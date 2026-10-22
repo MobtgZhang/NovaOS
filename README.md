@@ -21,21 +21,23 @@ These are engineering goals, not claims of formally verified security.
 
 ```mermaid
 flowchart TB
-    Apps["Native Desktop Applications"]
-    SDK["Nova SDK · Async Runtime · UI Toolkit"]
-    GUI["Desktop Shell · Window Compositor"]
-    Services["User-Space Services: Files · Network · Audio · Devices"]
-    IPC["Capability-Aware IPC · Shared Memory"]
-    Kernel["NovaKernel: Threads · Memory · Scheduling · Capabilities"]
-    HW["x86-64 Hardware / QEMU"]
+    APP["Applications: terminal / editor / file manager"]
+    SDK["Nova SDK: async runtime / GUI toolkit / C ABI"]
+    GUI["Desktop: shell / window compositor"]
+    SYS["User-space servers: file / net / audio / device / security"]
+    SUP["Service manager + capability broker"]
+    IPC["Kernel IPC + capability validation"]
+    K["NovaKernel: address spaces / threads / scheduler / IRQ / timers"]
+    HW["Hardware or QEMU: CPU / RAM / PCI / display / storage"]
 
-    Apps --> SDK
+    APP --> SDK
     SDK --> GUI
-    SDK --> Services
+    SDK --> SYS
     GUI --> IPC
-    Services --> IPC
-    IPC --> Kernel
-    Kernel --> HW
+    SYS --> IPC
+    SUP --> IPC
+    IPC --> K
+    K --> HW
 ```
 
 | Component | Responsibility |
@@ -47,6 +49,25 @@ flowchart TB
 | **File Server** | In-memory filesystem first; virtual filesystems and persistent storage later |
 | **Device Manager** | Controlled MMIO, IRQ, PCI, and virtual device access |
 | **Nova Desktop** | Display service, compositing, input routing, windows, and UI components |
+
+## Boot workflow chain
+
+```mermaid
+sequenceDiagram
+    participant B as UEFI + Limine
+    participant K as NovaKernel
+    participant I as init / ServiceManager
+    participant F as FileServer
+    participant C as Console
+    B->>K: kernel ELF + memory map + modules
+    K->>K: paging / interrupts / scheduler
+    K->>I: start first user process + bootstrap caps
+    I->>F: launch service + delegate caps
+    F-->>I: ready / endpoint
+    I->>C: start console
+    C->>F: IPC read a file
+    F-->>C: result
+```
 
 ## Technology Stack
 
