@@ -6,8 +6,6 @@
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
 
-📖 **[Detailed design and implementation plan (中文)](NovaOS.md)**
-
 ## Design Principles
 
 - **Minimal kernel:** Keep scheduling, virtual memory, IPC, interrupt handling, and capability enforcement in the kernel.
@@ -125,15 +123,7 @@ Useful early contributions include architecture reviews, ABI and IPC design feed
 
 ## License
 
-NovaOS is intended to be dual-licensed under either:
-
-- [Apache License 2.0](LICENSE-APACHE)
-- [MIT License](LICENSE-MIT)
-
-**at your option** (`MIT OR Apache-2.0`).
-
-Before publishing under these terms, add both full license texts with accurate copyright notices. Third-party dependencies and assets may use different licenses.
-
+NovaOS is intended to be dual-licensed under [Apache License 2.0](LICENSE-APACHE)
 ---
 
 **NovaOS — Small kernel. Strong boundaries. Open possibilities.**
