@@ -123,7 +123,8 @@ Useful early contributions include architecture reviews, ABI and IPC design feed
 
 ## License
 
-NovaOS is intended to be dual-licensed under [Apache License 2.0](LICENSE-APACHE)
+Apache License 2.0 
+
 ---
 
 **NovaOS — Small kernel. Strong boundaries. Open possibilities.**
