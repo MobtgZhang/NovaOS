@@ -1,0 +1,21 @@
+# Initramfs manifest
+#
+# `cargo xtask image` reads this to decide which files go into the initial
+# ramdisk. It is a manifest rather than a directory scan for one reason: a build
+# must be reproducible, and a scan picks up whatever happens to be in the build
+# directory, including stale artifacts from a previous configuration.
+#
+# Format: one path per line, relative to the repository root. Lines beginning
+# with `#` are comments. There is no globbing yet; M2 adds it when there is more
+# than one binary to place.
+#
+# # Why this file is empty
+#
+# NovaOS v0.1.0 (M0) has no userspace. The kernel is the only thing on the ISO,
+# and `module_path` in `limine.conf` points at a file this build does not create.
+# That is deliberate: Limine treats a *missing module file* differently from a
+# missing kernel, and leaving the line in place means the M2 change is one line
+# here plus the userspace landing in the image, not a change to the boot contract
+# that the kernel already depends on.
+
+# (no entries yet — userspace arrives in M2)

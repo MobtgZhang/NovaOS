@@ -1,0 +1,72 @@
+# NovaOS build configuration.
+#
+# The kernel is a bare-metal `x86_64-unknown-none` ELF image. `rust-lld` ships
+# with the toolchain, so no system `ld` is required.
+
+[build]
+target-dir = "target"
+
+[alias]
+# The primary entry points. Each one resolves to `xtask`, which owns the
+# build/image/run sequencing — the aliases exist so the common cases are short,
+# not so the logic lives here.
+nova-build = "build --package nova-kernel --target x86_64-unknown-none"
+nova-run = "run --package xtask --"
+nova-test-host = "test --workspace --exclude nova-kernel --exclude xtask"
+
+# Aliases for the `xtask` subcommands, so the documented workflows read as one
+# word. `cargo xtask <cmd>` is the same binary and takes the same arguments.
+xtask = "run --package xtask --"
+image = "run --package xtask -- image"
+boot = "run --package xtask -- run"
+
+# A kernel is not a host executable: it has no `std`, no C runtime start-up, and
+# its own `_start`. Building it for `x86_64-unknown-linux-gnu` produces a
+# dynamically linked binary whose CRT defines a second `_start`, which fails at
+# link time with a confusing duplicate-symbol error. Every kernel-facing alias
+# therefore names the target explicitly, and the bare-metal rustflags below are
+# only applied to it.
+nova-run-kernel = "run --package nova-kernel --target x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # A kernel cannot unwind, so the abort handler must trap.
+    "-C", "panic=abort",
+    # Use rust-lld rather than requiring a system linker. The path is the
+    # rustup-shipped binary rather than a bare `ld.lld`, because `linker-flavor`
+    # resolves the name through PATH and this image has no `ld.lld` installed.
+    # `rust-lld` dispatches on its own argv[0], which it does here because it is
+    # invoked under that name.
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    # The kernel supplies its own `_start`. No `-nostartfiles` here: that is a
+    # GCC driver flag, and we invoke `rust-lld` directly, so there is no CRT to
+    # suppress in the first place — nothing links `Scrt1.o` when the driver is
+    # the linker itself.
+    # Unreferenced sections must not reach the image, or a large binary could
+    # overlap the physical memory the frame allocator is about to hand out.
+    "-C", "link-arg=--gc-sections",
+    # Position-independent code would need a relocation loop before paging is
+    # set up; the kernel runs from a fixed higher-half address.
+    "-C", "relocation-model=static",
+    "-C", "code-model=kernel",
+    # x86-64-unknown-none still advertises SSE2, but no FPU state is initialised
+    # before M2 saves it per thread.
+    "-C", "target-feature=-sse,-sse2",
+    # The kernel script places the image at a fixed higher-half VMA with a low
+    # LMA. Without this, `rust-lld` picks its own default entry layout and the
+    # `__kernel_phys_base` symbol the allocator reads would not exist.
+    "-C", "link-arg=-Tkernel/linker.ld",
+    # Limine's protocol structures are addressed by absolute virtual address, so
+    # the linker must not emit a PT_INTERP or dynamic segment looking for a
+    # dynamic loader that does not exist on bare metal.
+    "-C", "link-arg=--no-dynamic-linker",
+]
+
+[target.x86_64-unknown-linux-gnu]
+# Host builds (xtask, unit tests) use std and the default panic strategy.
+rustflags = []
+
+[term]
+quiet = false
+verbose = false

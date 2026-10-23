@@ -1,0 +1,22 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS build automation: kernel build, image packaging, and QEMU orchestration"
+publish = false
+
+# Intentionally dependency-free. `xtask` runs on a developer's machine and in
+# CI, so it *could* use `clap` and `reqwest` — but every dependency here is one
+# more thing that has to build before the build system itself works, and a
+# bootstrap tool that cannot bootstrap is a bad trade. Hand-rolled argument
+# parsing is a few dozen lines and pulls in nothing.
+[dependencies]
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

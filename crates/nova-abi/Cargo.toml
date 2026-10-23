@@ -1,0 +1,20 @@
+[package]
+name = "nova-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS stable kernel/user ABI: syscall numbers, error codes, and fixed-layout value types"
+
+# `no_std` and architecture-neutral on purpose. This crate is compiled into the
+# kernel, into every user-space binary, and into host-side test code; anything
+# that needs an allocator or a platform would make one of those three impossible.
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# The error-code table is a C ABI surface: every value has an externally visible
+# meaning, so a "simplification" that renumbers one is a breaking change.
+missing_safety_doc = "deny"

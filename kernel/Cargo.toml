@@ -1,0 +1,39 @@
+[package]
+name = "nova-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS microkernel"
+
+# The kernel is a single binary: `main.rs` is the crate root and there is no
+# library target, because exposing kernel internals to the workspace would let a
+# future crate depend on page-table internals and quietly couple to them.
+[[bin]]
+name = "nova-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+limine = { workspace = true }
+
+[lints.rust]
+# An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`
+# block, so every one of them carries an explicit SAFETY comment. The kernel's
+# unsafe surface is the whole of its privileged surface; this makes it auditable
+# by reading, not by running the compiler's judgement.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Every `unsafe` block must be adjacent to a `// SAFETY:` comment. This is the
+# mechanical half of "all new unsafe has a safety comment"; the other half is
+# that the comment must actually state the invariant.
+undocumented_unsafe_blocks = "warn"
+# An `unsafe fn` must document why it is unsafe, or the reader has no way to
+# know what the caller must guarantee.
+missing_safety_doc = "deny"
+# Arithmetic on lengths and offsets reported by firmware must be checked rather
+# than assumed: `wrapping_add` on a memory-map length hides an overflow that
+# would otherwise hand out memory that does not exist.
+arithmetic_side_effects = "allow"
