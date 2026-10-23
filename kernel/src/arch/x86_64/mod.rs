@@ -112,27 +112,37 @@ impl InterruptControl for Interrupts {
 pub unsafe fn arch_init() {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        // The IDT goes up *first*, before the GDT.
+        // The GDT goes up *first*, before the IDT.
         //
-        // The module docs describe GDT-then-IDT, which is wrong: `gdt::init`
-        // ends in `ltr`, and `ltr` is a faulting instruction. If the selector it
-        // is given does not name a present TSS descriptor, the CPU raises
-        // `#GP` — and with no IDT installed there is no handler for that, so the
-        // fault escalates to `#DF` with no handler either, and the machine
-        // triple-faults and resets.
+        // Every IDT gate names the kernel code selector (`0x08`). A gate is only
+        // valid if that selector names a present, executable code segment *in
+        // the GDT that is installed when the gate is used* — and `gdt::init`
+        // ends in `ltr`, which is itself a faulting instruction.
         //
-        // That failure is invisible from inside QEMU: the reset happens in under
-        // a second, the serial log holds only firmware output, and because
-        // `-no-reboot` turns the reset into a *successful* QEMU exit, a harness
-        // reports a clean pass for a kernel that never ran. The only evidence is
-        // a `-d int,cpu_reset` log naming the faulting instruction.
+        // So the two initialisations have to be ordered around both of those
+        // facts, and each ordering is wrong in a way that is invisible:
         //
-        // Loading the IDT first costs nothing and makes any later fault — GDT
-        // setup included — land in a handler that can print and exit.
-        idt::init();
-
-        // GDT and TSS next. Every segment instruction here is now covered.
+        //   IDT first — `ltr` raises `#GP` if its selector does not name a
+        //   present TSS, and with no IDT installed there is no handler, so the
+        //   fault escalates to `#DF`, also unhandled, and the machine
+        //   triple-faults and resets. The reset takes under a second and, with
+        //   `-no-reboot`, QEMU exits *successfully* — so a harness reports a
+        //   clean pass for a kernel that never ran.
+        //
+        //   GDT first — the gates are then filled against a valid selector, but
+        //   `lgdt` and `ltr` run with the bootloader's IDT still installed. A
+        //   fault during that window lands in Limine's flat handlers, which
+        //   cannot report anything in NovaOS's format.
+        //
+        // Neither order is safe on its own. The resolution is that the GDT is
+        // built and loaded first, and `gdt::init` does its `ltr` only after the
+        // GDT is in place; the IDT is installed immediately afterwards, before
+        // anything else can fault. The window between the two is exactly the
+        // GDT/TSS setup, which is written to be non-faulting once `lgdt` has
+        // succeeded.
         gdt::init();
+
+        idt::init();
     }
 
     // Interrupt routing has no safety requirement of its own but must not run

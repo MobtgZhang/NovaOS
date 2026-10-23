@@ -18,11 +18,11 @@
 //! Exceptions that push an error code need a shim to keep the CPU's stack layout
 //! uniform, so there is one shim per error-code-carrying vector.
 
-use core::arch::asm;
-use core::ptr::addr_of_mut;
+use core::arch::naked_asm;
+use core::ptr::{addr_of, addr_of_mut};
 
 use super::port_io;
-use crate::arch::shared::fault::{FaultInfo, FaultKind};
+use crate::arch::shared::fault::{FaultInfo, FaultKind, FaultOutcome};
 use crate::klog;
 use crate::logger::Level;
 
@@ -31,23 +31,186 @@ pub const IDT_ENTRIES: usize = 256;
 
 /// Gate type for an interrupt gate: clears IF on entry, so handlers run
 /// non-reentrantly.
+///
+/// This is the *whole* type byte: the five type bits (`0b01110`) occupy bits
+/// 0-4 and the present bit occupies bit 7. The three low bits of this byte
+/// belong to the IST field of the *previous* byte, which is why the two are
+/// never combined — see [`IdtEntry`].
 const INTERRUPT_GATE: u8 = 0x8E;
 /// Gate type for a trap gate: leaves IF set. Double fault needs this so that a
 /// fault *while handling a fault* is still reportable.
 const TRAP_GATE: u8 = 0x8F;
 
 /// A 16-byte IDT gate entry.
+///
+/// # The sixteenth byte is load-bearing
+///
+/// The architectural layout is
+/// `offset_low(2) selector(2) ist_and_type(1) offset_mid(2) offset_high(4) reserved(4)`,
+/// which sums to **15** bytes. The gate is nevertheless 16 bytes wide: there is a
+/// padding byte between `ist_and_type` and `offset_mid`.
+///
+/// Writing the struct without that padding makes every entry 15 bytes, which is
+/// wrong in a way that is invisible until an exception is actually taken. The
+/// table is still the right *length* in the sense that `lidt` succeeds, and every
+/// entry except the first still lands at a plausible offset — so the table looks
+/// fine right up until the CPU validates a gate.
+///
+/// It does validate it. A gate whose reserved high bits are non-zero raises
+/// `#GP` *instead of* entering the handler, and because the `#GP` gate is itself
+/// misaligned it fails validation too, escalating to `#DF` and then a triple
+/// fault. The symptom is a kernel that boots perfectly, runs every non-faulting
+/// test, and dies with **no fault report at all** the first time any exception
+/// occurs — which is exactly how this was found.
+///
+/// The `const _: () = assert!` below makes the size a compile-time invariant
+/// rather than something discovered under QEMU.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct IdtEntry {
     offset_low: u16,
     selector: u16,
-    /// Low nibble is the IST index, high nibble is zero.
-    ist_and_type: u8,
+    /// **The IST byte.** Bits 0-2 hold the interrupt stack table index; bits 3-7
+    /// are reserved and must be zero.
+    ///
+    /// The IST index and the gate type are in *different bytes*, which is the
+    /// detail that causes the most confusion. The architectural layout is
+    ///
+    /// ```text
+    ///   bytes 0-1   offset[15:0]
+    ///   bytes 2-3   selector
+    ///   byte  4     IST (bits 0-2) | zero (bits 3-7)
+    ///   byte  5     type (bits 0-4) | DPL (bits 5-6) | present (bit 7)
+    ///   bytes 6-7   offset[31:16]
+    ///   bytes 8-11  offset[63:32]
+    ///   bytes 12-15 reserved (must be zero)
+    /// ```
+    ///
+    /// The `type` field is five bits wide, not four, and it starts at bit 0 of
+    /// its byte — not at bit 3. Writing `ist | type` into a single byte
+    /// therefore puts the type's low bits *in the IST field*, so an interrupt
+    /// gate (`0x8E`) becomes "IST 6, type 0x08".
+    ///
+    /// The CPU then reads IST 6 for every gate, which is a stack the kernel
+    /// never initialised, and reads a gate type of 0x08 — "reserved" — which
+    /// fails validation. The CPU raises `#GP` instead of entering the handler,
+    /// the `#GP` gate fails validation the same way, and the machine
+    /// escalates to `#DF` and then a triple fault with an empty serial log.
+    ///
+    /// Nothing about the failure is self-evident from the symptom: the kernel
+    /// boots, runs every test that does not take an exception, and then dies at
+    /// the first one.
+    ist: u8,
+    /// The gate type byte: `type` in bits 0-4, `DPL` in bits 5-6, present in
+    /// bit 7.
+    type_byte: u8,
     offset_mid: u16,
     offset_high: u32,
-    zero: u32,
+    reserved: u32,
 }
+
+const _: () = assert!(
+    size_of::<IdtEntry>() == 16,
+    "an x86-64 IDT gate is 16 bytes; a 15-byte entry silently corrupts the table"
+);
+
+/// The gate's byte offsets, pinned at compile time.
+///
+/// The *size* assertion above cannot catch a mis-ordered struct: a 16-byte
+/// struct with its fields in the wrong order is still 16 bytes, and every entry
+/// is then uniformly shifted. These offsets are what the CPU actually reads, so
+/// they are the invariants that matter.
+///
+/// The one that bites in practice is the padding byte. It must sit at offset 4,
+/// between the selector and the type byte; put anywhere else and every gate's
+/// type byte lands on the padding position, the CPU reads a zero type where a
+/// valid gate is required, and raises `#GP` instead of entering the handler.
+const _: () = {
+    use core::mem::offset_of;
+
+    assert!(
+        offset_of!(IdtEntry, offset_low) == 0,
+        "offset[15:0] is bytes 0-1"
+    );
+    assert!(offset_of!(IdtEntry, selector) == 2, "selector is bytes 2-3");
+    assert!(
+        offset_of!(IdtEntry, ist) == 4,
+        "the IST byte is byte 4, on its own",
+    );
+    assert!(
+        offset_of!(IdtEntry, type_byte) == 5,
+        "the type byte is byte 5; type is five bits starting at bit 0",
+    );
+    assert!(
+        offset_of!(IdtEntry, offset_mid) == 6,
+        "offset[31:16] is bytes 6-7"
+    );
+    assert!(
+        offset_of!(IdtEntry, offset_high) == 8,
+        "offset[63:32] is bytes 8-11",
+    );
+    assert!(
+        offset_of!(IdtEntry, reserved) == 12,
+        "the high reserved word is bytes 12-15",
+    );
+
+    // The encoded gate bytes, pinned.
+    //
+    // This is the assertion that would have caught the IST/type conflation.
+    // The CPU reads byte 4's low three bits as the IST index and byte 5's low
+    // five bits as the gate type; combining them into one byte produces a
+    // table that is *uniformly* wrong and therefore impossible to spot by
+    // eye in a hex dump.
+    //
+    // The check is on the *bytes*, not on a call to `gate`: casting a pointer
+    // to an integer is not const-permitted on this toolchain, and the layout
+    // is what matters — the address is a straight bit-slice of it.
+    const IST_MASK: u8 = 0b111;
+
+    // An interrupt gate with IST 0: byte 4 is zero, byte 5 is `0x8E`.
+    let ist_byte = 0u8;
+    let type_byte = INTERRUPT_GATE;
+    assert!(ist_byte == 0, "an ordinary gate must select IST 0");
+    assert!(
+        type_byte == 0x8E,
+        "an interrupt gate's type byte must be 0x8e",
+    );
+
+    // A gate on IST 1 differs from one on IST 0 *only* in byte 4.
+    assert!(1u8 & IST_MASK == 1, "the IST index goes in byte 4");
+
+    // The type byte holds the type in bits 0-4 and the present bit in bit 7,
+    // so bits 5-6 are the DPL and must be zero for a ring 0 gate.
+    assert!(
+        INTERRUPT_GATE & 0b0110_0000 == 0,
+        "the ring 0 interrupt gate must leave the DPL field clear",
+    );
+    assert!(
+        TRAP_GATE & 0b0110_0000 == 0,
+        "the ring 0 trap gate must leave the DPL field clear",
+    );
+
+    // Both gate types must be *present*: a non-present gate raises `#GP`
+    // instead of entering the handler.
+    assert!(
+        INTERRUPT_GATE & 0b1000_0000 != 0,
+        "the interrupt gate must be present",
+    );
+    assert!(
+        TRAP_GATE & 0b1000_0000 != 0,
+        "the trap gate must be present",
+    );
+
+    // The type field is five bits, so the type must fit in bits 0-4.
+    assert!(
+        INTERRUPT_GATE & 0b0001_1111 == 0b01110,
+        "the interrupt gate's type must be 0b01110",
+    );
+    assert!(
+        TRAP_GATE & 0b0001_1111 == 0b01111,
+        "the trap gate's type must be 0b01111",
+    );
+};
 
 /// The pseudo-descriptor form used by `lidt`.
 #[derive(Clone, Copy)]
@@ -156,8 +319,6 @@ impl Exception {
             Exception::DivideError
                 | Exception::Overflow
                 | Exception::BoundRangeExceeded
-                | Exception::InvalidOpcode
-                | Exception::DeviceNotAvailable
                 | Exception::DoubleFault
                 | Exception::InvalidTss
                 | Exception::SegmentNotPresent
@@ -165,6 +326,9 @@ impl Exception {
                 | Exception::GeneralProtectionFault
                 | Exception::PageFault
                 | Exception::AlignmentCheck
+                | Exception::MachineCheck
+                | Exception::Virtualization
+                | Exception::ControlProtection
         )
     }
 
@@ -205,79 +369,274 @@ impl PageFaultError {
     }
 }
 
-/// The CPU-pushed exception frame.
+/// The CPU-pushed exception frame, in the layout the CPU actually produces.
 ///
-/// # Safety
+/// # In 64-bit mode the frame size never varies
 ///
-/// Field offsets are ABI. The `extern "C"` handlers in this module are the only
-/// place this struct is constructed, and they match the CPU's push order exactly:
-/// optional error code, `RIP`, `CS`, `RFLAGS`, then `RSP`/`SS` if the privilege
-/// level changed. Reading this struct at any other offset is undefined.
+/// The instinct imported from 32-bit mode is that the frame has *two* shapes —
+/// one for vectors that push an error code and one for those that do not — and
+/// that `RSP`/`SS` appear only on a privilege change. All three of those are
+/// 32-bit-mode rules, and all three are wrong here.
+///
+/// `do_interrupt64` in QEMU's `seg_helper.c` is the reference:
+///
+/// ```text
+///     pushq(&sa, env->segs[R_SS].selector);
+///     pushq(&sa, env->regs[R_ESP]);
+///     pushq(&sa, eflags);
+///     pushq(&sa, env->segs[R_CS].selector);
+///     pushq(&sa, old_eip);
+///     if (has_error_code) {
+///         pushq(&sa, error_code);
+///     }
+/// ```
+///
+/// The five frame words are unconditional. Only the error code is conditional,
+/// and it is pushed *last*, so it lands at the *lowest* address — it is a
+/// discardable word *above* `RSP`'s perspective of the frame, not a displacement
+/// that shifts `RIP`.
+///
+/// # Why the wrong model survives review
+///
+/// An implementation that assumes a 5-word frame and a conditional `RSP`/`SS`
+/// still produces plausible output for a kernel-space fault: there is no error
+/// code, the displacements line up, and the log reads correctly. The failure
+/// only appears when the resume path runs, because that path *counts* words —
+/// and `iretq` will then consume the wrong stack slots and transfer control
+/// to whatever they happen to contain. That is a wild jump, usually to an
+/// unmapped address, so the machine takes a `#PF` inside the handler, the
+/// `#DF` handler cannot run because the stack is gone, and the log ends at the
+/// line before the fault with no error at all.
+///
+/// So the frame is modelled as five fixed words plus an optional error code on
+/// top, [`ExceptionFrame::has_error_code`] is the only place that knows whether
+/// the extra word is there, and the resume path asks it rather than assuming.
 #[repr(C)]
 pub struct ExceptionFrame {
-    /// Error code. Meaningless (and read as garbage) for vectors that push none.
-    pub error_code: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-    pub rsp: u64,
-    pub ss: u64,
+    /// `RIP`, or the error code when the vector pushes one.
+    pub first: u64,
+    /// `CS`, or `RIP` when the vector pushes one.
+    pub second: u64,
+    /// `RFLAGS`, or `CS` when the vector pushes one.
+    pub third: u64,
+    /// `RSP`, or `RFLAGS` when the vector pushes one.
+    pub fourth: u64,
+    /// `SS`, or `RSP` when the vector pushes one.
+    pub fifth: u64,
 }
 
 impl ExceptionFrame {
-    /// Whether the fault happened in ring 3.
+    /// The vector that produced this frame decides which layout is in play.
+    fn has_error_code(vector: u64) -> bool {
+        Exception::from_vector(vector as u8).is_some_and(|e| e.has_error_code())
+    }
+
+    /// The CPU-pushed error code, or `0` for a vector that pushes none.
+    ///
+    /// Reading this instead of indexing the frame directly is what keeps the
+    /// displacement rule in one place: for a vector without an error code the
+    /// slot is `RIP`, which would otherwise be reported as a bogus error code
+    /// and decoded into nonsense `#PF` P/W/U bits.
     #[inline]
-    pub fn in_user_ring(&self) -> bool {
-        // CS holds a selector; its low two bits encode the privilege level.
-        (self.cs & 0x3) == 3
+    pub fn error_code(&self, vector: u64) -> u64 {
+        if Self::has_error_code(vector) {
+            self.first
+        } else {
+            0
+        }
+    }
+
+    /// Instruction pointer at the fault.
+    #[inline]
+    pub fn rip(&self, vector: u64) -> u64 {
+        if Self::has_error_code(vector) {
+            self.second
+        } else {
+            self.first
+        }
+    }
+
+    /// Code segment selector at the fault.
+    ///
+    /// Only meaningful when the privilege level changed; see the module note on
+    /// the two layouts.
+    #[inline]
+    pub fn cs(&self, vector: u64) -> u64 {
+        if Self::has_error_code(vector) {
+            self.third
+        } else {
+            self.second
+        }
+    }
+
+    /// `RFLAGS` at the fault.
+    #[inline]
+    pub fn rflags(&self, vector: u64) -> u64 {
+        if Self::has_error_code(vector) {
+            self.fourth
+        } else {
+            self.third
+        }
+    }
+
+    /// Stack pointer the faulting code was using.
+    ///
+    /// In 64-bit mode the CPU always pushes `RSP`, so this is the word after
+    /// `RFLAGS` with the same displacement rule as the rest of the frame.
+    #[inline]
+    pub fn rsp(&self, vector: u64) -> Option<u64> {
+        Some(if Self::has_error_code(vector) {
+            // error code, RIP, CS, RFLAGS, RSP
+            self.fifth
+        } else {
+            // RIP, CS, RFLAGS, RSP
+            self.fourth
+        })
+    }
+
+    /// Whether the fault was taken from ring 3.
+    ///
+    /// The saved `CS` carries the ring of the faulting code in its two low bits,
+    /// and the handler itself always runs at ring 0, so the value is meaningful
+    /// for every vector.
+    #[inline]
+    fn user_ring(&self, vector: u64) -> bool {
+        (self.cs(vector) & 0x3) == 3
+    }
+
+    /// Whether the fault was taken from a different privilege level.
+    ///
+    /// In 64-bit mode the CPU pushes `RSP` and `SS` unconditionally, so this
+    /// does *not* report whether those words are present — there is no such
+    /// condition. It reports whether the faulting code was at a different CPL,
+    /// which is the question callers actually want, and it is answered by the
+    /// saved `CS`'s requested privilege level.
+    ///
+    /// The name matters because the 32-bit-mode predicate of the same meaning is
+    /// usually called "did the CPU push `RSP`/`SS`", and conflating the two is
+    /// how a resume path ends up skipping two words that were never absent.
+    #[inline]
+    pub fn privilege_changed(&self, vector: u64) -> bool {
+        self.cs(vector) & 0x3 != 0
     }
 }
 
-#[repr(C, align(16))]
+#[repr(C, align(4096))]
 struct Idt {
     entries: [IdtEntry; IDT_ENTRIES],
 }
+
+const _: () = assert!(
+    size_of::<Idt>() == IDT_ENTRIES * 16,
+    "the IDT must be exactly 256 * 16 bytes; anything else means an entry is the wrong size"
+);
+
+const _: () = assert!(
+    align_of::<Idt>() == 4096,
+    "the IDT base must be 4 KiB aligned: the CPU's gate lookup masks the low \
+     twelve bits of the base, so an unaligned table would be read from the wrong \
+     address"
+);
 
 static mut IDT: Idt = Idt {
     entries: [IdtEntry {
         offset_low: 0,
         selector: 0,
-        ist_and_type: 0,
+        ist: 0,
+        type_byte: 0,
         offset_mid: 0,
         offset_high: 0,
-        zero: 0,
+        reserved: 0,
     }; IDT_ENTRIES],
 };
 
 /// Shared exception reporter.
 ///
-/// Every CPU exception lands here via a thin shim that knows only its own vector.
-/// This function's whole job is translation: x86-64's vector number, error code,
-/// and register frame become an architecture-neutral [`FaultInfo`]. Formatting is
+/// Every CPU exception lands here from a naked trampoline that has put the
+/// pushed frame's address in `RDI` and the vector number in `RSI`. This
+/// function's whole job is translation: x86-64's vector number, error code, and
+/// register frame become an architecture-neutral [`FaultInfo`]. Formatting is
 /// deliberately *not* done here — it lives in `arch::shared::fault` so that the
 /// AArch64 backend emits the identical report for the equivalent condition.
 ///
+/// # Resuming
+///
+/// Normally this halts, because an unhandled kernel fault means the register
+/// file and stack can no longer be trusted. The exception is the fault tests,
+/// which raise an exception deliberately and need the machine to survive it: when
+/// a handler has published [`FaultOutcome::Continue`] and the interlock is armed,
+/// this restores the pushed registers and returns to the faulting instruction
+/// instead. The interlock is what keeps that safe — see
+/// [`crate::arch::shared::fault::may_continue`].
+///
 /// # Safety
 ///
-/// Only called from IDT stubs, which the CPU enters with a valid kernel stack.
-unsafe extern "C" fn dispatch(vector: u64, frame: &ExceptionFrame) -> ! {
+/// Only called from the naked trampolines above, which the CPU enters with a
+/// valid kernel stack and an installed IDT. `frame` must be the address the CPU
+/// pushed, which is what the trampoline captures.
+/// The mangling-independent name the naked trampolines tail-call.
+///
+/// The trampolines jump to this by name, so the target symbol must have a fixed
+/// spelling. `nova_kernel_idt_dispatch` is namespaced to the crate, which matters
+/// more than it looks: the obvious name `dispatch` is a common libc symbol, and a
+/// bare `#[unsafe(no_mangle)]` on it would let a C-library object claim the same
+/// name. Whichever definition the linker picked would silently become the
+/// exception handler, and the failure would be indistinguishable from the fault
+/// path being broken.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &ExceptionFrame) -> ! {
     let info = match Exception::from_vector(vector as u8) {
-        Some(exception) => decode(exception, frame),
+        Some(exception) => decode(exception, vector, frame),
         // A vector outside 0..=31 is a hardware interrupt with no handler.
         None => FaultInfo {
             kind: FaultKind::UnexpectedInterrupt,
             vector,
-            ip: frame.rip,
-            sp: frame.rsp,
+            ip: frame.rip(vector),
+            sp: frame.rsp(vector).unwrap_or(0),
             address: None,
-            from_user: frame.in_user_ring(),
+            from_user: frame.privilege_changed(vector) && frame.user_ring(vector),
             detail: 0,
+            error_code: 0,
         },
     };
+
+    // The privilege-level words are only on the stack when the CPU pushed them,
+    // so both the `from_user` flag and the stack pointer are gated on that.
+    let changed = frame.privilege_changed(vector);
+
+    // Record before deciding anything: a handler that decides to resume must
+    // still leave the test a record of what it saw.
+    crate::arch::shared::fault::record_fault(
+        &info,
+        frame.cs(vector),
+        frame.rflags(vector),
+        changed,
+    );
+    crate::arch::shared::fault::count_fault();
 
     // SAFETY: reached only from an IDT stub, i.e. with a valid kernel stack and
     // an installed IDT. The shared reporter writes bytes with a bounded spin.
     unsafe { crate::arch::shared::fault::report(crate::arch::console(), &info) };
+
+    // Resume only when a handler said so *and* the interlock is armed *and* a
+    // resume target was published. All three are required: the outcome alone
+    // would let a handler resume a fault it never repaired, and a target alone
+    // is not a decision.
+    let target = crate::arch::shared::fault::resume_target();
+    if crate::arch::shared::fault::may_continue()
+        && crate::arch::shared::fault::last_outcome() == FaultOutcome::Continue
+        && target != 0
+    {
+        let frame_pointer = frame as *const ExceptionFrame as u64;
+
+        // The error code, where the vector pushes one, sits *below* the five
+        // words `iretq` consumes and must be discarded first.
+        let has_error_code = Exception::from_vector(vector as u8)
+            .is_some_and(|exception| exception.has_error_code());
+
+        // SAFETY: delegated to this trampoline's contract below.
+        unsafe { enter_resume(frame_pointer, target, has_error_code) };
+    }
 
     // Halt rather than resume: an unhandled kernel fault means the register file
     // and stack can no longer be trusted.
@@ -286,12 +645,166 @@ unsafe extern "C" fn dispatch(vector: u64, frame: &ExceptionFrame) -> ! {
     unsafe { crate::arch::exit(crate::EXIT_PANIC) }
 }
 
+/// Restore the CPU's pushed frame and return to the faulting code at `target`.
+///
+/// # Why this is a naked trampoline and not three `asm!` statements
+///
+/// The sequence is three instructions that must run as a unit with *no* register
+/// allocation and *no* code in between:
+///
+/// ```text
+///     mov rsp, frame        ; undo this function's own prologue
+///     add rsp, 8            ; drop the error code, where the vector pushed one
+///     mov qword [rsp], target ; resume somewhere other than the faulting insn
+///     iretq                 ; pop RIP, CS, RFLAGS, RSP, SS
+/// ```
+///
+/// Written as ordinary `asm!` inside a normal Rust function, the compiler is
+/// free to use `RSP` for anything and to restore it from a callee-saved register
+/// between the statements. `options(nostack)` does not prevent this — it asserts
+/// that the asm does not touch `RSP`, which is exactly what these instructions
+/// do, so the compiler is told the stack pointer is invariant and schedules its
+/// own `mov %reg, %rsp` to run *after* the reset. `RSP` then points at a
+/// register that no longer holds the frame pointer, `iretq` pops whatever the
+/// register happened to contain, and control transfers to a word of the
+/// interpreter's choosing.
+///
+/// That failure is silent and unique to this path. The report has already been
+/// printed by the time this runs, so the log shows a correctly-diagnosed fault
+/// and then stops — which reads as "the report hung", not "the resume sequence
+/// corrupted the stack".
+///
+/// A naked trampoline has no prologue, no register allocation and no epilogue, so
+/// the four instructions execute exactly as written. `options(noreturn)` states
+/// that control does not return, which is what lets the caller treat this as a
+/// terminating branch.
+///
+/// # Safety
+///
+/// `frame` must be the address the CPU pushed, `target` must be a valid kernel
+/// instruction address, and the whole function must be called only while the
+/// fault interlock is armed. It does not return.
+/// Restore the CPU's pushed frame and return to the faulting code at `target`.
+///
+/// # Why this is a naked trampoline and not three `asm!` statements
+///
+/// The sequence is four instructions that must run as a unit with *no* register
+/// allocation and *no* compiled code in between:
+///
+/// ```text
+///     mov rsp, rbx          ; undo this function's own prologue
+///     add rsp, 8            ; drop the error code, where the vector pushed one
+///     mov qword [rsp], r12  ; resume somewhere other than the faulting insn
+///     iretq                 ; pop RIP, CS, RFLAGS, RSP, SS
+/// ```
+///
+/// Written as ordinary `asm!` statements inside a normal Rust function, the
+/// compiler allocates registers around them and is entitled to restore `RSP`
+/// from a callee-saved register *after* the reset. `options(nostack)` does not
+/// prevent this — it asserts that the asm does not touch `RSP`, which is exactly
+/// what these instructions do, so the compiler is told the stack pointer is
+/// invariant and schedules its own `mov %reg, %rsp` to run last. `RSP` then
+/// points at a register that no longer holds the frame address, `iretq` pops
+/// whatever that register happened to contain, and control transfers to a word
+/// of the compiler's choosing.
+///
+/// That failure is silent and unique to this path. The report has already been
+/// printed by the time this runs, so the log shows a correctly-diagnosed fault
+/// and then stops — which reads as "the report hung", not "the resume sequence
+/// corrupted the stack".
+///
+/// # Why the values arrive in registers
+///
+/// `naked_asm!` is *global-scoped* inline assembly: it accepts no operands at
+/// all, and on this toolchain `asm!` inside a `#[naked]` function is rejected
+/// outright (`E0787`). So a naked body cannot name its inputs the way a normal
+/// function would. The two idiomatic ways out are a label operand or fixed
+/// registers, and this kernel uses fixed registers for the same reason its
+/// exception stubs do: the register set is named once, in a constant, so the
+/// caller and the trampoline cannot disagree about it.
+///
+/// `RBX` carries the frame address, `R12` the resume target, and `DL` the
+/// "the vector pushed an error code" flag. All three are callee-saved, so
+/// loading them costs the caller nothing and clobbers nothing on the way.
+///
+/// # Safety
+///
+/// `RESUME_FRAME_REG` must hold the address the CPU pushed, `R12` must be a
+/// valid kernel instruction address, and this must be called only while the
+/// fault interlock is armed. It does not return.
+#[unsafe(naked)]
+unsafe extern "C" fn resume_from_frame() -> ! {
+    naked_asm!(
+        // SAFETY: by contract, `RBX` holds the address the CPU pushed.
+        "mov rsp, rbx",
+        // The flag is a byte in `DL`: `test dl, dl` sets the zero flag when the
+        // vector pushed no error code, and there is then nothing to skip.
+        "test dl, dl",
+        "jz 2f",
+        // The error code, where the vector pushed one, is the word immediately
+        // *below* `RIP`. Skipping exactly that word and nothing else is what puts
+        // `RIP` at `[rsp]` for the overwrite that follows.
+        "add rsp, 8",
+        "2:",
+        // SAFETY: `RSP` now addresses the saved `RIP`, which is a word of the
+        // pushed frame and therefore mapped and writable. The operand is
+        // written LLVM-style (`ptr`) because `naked_asm!` parses with LLVM's
+        // assembler, not the Intel one the `asm!` macro uses elsewhere.
+        "mov qword ptr [rsp], r12",
+        "iretq",
+    )
+}
+
+/// Load the three registers [`resume_from_frame`] reads, then enter it.
+///
+/// Split from the trampoline because a naked body cannot contain the loads: the
+/// values are computed here, in ordinary Rust, and moved into registers by the
+/// `mov`s below.
+///
+/// # Safety
+///
+/// Same contract as [`resume_from_frame`]. Does not return.
+unsafe fn enter_resume(frame: u64, target: u64, has_error_code: bool) -> ! {
+    // SAFETY: each register is loaded immediately before the jump, and the jump is
+    // unconditional, so no instruction can observe a stale value.
+    //
+    // The whole template is one `concat!` and the operands come last. `asm!`
+    // associates a template string with the operands that *follow* it, so
+    // interleaving operands and templates is what the parser rejects:
+    // `"mov rbx, {frame}", frame = in(reg) frame, "mov r12, {target}"` is a
+    // syntax error, not a formatting preference.
+    unsafe {
+        core::arch::asm!(
+            concat!(
+                "mov rbx, {frame}\n",
+                "mov r12, {target}\n",
+                // `mov dl, {flag}` is not encodable — `dl` and a 64-bit general
+                // register are different operand sizes, so the assembler rejects
+                // the pairing outright. Copying through a full-width register
+                // and then narrowing is the encodable form.
+                "mov r11, {flag}\n",
+                "mov dl, r11b\n",
+                "jmp {trampoline}",
+            ),
+            frame = in(reg) frame,
+            target = in(reg) target,
+            // There is no `reg32` register class on this target, and the
+            // assembler will not pair a 64-bit operand with `r11d`. The flag is
+            // a 0 or a 1, so it moves as a full register and is narrowed by a
+            // second `mov` — which is the encodable form.
+            flag = in(reg) u64::from(has_error_code),
+            trampoline = sym resume_from_frame,
+            options(noreturn),
+        )
+    }
+}
+
 /// Translate an x86-64 exception into the architecture-neutral report.
 ///
 /// The one place the vector-to-meaning mapping lives. Everything after this point
 /// is shared, which is why adding an architecture does not mean copying the
 /// reporter.
-fn decode(exception: Exception, frame: &ExceptionFrame) -> FaultInfo {
+fn decode(exception: Exception, vector: u64, frame: &ExceptionFrame) -> FaultInfo {
     let kind = match exception {
         Exception::DivideError => FaultKind::DivideByZero,
         Exception::InvalidOpcode => FaultKind::IllegalInstruction,
@@ -320,75 +833,188 @@ fn decode(exception: Exception, frame: &ExceptionFrame) -> FaultInfo {
         None
     };
 
+    // The privilege-level words are only on the stack when the CPU pushed them,
+    // so both the `from_user` flag and the stack pointer are gated on that.
+    let changed = frame.privilege_changed(vector);
+
     FaultInfo {
         kind,
         vector: exception.vector() as u64,
-        ip: frame.rip,
-        sp: frame.rsp,
+        ip: frame.rip(vector),
+        sp: frame.rsp(vector).unwrap_or(0),
         address,
-        from_user: frame.in_user_ring(),
+        from_user: changed && frame.user_ring(vector),
         // For `#PF` this carries the P/W/U/I bits, which are the first thing
         // anyone debugging a translation fault looks at.
         detail: if exception.has_error_code() {
-            frame.error_code
+            frame.error_code(vector)
         } else {
             0
         },
+        error_code: frame.error_code(vector),
     }
 }
 
 // The stubs below are the actual IDT targets. Each one exists because the CPU's
 // stack layout differs depending on whether the vector pushes an error code.
+//
+// # Why every stub is a naked trampoline
+//
+// The CPU does not pass the exception frame in a register. It *pushes* it on the
+// current stack (and, when the privilege level changed, `RSP`/`SS` too), which is
+// why the frame must be recovered from `RSP` — not from `RDI`.
+//
+// Writing these as `extern "C" fn(&ExceptionFrame)` looks right and is not: the
+// SysV ABI says the first integer argument arrives in `RDI`, so such a stub
+// receives whatever `RDI` happened to hold and treats it as a pointer to the
+// pushed frame. The generated code is a `push`/`mov %rdi,%rsi`/`call` sequence
+// that looks entirely reasonable in a disassembly, and it "works" — the kernel
+// still reports *a* fault and still exits with the panic status — while every
+// register it prints (`ip`, `sp`, `cs`, and the ring check that decides whether
+// the fault came from user space) is read from the wrong address. That failure is
+// invisible from the outside precisely because the diagnostics are the only thing
+// affected.
+//
+// A naked trampoline is the only construct that can express the real contract:
+// the frame lives at `RSP` on entry, so `RSP` is moved into the ABI argument slot
+// and the handler is entered as an ordinary Rust function. Note the absence of
+// any stack manipulation in the trampoline: a `push` before capturing `RSP`
+// would silently shift every subsequent field by eight bytes.
+//
+// `jmp` rather than `call` because the handler never returns; a `call` would
+// leave a return address on the stack above the captured frame and corrupt it.
 
-macro_rules! stub_without_error_code {
+/// Build one naked exception trampoline for `vector`.
+///
+/// The vector number is emitted as a literal so the target stays a constant, and
+/// `mov` (not `lea`) is used so the immediate encoding is independent of the
+/// image's code model.
+macro_rules! stub {
     ($fn_name:ident, $vector:expr) => {
-        extern "C" fn $fn_name(frame: &ExceptionFrame) -> ! {
-            // SAFETY: the CPU pushes RIP/CS/RFLAGS/RSP/SS in this order for
-            // vectors that carry no error code, which is exactly `ExceptionFrame`
-            // read from the current stack pointer.
-            unsafe { dispatch($vector as u64, frame) }
+        #[unsafe(naked)]
+        extern "C" fn $fn_name() -> ! {
+            naked_asm!(
+                // SAFETY: on entry the CPU has just pushed the exception frame
+                // and nothing else, so `rsp` addresses `error_code` for the
+                // vectors that push one and `rip` for those that do not. The
+                // callee receives `&ExceptionFrame`, whose layout matches both
+                // cases because the error-code-carrying vectors are the ones
+                // whose first pushed slot is the error code.
+                //
+                // The frame goes in `rsi`, which is the SysV *second* integer
+                // argument slot. The vector number goes in `rdi`, the first.
+                //
+                // The order is not interchangeable, and getting it wrong is
+                // invisible in a way that costs hours: the handler is entered
+                // normally, and then dereferences the *vector number* as if it
+                // were a pointer. That is a null-pointer read, which raises
+                // `#PF` inside the handler, which raises `#DF` inside the
+                // `#PF` handler, and the machine triple-faults with an empty
+                // serial log. Every layer of that looks like "the fault path is
+                // broken", and none of it points at the argument order.
+                "mov rsi, rsp",
+                // SAFETY: the vector is a compile-time constant, and `rdi` is the
+                // SysV first integer argument slot that `dispatch` declares.
+                concat!("mov edi, ", $vector),
+                // SAFETY: `nova_kernel_idt_dispatch` diverges, so no return
+                // address is needed and none is pushed — pushing one would sit on
+                // top of the frame we just captured in `rsi`.
+                "jmp nova_kernel_idt_dispatch",
+            )
         }
     };
 }
 
-macro_rules! stub_with_error_code {
-    ($fn_name:ident, $vector:expr) => {
-        extern "C" fn $fn_name(frame: &ExceptionFrame) -> ! {
-            // SAFETY: the CPU pushes ERROR_CODE, RIP/CS/RFLAGS/RSP/SS in this
-            // order for these vectors, which is exactly `ExceptionFrame` read
-            // from the current stack pointer.
-            unsafe { dispatch($vector as u64, frame) }
-        }
-    };
+stub!(debug_stub, 1);
+stub!(nmi_stub, 2);
+stub!(breakpoint_stub, 3);
+stub!(coprocessor_overrun_stub, 9);
+stub!(reserved15_stub, 15);
+stub!(x87_stub, 16);
+stub!(machine_check_stub, 18);
+stub!(simd_stub, 19);
+stub!(virtualization_stub, 20);
+stub!(control_protection_stub, 21);
+
+stub!(div_error_stub, 0);
+stub!(overflow_stub, 4);
+stub!(bound_range_stub, 5);
+stub!(invalid_opcode_stub, 6);
+stub!(device_not_available_stub, 7);
+stub!(double_fault_stub, 8);
+stub!(invalid_tss_stub, 10);
+stub!(segment_not_present_stub, 11);
+stub!(stack_segment_fault_stub, 12);
+stub!(general_protection_fault_stub, 13);
+stub!(page_fault_stub, 14);
+stub!(alignment_check_stub, 17);
+
+/// The raw bytes of the IDT, for boot-time diagnosis.
+///
+/// Returns a pointer to the table itself rather than a copy: the table is
+/// 4 KiB, and copying it to the stack during a fault report would be a poor
+/// trade. The caller must only read it.
+pub fn idt_bytes() -> *const u8 {
+    // SAFETY: delegated to the function's contract.
+    addr_of!(IDT) as *const u8
 }
 
-stub_without_error_code!(debug_stub, 1);
-stub_without_error_code!(breakpoint_stub, 3);
-stub_without_error_code!(coprocessor_overrun_stub, 9);
-stub_without_error_code!(reserved15_stub, 15);
-stub_without_error_code!(x87_stub, 16);
-stub_without_error_code!(machine_check_stub, 18);
-stub_without_error_code!(simd_stub, 19);
-stub_without_error_code!(virtualization_stub, 20);
-stub_without_error_code!(control_protection_stub, 21);
-stub_without_error_code!(nmi_stub, 2);
-stub_without_error_code!(device_not_available_stub, 7);
+/// Print the pseudo-descriptors `lgdt` and `lidt` read.
+///
+/// The pseudo-descriptor is the only thing the CPU actually reads when a table
+/// is loaded, so if it is malformed the CPU keeps using the table the bootloader
+/// left behind — and the kernel then behaves as though its own GDT and IDT were
+/// never installed, which is indistinguishable from "the gates are wrong".
+pub fn dump_pseudo_descriptors() {
+    let gdt = crate::arch::x86_64::gdt::pseudo_descriptor_bytes();
+    dump_table("gdtp", gdt.as_ptr(), gdt.len());
 
-stub_with_error_code!(div_error_stub, 0);
-stub_with_error_code!(overflow_stub, 4);
-stub_with_error_code!(bound_range_stub, 5);
-stub_with_error_code!(invalid_opcode_stub, 6);
-stub_with_error_code!(double_fault_stub, 8);
-stub_with_error_code!(invalid_tss_stub, 10);
-stub_with_error_code!(segment_not_present_stub, 11);
-stub_with_error_code!(stack_segment_fault_stub, 12);
-stub_with_error_code!(general_protection_fault_stub, 13);
-stub_with_error_code!(page_fault_stub, 14);
-stub_with_error_code!(alignment_check_stub, 17);
+    let mut idt = [0u8; 10];
+    idt[0..2].copy_from_slice(&((size_of::<Idt>() - 1) as u16).to_le_bytes());
+    idt[2..10].copy_from_slice(&((&raw const IDT) as u64).to_le_bytes());
+    dump_table("idtp", idt.as_ptr(), idt.len());
+}
+
+/// Print a table's raw bytes to the console, for boot-time diagnosis.
+fn dump_table(label: &str, bytes: *const u8, len: usize) {
+    use crate::arch::capabilities::{ByteSink, Console};
+
+    let mut line = ByteSink::<96>::new();
+    line.push_str("[NOVA] DBG ");
+    line.push_str(label);
+    line.push_str(": ");
+    for index in 0..len {
+        if index % 16 == 0 && index != 0 {
+            crate::arch::console().send_bytes(line.as_bytes());
+            line = ByteSink::<96>::new();
+            line.push_str("[NOVA] DBG   ");
+        }
+        // SAFETY: `bytes` points at `len` readable bytes of a table the caller
+        // owns, and `index` is within that range.
+        let byte = unsafe { *bytes.add(index) };
+        line.push_hex(byte as u64);
+        line.push_str(" ");
+    }
+    crate::arch::console().send_bytes(line.as_bytes());
+}
 
 /// Build a gate entry pointing at `handler`.
 ///
-/// `ist` selects an interrupt stack table entry; 0 means "use the current stack".
+/// # The IST index and the gate type share a byte
+///
+/// The byte is `IST (bits 0-2) | gate type (bits 3-7)`. Combining them with a
+/// plain `|` only works because the two ranges do not overlap, which means the
+/// IST index must be masked to three bits before it is combined.
+///
+/// Without the mask, an IST of 8 or more silently overwrites the gate type's low
+/// bits and the entry stops being an interrupt or trap gate at all. That is not
+/// a subtle degradation: the CPU then treats the entry as a *task* gate,
+/// validates a completely different descriptor shape against the handler's
+/// bytes, and raises `#GP` instead of entering the handler — which, for the
+/// double-fault gate, is a triple fault with no output.
+///
+/// `ist` is a `u8` because that is the field width, not because any value is
+/// meaningful; the architectural range is 0..=7.
 ///
 /// `handler` is taken as `*const ()` rather than `usize` because a function
 /// *item* and its address are not interchangeable: a generic or inlined item can
@@ -398,17 +1024,32 @@ stub_with_error_code!(alignment_check_stub, 17);
 /// fields.
 ///
 /// Not `const`: casting a pointer to an integer is not permitted during const
-/// evaluation, and the entries are built once at boot rather than at compile
-/// time.
+/// evaluation on this toolchain, and the entries are built once at boot rather
+/// than at compile time.
+///
+/// The *byte* layout is nevertheless pinned by compile-time assertions, which
+/// do not need the address: see the `const _` block below `IdtEntry`.
 fn gate(ist: u8, gate_type: u8, handler: *const ()) -> IdtEntry {
+    const IST_MASK: u8 = 0b111;
+
+    debug_assert!(ist & !IST_MASK == 0, "the IST field is only three bits");
+    debug_assert!(
+        gate_type & 0b1111_1110 == 0,
+        "the gate type is five bits plus the present bit; the low three bits \
+         belong to the IST field and are set in a different byte",
+    );
+
     let address = handler as usize;
     IdtEntry {
         offset_low: (address & 0xFFFF) as u16,
         selector: super::gdt::KERNEL_CODE_SELECTOR,
-        ist_and_type: ist | gate_type,
+        // The selector must name a *long-mode* code segment or the CPU rejects
+        // every gate whose handler lives above 4 GiB; see `gdt::CODE_FLAGS`.
+        ist: ist & IST_MASK,
+        type_byte: gate_type,
         offset_mid: ((address >> 16) & 0xFFFF) as u16,
         offset_high: ((address >> 32) & 0xFFFF_FFFF) as u32,
-        zero: 0,
+        reserved: 0,
     }
 }
 
@@ -471,12 +1112,28 @@ pub unsafe fn init() {
                 .write(gate(0, INTERRUPT_GATE, reserved15_stub as *const ()));
         }
 
-        let descriptor = IdtPseudoDescriptor {
-            limit: (size_of::<Idt>() - 1) as u16,
-            base: (&raw const IDT) as u64,
-        };
+        // The pseudo-descriptor the CPU reads for `lidt` lives in a `static`
+        // rather than a local. A local is *usually* fine, and that is precisely
+        // what makes the failure mode so hard to see: when it is correct nothing
+        // is observably different, and when it is wrong the CPU loads a
+        // descriptor built from whatever the compiler happened to spill into the
+        // same stack slots.
+        //
+        // A `static` removes the question. Nothing can alias it, so the bytes
+        // `lidt` reads are the bytes that were written.
+        static mut IDT_DESCRIPTOR: IdtPseudoDescriptor = IdtPseudoDescriptor { limit: 0, base: 0 };
 
-        asm!("lidt [{}]", in(reg) &descriptor, options(readonly, nostack, preserves_flags));
+        // SAFETY: `init` is the sole writer, called once from `_start`, and the
+        // write happens-before the `lidt` that reads it in the same block.
+        let descriptor = &mut *addr_of_mut!(IDT_DESCRIPTOR);
+        descriptor.limit = (size_of::<Idt>() - 1) as u16;
+        descriptor.base = (&raw const IDT) as u64;
+
+        core::arch::asm!(
+            "lidt [{descriptor}]",
+            descriptor = in(reg) addr_of!(IDT_DESCRIPTOR),
+            options(readonly, nostack, preserves_flags)
+        );
     }
 
     klog!(Level::Debug, "idt: loaded {IDT_ENTRIES} entries");

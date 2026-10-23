@@ -8,10 +8,16 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr::{addr_of, addr_of_mut};
 
+use crate::arch::capabilities::{ByteSink, Console};
 use crate::klog;
 use crate::logger::Level;
 
-/// GDT slot count. Slot 3 stays null so that the TSS can occupy slots 4 and 5.
+/// GDT slot count.
+///
+/// The TSS descriptor is 16 bytes and lives at slot 4, so it straddles slots 4
+/// and 5. Six slots are therefore enough — but the count is asserted against
+/// the TSS's position below, because a table that is one slot short would let
+/// the TSS's second half fall outside the table and make the CPU read garbage.
 const GDT_SLOTS: usize = 6;
 /// Slot index of the TSS low half.
 ///
@@ -51,10 +57,72 @@ const DPL_RING0: u8 = 0;
 /// Ring 3 privilege level.
 const DPL_RING3: u8 = 3;
 
-/// Type bits for a long-mode code segment: present, 64-bit, readable.
+/// Type bits for a long-mode code segment: executable and readable.
+///
+/// These are the *type* bits only — bits 0-3 of the access byte. The `S` bit
+/// (bit 4), the `DPL` bits (5-6) and the present bit (7) are added separately,
+/// because `S` is what distinguishes a code or data segment from a system
+/// segment, and a descriptor without it is not a segment at all.
 const CODE_TYPE: u8 = 0xA;
-/// Type bits for a long-mode data segment: present, writable.
+/// Type bits for a long-mode data segment: writable.
 const DATA_TYPE: u8 = 0x2;
+
+/// The `S` bit of an access byte: "this is a code or data segment".
+///
+/// Without it the descriptor is a *system* segment, and the CPU rejects every
+/// reference to it as a code segment — including the reference the CPU makes
+/// when it validates an IDT gate. The gate is therefore rejected, `#GP` is
+/// raised instead of entering the handler, and the `#GP` gate is rejected the
+/// same way, so the machine escalates to `#DF` and then triple-faults with an
+/// empty serial log.
+const S_BIT: u8 = 1 << 4;
+
+/// The code segment's flags/granularity byte.
+///
+/// Bits: G (granularity) | D/B | L (long mode) | AVL | limit[19:16].
+///
+/// **The `L` bit (bit 5) is mandatory**, and its absence is the single most
+/// expensive mistake available in a GDT.
+///
+/// With `L` clear, the descriptor describes a 16-bit or 32-bit segment, so the
+/// descriptor's high dword — which the CPU reads when validating an interrupt gate
+/// — is defined to be zero. Every 64-bit IDT gate has a non-zero high dword,
+/// because any kernel address above 4 GiB puts part of the handler address in
+/// bits 32..48. The CPU therefore fails gate validation and raises `#GP` *instead
+/// of* entering the handler.
+///
+/// The result is a triple fault with an empty serial log, because the `#GP`
+/// handler is reached through the same invalid gate. The kernel boots, passes
+/// every test that does not take an exception, and then dies silently at the
+/// first one — which is precisely the failure this comment exists to prevent.
+///
+/// **The `D/B` bit (bit 6) must be clear**, which is the second half of the
+/// same mistake and is just as fatal. `D/B` selects the default operand size
+/// for the segment: 32-bit when set, 16-bit when clear. In 64-bit mode there is
+/// no 16-bit operand size, so the architectural requirement is that a 64-bit
+/// code segment leaves `D/B` clear. The CPU enforces it: the gate validation
+/// path rejects any descriptor whose `L` bit is set *and* whose `D/B` bit is
+/// set, raising `#GP` instead of entering the handler — so a code segment
+/// encoded as `0xEF` rather than `0xAF` produces exactly the same silent
+/// triple fault as a missing `L` bit.
+///
+/// `0xAF` = G | L | limit[19:16]. `0xEF` would additionally set `D/B`.
+const CODE_FLAGS: u8 = 0x80 | 0x20 | 0x0F;
+
+/// The data segment's flags/granularity byte.
+///
+/// `0xCF` = G | D/B | P | S | data. No `L` bit: it is meaningless for a data
+/// segment, and setting it would be a second, subtler way to make the CPU reject
+/// an access.
+const DATA_FLAGS: u8 = 0xC0 | 0x0F;
+
+/// GDT selector of the long-mode code segment, named so the IDT gates and the
+/// `selector` field above cannot disagree about which descriptor they mean.
+const KERNEL_CODE_INDEX: usize = 1;
+/// GDT selector of the long-mode data segment.
+const KERNEL_DATA_INDEX: usize = 2;
+/// GDT slot reserved so the 16-byte TSS descriptor lands on a 16-byte boundary.
+const RESERVED_SLOT: usize = 3;
 /// Type bits for the TSS: present, 64-bit available.
 const TSS_TYPE: u8 = 0x9;
 
@@ -68,17 +136,86 @@ pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 pub const FAULT_STACK_SIZE: usize = 16 * 1024;
 
 /// The 16-byte system-segment entry the TSS occupies in the GDT.
+///
+/// # It is sixteen bytes, not eight
+///
+/// A system-segment descriptor (TSS or LDT) is **twice** the size of a code or
+/// data descriptor: it holds the base address across *two* 8-byte slots, so the
+/// base can be a full 64-bit physical address.
+///
+/// Writing only eight bytes leaves the upper half of the descriptor holding
+/// whatever was in the GDT before — in this kernel, zero, because the GDT
+/// starts zeroed. The CPU then reads the TSS base as `0x0000_0000_8b12_5ce0`,
+/// which is not the TSS's address at all, and every access to the TSS — the
+/// `RSP0` load on a privilege transition, the IST1 load on an exception — reads
+/// from unmapped memory.
+///
+/// The symptom is exceptionally misleading. The machine boots, runs every test
+/// that does not take an exception, and then triple-faults with no output the
+/// first time an exception occurs. Nothing in the serial log points at the GDT,
+/// because the GDT is never printed by anything but a deliberate dump.
+///
+/// The `const _: () = assert!` below makes the size a compile-time invariant.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct TssDescriptor {
     limit_low: u16,
     base_low: u16,
+    /// Base bits 23:16.
     base_mid: u8,
     access: u8,
     /// Limit bits 19:16; no granularity bit, since a TSS limit is a byte count.
     limit_flags: u8,
+    /// Base bits 31:24.
     base_high: u8,
+    // --- second 8-byte slot ---
+    /// Base bits 39:32.
+    base_32_39: u8,
+    /// Base bits 47:40.
+    base_40_47: u8,
+    /// Base bits 55:48.
+    base_48_55: u8,
+    /// Base bits 63:56.
+    base_56_63: u8,
+    /// Reserved; must be zero.
+    reserved: u32,
 }
+
+const _: () = {
+    use core::mem::offset_of;
+
+    // The 64-bit TSS descriptor is 16 bytes, and its *first* eight bytes have
+    // exactly the layout of a code or data descriptor:
+    //
+    //   bytes 0-1   limit[15:0]
+    //   bytes 2-3   base[15:0]
+    //   byte  4     base[23:16]
+    //   byte  5     access
+    //   byte  6     limit[19:16] | flags
+    //   byte  7     base[31:24]
+    //   bytes 8-11  base[63:32]
+    //   bytes 12-15 reserved
+    //
+    // The access byte is therefore at offset 5 for the TSS as well, not 6 —
+    // the difference from an ordinary segment is that the *base* is 64 bits
+    // wide, not that the access byte moves. Moving it is the mistake that
+    // makes `ltr` raise `#GP`, which is a fault the CPU delivers through the
+    // IDT the kernel has not installed yet.
+    assert!(offset_of!(TssDescriptor, limit_low) == 0);
+    assert!(offset_of!(TssDescriptor, base_low) == 2);
+    assert!(offset_of!(TssDescriptor, base_mid) == 4);
+    assert!(offset_of!(TssDescriptor, access) == 5);
+    assert!(offset_of!(TssDescriptor, limit_flags) == 6);
+    assert!(offset_of!(TssDescriptor, base_high) == 7);
+    assert!(offset_of!(TssDescriptor, base_32_39) == 8);
+    assert!(offset_of!(TssDescriptor, base_56_63) == 11);
+    assert!(offset_of!(TssDescriptor, reserved) == 12);
+};
+
+const _: () = assert!(
+    size_of::<TssDescriptor>() == 16,
+    "a TSS descriptor is 16 bytes; writing 8 leaves the CPU reading a garbage base"
+);
 
 /// An 8-byte code/data segment entry.
 #[derive(Clone, Copy)]
@@ -102,43 +239,118 @@ struct PseudoDescriptor {
 
 /// Task State Segment for ring 0.
 ///
-/// Only the fields x86-64 consults on a privilege transition are present:
-/// `privilege_stack_table[0]` selects the ring-0 stack, and
-/// `interrupt_stack_table_index` names the L0 interrupt stack.
+/// Only the fields x86-64 consults on an exception or privilege transition are
+/// present: `rsp0` selects the ring-0 stack, and `ist` holds the seven interrupt
+/// stack table entries a gate's IST field can select.
+///
+/// # The layout must be reproduced byte for byte
+///
+/// This is a hardware structure the CPU reads on every exception and privilege
+/// transition, so every offset is ABI. The canonical 64-bit TSS is **104 bytes**:
+///
+/// ```text
+///    0  reserved0        (4, zero)
+///    4  reserved1        (4, zero)      <-- easy to omit
+///    8  rsp0             (8)
+///   16  rsp1             (8)
+///   24  rsp2             (8)
+///   32  reserved2        (8, zero)
+///   40  ist[0] .. ist[6] (7 * 8 = 56)   <-- ist[0] is IST1, NOT IST0
+///   96  reserved3        (8, zero)
+///  104  i64Reserved      (2, zero)
+///  106  istIndex         (2)
+///  108  reserved4        (8, zero)
+///  116  -- end, 124 bytes total
+/// ```
+///
+/// Three ways this goes wrong, all of which are invisible until the first
+/// exception is taken:
+///
+/// 1. Omitting the second reserved word shifts every meaningful field down four
+///    bytes, so `ist[0]` is read from where `reserved2` should be and the CPU
+///    switches stacks to an address that is not a stack. The resulting fault in
+///    the fault handler is itself unreportable, and the machine triple-faults
+///    with an empty serial log.
+/// 2. Treating `ist` as a 7-entry array indexed by *IST number* rather than
+///    *offset*, so `ist[1]` is IST2 and IST1 reads `ist[0]`.
+/// 3. Adding the trailing reserved words the diagram above does not list, which
+///    pushes the size past 124 and makes the descriptor's limit point at memory
+///    the kernel does not own.
+///
+/// The `const _: () = assert!` below turns all three into compile errors.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct TaskStateSegment {
     reserved0: u32,
-    /// Ring 3 privilege stack pointer.
+    /// Second reserved word. Must be present; see the type note.
+    reserved1: u32,
+    /// Ring 0 stack pointer used on a privilege transition (`RSP0`).
     pub privilege_stack_table: [u64; 3],
-    /// Ring 3 privilege stack segment selector (unused under 64-bit).
-    reserved1: u64,
-    /// Ring 0 stack pointers, one per IST index.
-    pub interrupt_stack_table: [u64; 7],
+    /// Reserved. Keeps `ist` at its architectural offset of 40.
     reserved2: u64,
+    /// The seven IST entries. `ist[0]` is **IST1**; IST0 does not exist.
+    pub interrupt_stack_table: [u64; 7],
     reserved3: u64,
-    reserved4: u64,
-    reserved5: u64,
-    /// IST index used by exceptions arriving from ring 3, i.e. double fault.
+    /// `I64Reserved`. Must be zero.
+    i64reserved: u16,
+    /// IST index for exceptions arriving from ring 3.
     pub interrupt_stack_table_index: u16,
-    reserved6: u16,
-    reserved7: u64,
+    reserved4: u64,
 }
+
+/// Compile-time proof that the fields sit at their architectural offsets.
+///
+/// Deliberately asserts *offsets* rather than a total size. The size of a 64-bit
+/// TSS is reported inconsistently across references — 104 bytes in some, 116 in
+/// others, the difference being whether the trailing reserved word is counted —
+/// so pinning the size would encode one source's convention as a hard rule. The
+/// offsets, by contrast, are unambiguous and are the only thing the CPU actually
+/// uses: `RSP0` at 8, IST1 at 40, and the IST index at 106.
+///
+/// Each of these is a field the kernel reads or the CPU loads, so getting one
+/// wrong is a silent misbehaviour rather than a compile error elsewhere.
+const _: () = {
+    use core::mem::offset_of;
+
+    assert!(offset_of!(TaskStateSegment, privilege_stack_table) == 8);
+    assert!(offset_of!(TaskStateSegment, interrupt_stack_table) == 40);
+    assert!(offset_of!(TaskStateSegment, interrupt_stack_table_index) == 106);
+    // Three stack pointers, then the word that keeps the IST array at 40. Without
+    // the check, dropping `reserved2` would slide every IST entry down eight
+    // bytes and install the fault stack into what the CPU reads as IST0's
+    // neighbour.
+    assert!(
+        offset_of!(TaskStateSegment, privilege_stack_table) + 3 * 8
+            == offset_of!(TaskStateSegment, reserved2)
+    );
+    // Seven IST entries must fit before the word that follows them.
+    assert!(
+        offset_of!(TaskStateSegment, interrupt_stack_table) + 7 * 8
+            == offset_of!(TaskStateSegment, reserved3)
+    );
+};
+
+/// The architectural index of IST1 within
+/// [`TaskStateSegment::interrupt_stack_table`].
+///
+/// The array is *offset* by one, because IST0 does not exist: the CPU's IST1 is
+/// `interrupt_stack_table[0]`. Writing `interrupt_stack_table[FAULT_IST_INDEX]`
+/// therefore installs the IST2 stack and leaves IST1 pointing at zero, which is
+/// what makes a double fault switch to address 0 and triple-fault.
+pub const IST_ARRAY_OFFSET: usize = 1;
 
 impl TaskStateSegment {
     const fn zeroed() -> Self {
         Self {
             reserved0: 0,
-            privilege_stack_table: [0; 3],
             reserved1: 0,
-            interrupt_stack_table: [0; 7],
+            privilege_stack_table: [0; 3],
             reserved2: 0,
+            interrupt_stack_table: [0; 7],
             reserved3: 0,
-            reserved4: 0,
-            reserved5: 0,
+            i64reserved: 0,
             interrupt_stack_table_index: 0,
-            reserved6: 0,
-            reserved7: 0,
+            reserved4: 0,
         }
     }
 }
@@ -166,16 +378,142 @@ static mut GDT: Gdt = Gdt {
 /// contract does not already provide.
 static mut TSS: TaskStateSegment = TaskStateSegment::zeroed();
 
-/// The dedicated ring 0 stack that interrupts arriving from ring 3 land on.
-static mut KERNEL_STACK: UnsafeCell<[u8; KERNEL_STACK_SIZE]> =
-    UnsafeCell::new([0; KERNEL_STACK_SIZE]);
-
-/// The stack used to handle a fault arriving from ring 3.
+/// A stack buffer the CPU may load as a stack pointer.
 ///
-/// A separate stack is mandatory: if a user thread overflowed its own stack,
-/// reusing it to report the fault would fault again, producing a triple fault
-/// that destroys all diagnostic context.
-static mut FAULT_STACK: UnsafeCell<[u8; FAULT_STACK_SIZE]> = UnsafeCell::new([0; FAULT_STACK_SIZE]);
+/// The `align(16)` goes on the *type*, not the static: `#[repr(align(..))]` is a
+/// type attribute and does not apply to `static` items. Wrapping the buffer in a
+/// newtype is the supported way to express "this array's storage is aligned",
+/// and it keeps the alignment attached to the buffer rather than to the one place
+/// that happens to declare it — so a future stack added to the same module
+/// inherits the guarantee instead of having to remember it.
+#[repr(align(16))]
+struct AlignedStack<const N: usize>(UnsafeCell<[u8; N]>);
+
+// SAFETY: the buffer is genuinely shared — it is a static read by any core — but
+// never *concurrently* accessed from Rust. The only writer is the CPU, using the
+// stack pointer it was handed, and that happens with interrupts masked and
+// without any Rust reference in scope: the CPU's own pushes are outside the
+// memory model entirely.
+//
+// There is also exactly one writer at a time even in principle. `RSP0` is
+// switched by `set_privilege_stack` only while the current thread is not running,
+// and IST1 is entered with interrupts disabled. So no two accesses can overlap,
+// which is what `Sync` requires.
+//
+// The counter-argument — "a thread could be interrupted mid-push by a fault that
+// also uses this stack" — is why the fault stack is separate and why that gate
+// carries IST1: a fault arriving from ring 3 switches to `FAULT_STACK` rather
+// than continuing on the interrupted thread's `RSP0`.
+unsafe impl<const N: usize> Sync for AlignedStack<N> {}
+
+impl<const N: usize> AlignedStack<N> {
+    const fn new() -> Self {
+        Self(UnsafeCell::new([0; N]))
+    }
+
+    /// Address of the first byte, which is where the CPU may push downwards from
+    /// the far end.
+    fn base(&self) -> u64 {
+        // Taking the address of a live reference's field needs no `unsafe`: `self`
+        // is a valid reference to a `'static`, and `addr_of!` never dereferences.
+        addr_of!(self.0) as u64
+    }
+
+    /// Address one past the last byte: the value the CPU loads as a stack
+    /// pointer.
+    fn top(&self) -> u64 {
+        self.base() + N as u64
+    }
+}
+
+/// The stack the CPU loads as `RSP0` on a privilege transition.
+///
+/// `static`, not `static mut`: the only writer is the CPU, through the stack
+/// pointer, and `UnsafeCell` inside [`AlignedStack`] is what permits that. A
+/// `static mut` here would be wrong twice over — it would claim the kernel
+/// mutates the buffer in Rust (it does not) and it would let `init` take a
+/// shared reference to a mutable static, which is UB by construction in
+/// edition 2024.
+static KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack::new();
+
+/// Move the CPU onto the kernel's own stack and return.
+///
+/// # Why the kernel must switch stacks rather than run on the bootloader's
+///
+/// `_start` arrives on whatever stack the bootloader set up — Limine's, in the
+/// direct-map region. Nothing requires the kernel to stay there, and several
+/// things go wrong if it does.
+///
+/// The bootloader's stack is sized to `LIMINE_STACK_SIZE` and is shared with the
+/// protocol structures Limine left on it. Worse, it lives in the *direct map*,
+/// so its address has no relationship to the kernel image: a fault report that
+/// prints `RSP` then shows an address that looks like it is outside the kernel,
+/// and the real stack-depth problem is masked by the surprise.
+///
+/// Most concretely, the CPU pushes the exception frame onto whatever stack is
+/// current when the gate's IST field is 0, and the dispatch routine then reads
+/// that frame as a `FaultFrame`. If the current stack is one the kernel does not
+/// own, the handler can fault while trying to report the original fault, and
+/// the machine escalates `#DE` to `#DF` to a triple fault with no output.
+///
+/// Switching once, at boot, means every later stack top is one the kernel
+/// controls and one whose alignment it asserted in `init`.
+///
+/// # It returns rather than branching
+///
+/// The naive shape — write `rsp`, then `jmp` to a `-> !` function — discards
+/// `_start`'s return address, because that address lives on the *old* stack.
+/// The function therefore returns normally: the `ret` reads `_start`'s return
+/// address, which is still intact on the bootloader's stack, and pops into the
+/// new one.
+///
+/// The alternative, inline assembly that moves the return address first, is
+/// sound too but leaves the compiler reasoning about a frame that no longer
+/// exists, which is exactly the situation where it will helpfully insert a
+/// stack access it believes is safe.
+///
+/// # Safety
+///
+/// Must be called with interrupts masked. The caller must not hold any local
+/// whose address escapes into the new stack frame; in practice this is called
+/// once from `_start`, whose remaining locals are all re-read after the switch.
+#[inline]
+pub unsafe fn switch_to_kernel_stack() {
+    let top = KERNEL_STACK.top();
+    debug_assert!(
+        top % 16 == 0,
+        "the kernel stack top must be 16-byte aligned"
+    );
+
+    // SAFETY: delegated to this function's contract. `top` is one past the last
+    // byte of a kernel-owned, 16-byte-aligned buffer, which is where a
+    // downward-growing stack starts.
+    unsafe {
+        // `nostack` would be a lie: the instruction *does* change `rsp`, so the
+        // compiler must not assume it is unchanged across this block.
+        asm!("mov rsp, {top}", top = in(reg) top, options(nomem));
+    }
+}
+
+/// The dedicated stack that exceptions arriving from ring 3 land on.
+///
+/// A separate stack is mandatory, not a convenience: if a user thread overflowed
+/// its own stack, reusing it to report the fault would fault again inside the
+/// handler, producing a triple fault that destroys every scrap of diagnostic
+/// context. This is the stack `#PF` and `#DF` switch to via IST1.
+///
+/// The 16-byte alignment carried by [`AlignedStack`] is what keeps the CPU from
+/// raising `#GP` *while trying to deliver an exception*. That failure is
+/// invisible until the first fault: a `.bss` array is packed against whatever
+/// precedes it, so its address ends up at an arbitrary offset such as `0xca9`,
+/// which looks like a perfectly ordinary address right up until the CPU checks
+/// its low four bits.
+/// its low four bits.
+///
+/// `static`, not `static mut`: only the CPU writes here, via the stack pointer it
+/// loads from the TSS, and `AlignedStack`'s `UnsafeCell` is what makes that
+/// sound without claiming Rust-level mutation.
+static FAULT_STACK: AlignedStack<FAULT_STACK_SIZE> = AlignedStack::new();
 
 /// Borrow the TSS.
 ///
@@ -253,8 +591,26 @@ pub unsafe fn init() {
         write_slot(gdt_base, 3, 0);
 
         let tss = tss_mut();
-        let kernel_top = addr_of!(KERNEL_STACK) as u64 + KERNEL_STACK_SIZE as u64;
-        let fault_top = addr_of!(FAULT_STACK) as u64 + FAULT_STACK_SIZE as u64;
+        let kernel_top = KERNEL_STACK.top();
+        let fault_top = FAULT_STACK.top();
+
+        // Both stacks must present a 16-byte-aligned top to the CPU. `RSP0` and
+        // the IST entries are checked here, at boot, so a linker change that
+        // breaks alignment is reported with a message instead of surfacing as a
+        // triple fault the first time an exception is taken — by which point the
+        // machine has already reset and there is nothing left to print.
+        //
+        // Checking the *top* rather than the base is what matters: a stack whose
+        // base is aligned but whose size is not a multiple of 16 has an unaligned
+        // top, which is the value the CPU actually loads.
+        assert!(
+            kernel_top % 16 == 0,
+            "the ring 0 stack top is not 16-byte aligned; the CPU faults on use",
+        );
+        assert!(
+            fault_top % 16 == 0,
+            "the IST1 fault stack top is not 16-byte aligned; the CPU faults on use",
+        );
 
         // Interrupt arriving from ring 3 must switch to the kernel stack, not to
         // whatever user stack the thread was running on.
@@ -265,11 +621,21 @@ pub unsafe fn init() {
         // a packed field is the documented way to do this.
         (&raw mut (*tss).privilege_stack_table[0]).write(kernel_top);
         (&raw mut (*tss).interrupt_stack_table_index).write(FAULT_IST_INDEX);
-        (&raw mut (*tss).interrupt_stack_table[FAULT_IST_INDEX as usize]).write(fault_top);
+        // `interrupt_stack_table[0]` is IST1, not IST0: the CPU's IST1 is the
+        // first entry of the array. Indexing by `FAULT_IST_INDEX` directly
+        // installs the IST2 stack and leaves IST1 holding zero, so a double fault
+        // switches to address 0 and triple-faults with no output. The subtraction
+        // is what makes the relationship between the CPU's IST number and the
+        // array index explicit rather than assumed.
+        (&raw mut (*tss).interrupt_stack_table[FAULT_IST_INDEX as usize - IST_ARRAY_OFFSET])
+            .write(fault_top);
 
         // Fill the 16-byte TSS descriptor last: it needs the final TSS base.
         let tss_base = tss as u64;
         let tss_limit = (size_of::<TaskStateSegment>() - 1) as u16;
+        // A TSS limit is a byte count and the segment is 124 bytes, so this must
+        // fit in 16 bits *without* the granularity bit doing any scaling.
+        assert!(size_of::<TaskStateSegment>() <= 0x10000);
         write_tss_descriptor(gdt_base, TSS_SLOT, tss_base, tss_limit);
 
         let descriptor = PseudoDescriptor {
@@ -277,6 +643,30 @@ pub unsafe fn init() {
             base: addr_of!(GDT) as u64,
         };
 
+        // `lgdt` reads the pseudo-descriptor directly out of memory, so
+        // nothing may run between building it and the instruction — not even
+        // a diagnostic that only reads it. A function call in between
+        // overwrites the stack slot the descriptor occupies, and the CPU then
+        // loads whatever the callee left there: a wrong limit and a wrong
+        // base, which leaves the CPU using the bootloader's table.
+        //
+        // The symptom is silent and deeply misleading: the kernel boots, runs
+        // every test that does not take an exception, and then triple-faults
+        // on the first one, with nothing in the log pointing at the GDT.
+        //
+        // `lgdt` first, then the segment reloads, then `ltr`.
+        //
+        // The order is not interchangeable. `ltr` raises `#GP` if its selector
+        // does not name a present TSS descriptor, so it must come after the GDT
+        // holding that descriptor is installed — but the IDT is not installed at
+        // this point, so a failure here would have nowhere to land.
+        //
+        // `lgdt` itself cannot fault: the pseudo-descriptor is a stack local and
+        // the table it describes is static, both mapped and written. The
+        // remaining instructions are non-faulting for the same reason, so this
+        // window is closed by construction rather than by ordering luck.
+        //
+        // SAFETY: delegated to this function's contract.
         load_gdt(&descriptor);
         reload_data_segments();
         load_tss(KERNEL_TSS_SELECTOR);
@@ -286,6 +676,72 @@ pub unsafe fn init() {
             "gdt: loaded 6 slots, tss rsp0={kernel_top:#x} ist{FAULT_IST_INDEX}={fault_top:#x}"
         );
     }
+}
+
+/// Print the raw GDT and IDT bytes to the console.
+///
+/// The GDT is the one structure whose corruption produces a symptom with no
+/// diagnostic of its own: a bad descriptor means the CPU rejects the gate and
+/// raises `#GP` instead of entering the handler, and the `#GP` handler is reached
+/// through an equally bad gate, so the machine triple-faults with an empty log.
+///
+/// Dumping the raw bytes lets the encoding be checked against the architectural
+/// layout by eye, which is far faster than reasoning about what a mis-encoded
+/// byte *would* do.
+///
+/// Separate from [`init`] because the console must already exist: `init` runs
+/// before the UART is programmed, so anything it prints is silently discarded.
+pub fn dump_tables() {
+    dump_table("gdt", addr_of!(GDT) as *const u8, size_of::<Gdt>());
+    dump_table(
+        "idt",
+        crate::arch::x86_64::idt::idt_bytes(),
+        crate::arch::x86_64::idt::IDT_ENTRIES * 16,
+    );
+    // The pseudo-descriptors `lgdt` and `lidt` actually read. Printing them
+    // settles whether the *instruction* was issued with the right bytes, which
+    // is a different question from whether the tables themselves are correct.
+    crate::arch::x86_64::idt::dump_pseudo_descriptors();
+}
+
+/// The raw bytes of the GDT's pseudo-descriptor.
+///
+/// The ten bytes `lgdt` reads: a little-endian 16-bit limit followed by a
+/// little-endian 64-bit base.
+///
+/// Returned by value rather than by pointer to a stack temporary, because a
+/// pointer would dangle by the time the caller dereferenced it — and a
+/// diagnostic that reads freed stack is worse than no diagnostic at all.
+pub fn pseudo_descriptor_bytes() -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    bytes[0..2].copy_from_slice(&((size_of::<Gdt>() - 1) as u16).to_le_bytes());
+    bytes[2..10].copy_from_slice(&(addr_of!(GDT) as u64).to_le_bytes());
+    bytes
+}
+
+/// Print a table's raw bytes to the console, for boot-time diagnosis.
+///
+/// Deliberately primitive: it formats hex itself and writes through the console
+/// directly, because a diagnostic that depends on the subsystem it is diagnosing
+/// cannot report that subsystem's failure.
+fn dump_table(label: &str, bytes: *const u8, len: usize) {
+    let mut line = ByteSink::<96>::new();
+    line.push_str("[NOVA] DBG ");
+    line.push_str(label);
+    line.push_str(": ");
+    for index in 0..len {
+        if index % 16 == 0 && index != 0 {
+            crate::arch::console().send_bytes(line.as_bytes());
+            line = ByteSink::<96>::new();
+            line.push_str("[NOVA] DBG   ");
+        }
+        // SAFETY: `bytes` points at `len` readable bytes of a table the caller
+        // owns, and `index` is within that range.
+        let byte = unsafe { *bytes.add(index) };
+        line.push_hex(byte as u64);
+        line.push_str(" ");
+    }
+    crate::arch::console().send_bytes(line.as_bytes());
 }
 
 /// The null segment: present bit clear, so any use faults.
@@ -310,9 +766,9 @@ const fn code_segment(selector: u16, dpl: u8) -> SegmentDescriptor {
         limit_low: 0xFFFF,
         base_low: 0,
         base_mid: 0,
-        access: (1 << 7) | (dpl << 5) | CODE_TYPE | if dpl == DPL_RING3 { 0x4 } else { 0 },
-        // 4 KiB granularity, plus the high limit bits.
-        limit_flags: 0xC0 | 0xF,
+        access: (1 << 7) | S_BIT | (dpl << 5) | CODE_TYPE | if dpl == DPL_RING3 { 0x4 } else { 0 },
+        // Must include the long-mode bit; see `CODE_FLAGS`.
+        limit_flags: CODE_FLAGS,
         base_high: 0,
     }
 }
@@ -324,25 +780,205 @@ const fn data_segment(selector: u16, dpl: u8) -> SegmentDescriptor {
         limit_low: 0xFFFF,
         base_low: 0,
         base_mid: 0,
-        access: (1 << 7) | (dpl << 5) | DATA_TYPE,
-        limit_flags: 0xC0 | 0xF,
+        access: (1 << 7) | S_BIT | (dpl << 5) | DATA_TYPE,
+        // Must not include the long-mode bit; see `DATA_FLAGS`.
+        limit_flags: DATA_FLAGS,
         base_high: 0,
     }
 }
 
 /// Pack an 8-byte segment descriptor into its 64-bit GDT slot form.
 const fn encode(segment: SegmentDescriptor) -> u64 {
-    // Widening casts rather than `u32::from`: `From` is not a `const` trait on
-    // this toolchain, and the whole encoder is `const` so that descriptor
-    // construction stays checkable at compile time.
-    let low = (segment.limit_low as u64)
-        | ((segment.base_mid as u64) << 16)
-        | ((segment.access as u64) << 40)
-        | ((segment.limit_flags as u64) << 48)
-        | ((segment.base_high as u64) << 56);
-    let high = segment.base_low as u64;
-    low | (high << 32)
+    // The architectural byte order, which is what the CPU reads:
+    //
+    //   bytes 0-1   limit[15:0]
+    //   bytes 2-3   base[15:0]
+    //   byte  4     base[23:16]
+    //   byte  5     access
+    //   byte  6     limit[19:16] | G | D/B | L | AVL
+    //   byte  7     base[31:24]
+    //
+    // The struct splits `base[15:0]` into `base_low: u16` and `base_mid: u8`
+    // because that is how the original reference code named it, and the two
+    // together must land in bytes 2-3. Everything after that follows the byte
+    // order above.
+    //
+    // # `access` is byte 5, not byte 4
+    //
+    // Placing `access` anywhere but byte 5 is the failure that costs the most
+    // time, because the resulting descriptor still looks like a segment
+    // descriptor. It is a segment descriptor whose *fields have moved*, so the
+    // CPU reads the `S`, `CS` and `L` bits out of bytes that hold the base and
+    // the limit instead, decides the descriptor is not a code segment, and
+    // raises `#GP` for every reference to it.
+    //
+    // The reference that hurts is the IDT: every gate names
+    // `KERNEL_CODE_SELECTOR`, so the moment an exception is taken the CPU
+    // rejects the gate, raises `#GP` instead of entering the handler, and the
+    // `#GP` gate is rejected the same way. The machine escalates to `#DF` and
+    // then to a triple fault with an empty serial log.
+    //
+    // A code segment with a zero base is a poor test of this, because it stays
+    // usable even when mis-encoded for the higher half: long mode ignores the
+    // base for segment purposes. Only the present bit and the type still
+    // matter, which is why a one-byte shift can survive every test that does
+    // not take an exception.
+    //
+    // The bytes are assembled one at a time rather than by shifting fields
+    // into a `u64`, because a shift encodes the same layout decision in a
+    // place where it is easy to get wrong by eight, and a wrong shift is
+    // invisible in the source. Listing the bytes makes the layout the code.
+    let bytes = [
+        segment.limit_low as u8,
+        (segment.limit_low >> 8) as u8,
+        segment.base_low as u8,
+        (segment.base_low >> 8) as u8,
+        segment.base_mid,
+        segment.access,
+        segment.limit_flags,
+        segment.base_high,
+    ];
+    u64::from_le_bytes(bytes)
 }
+
+/// Compile-time proof that the GDT encodings are what the CPU requires.
+///
+/// These are the invariants whose absence produces a silent triple fault rather
+/// than a diagnostic, so they are checked here rather than discovered by booting.
+const _: () = {
+    // The long-mode bit must be set on the code segment. See `CODE_FLAGS`.
+    assert!(
+        CODE_FLAGS & (1 << 5) != 0,
+        "the code segment must set the L bit"
+    );
+    // Granularity is required for a 4 KiB-granularity long segment.
+    assert!(CODE_FLAGS & (1 << 7) != 0, "granularity must be set");
+    // D/B must be *clear* on a 64-bit code segment. The CPU rejects a gate whose
+    // target descriptor has both L and D/B set, which is a `#GP` on every
+    // exception and therefore a triple fault on the first one.
+    assert!(
+        CODE_FLAGS & (1 << 6) == 0,
+        "a 64-bit code segment must leave D/B clear",
+    );
+    // L is bit 5 of the *flags* byte; the present bit (P, bit 7 of *access*) is
+    // the other half of the descriptor and is set in `code_segment`. Checking it
+    // here against `CODE_FLAGS` would be checking the wrong byte.
+    //
+    // The access byte is `P | S | DPL | type`. Both the present bit and the
+    // `S` bit are required, and both are asserted on the *built* descriptor
+    // below rather than on the constants, because a constant expression of the
+    // form `a | b != 0` is trivially true for every non-zero `a` and proves
+    // nothing.
+    //
+    // The four type bits are, from bit 3 down: executable (1 = code, 0 = data),
+    // conforming/readable, readable/writable, accessed. So a readable code
+    // segment is 0b1010 = 0xA and a writable data segment is 0b0010 = 0x2.
+    assert!(
+        CODE_TYPE & 0x8 != 0,
+        "the code descriptor must be a code type"
+    );
+    assert!(CODE_TYPE & 0x2 != 0, "the code segment must be readable");
+    assert!(
+        DATA_TYPE & 0x8 == 0,
+        "the data descriptor must be a data type"
+    );
+    assert!(DATA_TYPE & 0x2 != 0, "the data segment must be writable");
+    // The `S` bit must be set on a code or data segment. Without it the
+    // descriptor is a *system* segment, and the CPU refuses to use it as the
+    // target of an IDT gate — which turns the first exception into a triple
+    // fault with an empty serial log.
+    assert!(
+        code_segment(KERNEL_CODE_SELECTOR, DPL_RING0).access & S_BIT != 0,
+        "the code descriptor's access byte must set the S bit",
+    );
+    assert!(
+        data_segment(KERNEL_DATA_SELECTOR, DPL_RING0).access & S_BIT != 0,
+        "the data descriptor's access byte must set the S bit",
+    );
+    // The TSS is a *system* segment, so its access byte must **not** set `S`.
+    // Setting it would make the descriptor a 64-bit code segment with a
+    // 16-byte limit, and `ltr` would fail with `#GP`.
+    //
+    // The type field of a 64-bit available TSS is `0b1001`: bit 0 says the
+    // descriptor is a TSS rather than an LDT, bit 2 says it is available, and
+    // bit 3 says it is the 64-bit form.
+    assert!(
+        TSS_TYPE == 0b1001,
+        "the TSS type must be a 64-bit available TSS descriptor",
+    );
+    // Neither should be marked accessed: the CPU manages that bit, and a preset
+    // value is a (harmless but wrong) claim about hardware state.
+    assert!(CODE_TYPE & 0x1 == 0, "accessed must be left to the CPU");
+    assert!(DATA_TYPE & 0x1 == 0, "accessed must be left to the CPU");
+
+    // The selectors the IDT gates and `KERNEL_CODE_SELECTOR` name must be the
+    // slots `init` actually writes, or `lidt` gates point at the wrong
+    // descriptor.
+    assert!(KERNEL_CODE_SELECTOR == (KERNEL_CODE_INDEX as u16) * 8);
+    assert!(KERNEL_DATA_SELECTOR == (KERNEL_DATA_INDEX as u16) * 8);
+
+    // The TSS descriptor is 16 bytes, so it must occupy two whole 8-byte slots.
+    assert!(
+        TSS_SLOT * 8 + 16 <= GDT_SLOTS * 8,
+        "the TSS must fit in the GDT"
+    );
+    // And the slot before it must be the reserved one, or the descriptor would
+    // overlap the data segment.
+    assert!(TSS_SLOT == RESERVED_SLOT + 1);
+
+    // The encoder's byte layout, pinned.
+    //
+    // A kernel code segment: present, ring 0, code, readable.
+    //
+    //   access = 0x9A = present(0x80) | S(0x10) | code(0x08) | readable(0x02)
+    //   flags  = 0xAF = G(0x80) | L(0x20) | limit[19:16](0x0F)
+    //
+    // The low nibble of the flags byte is *not* the type — the type lives in
+    // the access byte. In the flags byte those four bits are limit[19:16], and
+    // they are 0xF so that the limit is the full 4 GiB that `G` implies.
+    //
+    // The `S` bit matters as much as the type does: without it the descriptor
+    // is a system segment, and the CPU rejects the gate that names it.
+    //
+    // little-endian, byte 0 first: FF FF 00 00 00 9A AF 00
+    assert!(
+        encode(code_segment(KERNEL_CODE_SELECTOR, DPL_RING0)) == 0x00AF_9A00_0000_FFFF,
+        "the code descriptor must encode to limit=0xffff access=0x9a flags=0xaf",
+    );
+
+    // A data segment: present, ring 0, writable, no long-mode bit.
+    //
+    //   access = 0x92 = present(0x80) | S(0x10) | writable(0x02)
+    //   flags  = 0xCF = G(0x80) | D/B(0x40) | limit[19:16](0x0F)
+    //
+    // Note that a data segment's access byte does *not* carry the "data" bit:
+    // bit 3 of the type field is the code/data selector, and it is 0 for data.
+    //
+    // little-endian, byte 0 first: FF FF 00 00 00 92 CF 00
+    assert!(
+        encode(data_segment(KERNEL_DATA_SELECTOR, DPL_RING0)) == 0x00CF_9200_0000_FFFF,
+        "the data descriptor must encode to limit=0xffff access=0x92 flags=0xcf",
+    );
+
+    // The access byte is byte 5 and the flags byte is byte 6. These two checks
+    // are the ones that matter: a descriptor whose access byte is not present
+    // is unusable, and every reference to it raises `#GP` — including the one
+    // the CPU makes when validating an IDT gate, which turns the first
+    // exception into a triple fault.
+    let encoded = encode(code_segment(KERNEL_CODE_SELECTOR, DPL_RING0));
+    assert!(
+        (encoded >> 40) & 0xFF == 0x9A,
+        "byte 5 must be the access byte, present, a segment, and executable",
+    );
+    assert!(
+        (encoded >> 48) & 0xFF == CODE_FLAGS as u64,
+        "byte 6 must carry limit[19:16] and the granularity/long-mode bits",
+    );
+    assert!(
+        (encoded >> 32) & 0xFF == 0,
+        "byte 4 is base[23:16], which is zero for a flat segment",
+    );
+};
 
 /// Store a packed descriptor into an 8-byte GDT slot.
 fn write_slot(gdt: *mut Gdt, index: usize, value: u64) {
@@ -368,14 +1004,20 @@ fn write_tss_descriptor(gdt: *mut Gdt, slot: usize, base: u64, limit: u16) {
                 base_low: (base & 0xFFFF) as u16,
                 base_mid: ((base >> 16) & 0xFF) as u8,
                 access: (1 << 7) | (DPL_RING0 << 5) | TSS_TYPE,
-                // No granularity bit: a TSS limit is a byte count, not page count.
-                //
-                // `limit` is already a `u16`, so the architectural bits 19:16 are
-                // zero by construction. Writing `(limit >> 16) & 0xF` would be an
-                // arithmetic overflow, not a masked zero — which is the compiler
-                // telling us the *caller* has already done the narrowing.
+                // A TSS limit is a **byte** count, so bit 7 (G, granularity) must
+                // be clear: set, it would multiply the limit by 4096 and describe
+                // a 64 KiB TSS while the kernel only owns 124 bytes.
                 limit_flags: 0,
                 base_high: ((base >> 24) & 0xFF) as u8,
+                // The upper 8-byte slot. Every byte of it is part of the base
+                // address, and every one of them must be written: leaving them
+                // zero makes the CPU read a TSS base of
+                // `0x0000_0000_8b12_5ce0`, which is not the TSS.
+                base_32_39: ((base >> 32) & 0xFF) as u8,
+                base_40_47: ((base >> 40) & 0xFF) as u8,
+                base_48_55: ((base >> 48) & 0xFF) as u8,
+                base_56_63: ((base >> 56) & 0xFF) as u8,
+                reserved: 0,
             });
     }
 }
