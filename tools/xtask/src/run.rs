@@ -506,4 +506,108 @@ mod tests {
         let rendered = tail(Path::new("/nonexistent/serial.log"), 10);
         assert!(rendered.contains("cannot read"));
     }
+
+    // --- Verdict classification ------------------------------------------------
+    //
+    // `cargo xtask test` is only useful if it tells a *failing* kernel apart from
+    // one that never ran. The two look identical from the outside — QEMU stops
+    // either way — so the distinction has to come from the serial log, which
+    // means these cases cannot be covered by booting a working kernel.
+
+    /// Write a serial log and return its path.
+    fn log_with(contents: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "novaos-classify-{}-{:p}.log",
+            std::process::id(),
+            contents
+        ));
+        std::fs::write(&path, contents).expect("temp file is writable");
+        path
+    }
+
+    /// `classify` needs a real `ExitStatus`, which only a reaped child provides.
+    fn status_for(code: i32) -> std::process::ExitStatus {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .expect("sh is available")
+    }
+
+    #[test]
+    fn a_passing_suite_with_the_expected_status_passes() {
+        let path = log_with("[NOVA-TEST] SUMMARY all suites passed\n");
+        let status = status_for(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+
+        let verdict = super::classify(status, "", &path);
+        assert!(verdict.is_ok(), "expected Ok, got {verdict:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reported_failure_is_a_failure_not_a_pass() {
+        // The kernel's own verdict outranks the exit status: it reached
+        // isa-debug-exit cleanly and still failed, so a passing status must not
+        // be read as success.
+        let path = log_with(
+            "[NOVA-TEST]   case boot_smoke ... FAIL: no direct map\n\
+             [NOVA-TEST] SUMMARY failures detected\n",
+        );
+        let status = status_for(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+
+        let verdict = super::classify(status, "", &path).expect_err("must fail");
+        assert!(
+            verdict.contains("boot_smoke"),
+            "the failing case should be named in the report: {verdict}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_kernel_that_never_reported_is_a_pass_failure_not_a_timeout() {
+        // No summary line at all: the kernel halted without reaching the
+        // harness. Reported as a failure so it is distinguishable from the
+        // timeout path, which `invoke` raises when QEMU has to be killed.
+        let path = log_with("BdsDxe: starting Boot0001\n");
+        let status = status_for(0);
+
+        let verdict = super::classify(status, "", &path).expect_err("must fail");
+        assert!(
+            verdict.contains("never printed a passing summary"),
+            "expected the no-summary verdict: {verdict}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_triple_fault_reset_is_not_reported_as_success() {
+        // `-no-reboot` turns a triple fault's reset into a *successful* QEMU
+        // exit, so status 0 with no summary is the signature of a kernel that
+        // reset before running. It must not be mistaken for a pass — which is
+        // exactly what happened before the TSS selector was fixed.
+        let path = log_with("BdsDxe: starting Boot0001\n");
+        let status = status_for(0);
+
+        assert!(
+            super::classify(status, "", &path).is_err(),
+            "a reset kernel reported as passing would hide the bug entirely"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn disagreement_about_the_exit_port_is_called_out() {
+        // A passing log with a status QEMU would not produce means the kernel
+        // and xtask disagree about `iobase`, which would otherwise read as an
+        // unexplained failure.
+        let path = log_with("[NOVA-TEST] SUMMARY all suites passed\n");
+        let status = status_for(7);
+
+        let verdict = super::classify(status, "", &path).expect_err("must fail");
+        assert!(
+            verdict.contains("disagree about the exit port"),
+            "expected the exit-port diagnosis: {verdict}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

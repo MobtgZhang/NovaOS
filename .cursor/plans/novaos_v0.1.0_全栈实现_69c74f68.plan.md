@@ -4,7 +4,7 @@ overview: 在 /mnt/mount/ssd1/NovaOS 从零实现 NovaOS v0.1.0：基于 Limine 
 todos:
   - id: m0-skeleton
     content: M0：workspace + nightly rust-toolchain + xtask(build/image/run/test/fetch-limine) + scripts/qemu.sh + ADR + CI，达成 QEMU 串口冒烟闭环
-    status: in_progress
+    status: completed
   - id: m1-boot
     content: M1：端口 IO 串口 + limine BootInfo 校验 + GDT/IDT/TSS + 异常处理 + bitmap 物理页分配器（含 host 单测）
     status: pending
@@ -57,6 +57,18 @@ isProject: false
 1. 串口必须用端口 IO（`in al,dx` / `out dx,al`）；直接 `write_volatile(0x3F8)` 触发 `#PF CR2=0x3f8` → 无 IDT → 三重故障
 2. Limine 12.x 路径必须带资源前缀：`path: boot():/nova-kernel.elf`，否则 `PANIC: Failed to open executable`
 3. `isa-debug-exit` 端口随 `iobase` 变化：`iobase=0xf4` 要写 **0xf4**（写 0x501 会导致 QEMU 永不退出）
+
+### 追加：M0 收尾时新发现的五个「静默失败」陷阱
+
+上面三个都属于「会报错」类。实际把内核跑通的过程中，另有一组失败**全部没有任何报错**，只能靠逐项二分 QEMU 行为定位，值得单列：
+
+4. **Limine 12 配置语法整体换过**：条目以 `/Title` 开头（不是 11.x 的 `kernel_path:`），协议名是 `limine`（不是 `elf64`），`timeout: 0` 表示「不显示菜单直接启动」而 `no` 恰恰相反。任何一处写错，Limine 只会输出 `[config file contains no valid entries]` 然后停在条目菜单——**没有构建错误**，harness 只会报 timeout。另：`default_entry` 必须写裸名 `NovaOS`，`/NovaOS` 会被解析成空前缀而静默关闭 autoboot。
+5. **`module_path` 指向 ISO 上不存在的文件会让整条目作废**，同样只报 `no valid entries`，不点名哪个文件。initramfs 未构建时必须整行省略。
+6. **控制台必须在任何可能 panic 的代码之前初始化**：panic handler 经控制台输出，而未初始化的控制台会**丢弃**写入（`send_byte` 直接 return）。顺序错了的表象是「以 panic 状态退出 + 串口日志为空」。
+7. **`ltr` 会 fault，且此时若 IDT 未装载就是三重故障**。而 `-no-reboot` 把 reset 变成 **QEMU 成功退出（状态 0）**，harness 因此对「内核根本没跑」报 green。本次即是 `KERNEL_TSS_SELECTOR = 0x18` 指向了留空的 slot 3，而 TSS 写在 slot 4。现在 selector 由 `TSS_SLOT` 推导，且 IDT 先于 GDT 装载。
+8. **Limine 12 通过导出的 `LIMINE_*` 符号名发现请求，不看 section**。沿用 11.x 的 `link_section = ".boot.rodata"` 会导致所有请求不被填充，内核对着一个支持 revision 6 的 12.9.4 报 `bootloader too old`——**诊断信息指向了完全错误的方向**。
+
+诊断手段记录：QEMU `-d int,cpu_reset -D <file>` 是定位三重故障唯一有效的手段；`readelf -sW <kernel> | grep LIMINE_` 可确认请求是否真的被导出。
 
 已验证的完整命令（成功输出 `SPIKE_OK` + `[NOVA-TEST] SUMMARY` 并 7s 退出）：
 
