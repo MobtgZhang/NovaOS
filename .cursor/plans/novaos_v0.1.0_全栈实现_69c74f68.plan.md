@@ -7,7 +7,7 @@ todos:
     status: completed
   - id: m1-boot
     content: M1：端口 IO 串口 + limine BootInfo 校验 + GDT/IDT/TSS + 异常处理 + bitmap 物理页分配器（含 host 单测）
-    status: pending
+    status: in_progress
   - id: m2-paging-user
     content: M2：递归页表与 AddressSpace + 地址布局文档 + 线程上下文与 syscall 入口（iretq）+ nova-elf 加载器 + user/nova-rt
     status: pending
