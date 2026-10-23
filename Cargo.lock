@@ -17,6 +17,7 @@ name = "nova-kernel"
 version = "0.1.0"
 dependencies = [
  "limine",
+ "nova-abi",
 ]
 
 [[package]]

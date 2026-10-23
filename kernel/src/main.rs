@@ -29,12 +29,10 @@
 
 #![no_std]
 #![no_main]
-
 // Kernel-internal invariants enforced at compile time. `main.rs` is the crate
 // root, so these live here rather than in a lint table that a future module
 // could opt out of.
 #![deny(unsafe_op_in_unsafe_fn)]
-
 // Subsystems for later milestones ship as complete, documented, and tested
 // units but have no caller yet: the page-table writer is built and verified in
 // M0, then installed in M2. Flagging them as dead would mean deleting working
@@ -147,6 +145,20 @@ pub unsafe extern "C" fn _start() -> ! {
         "memory: {} usable of {} mapped total",
         describe_bytes(boot_info.usable_bytes()),
         describe_bytes(boot_info.physical_limit())
+    );
+
+    // The ABI version is printed at boot so a serial log from a failing run can
+    // be matched against the kernel that produced it. It comes from the shared
+    // `nova-abi` crate rather than a kernel-local constant precisely so that the
+    // number here cannot disagree with the one `nr::GET_VERSION` returns to user
+    // space -- which is the disagreement that makes an ABI mismatch undiagnosable
+    // after the fact.
+    klog!(
+        Level::Info,
+        "abi: {}.{} ({} syscalls)",
+        nova_abi::ABI_VERSION.major,
+        nova_abi::ABI_VERSION.minor,
+        nova_abi::nr::ALL.len()
     );
 
     test::harness::run_all();

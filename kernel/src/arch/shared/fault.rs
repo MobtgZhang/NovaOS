@@ -108,12 +108,8 @@ pub struct FaultInfo {
 /// `level` replaces the hard-coded `ERR` tag. A recovered fault is still a
 /// fault worth seeing, but calling it a warning keeps the log honest about
 /// whether the machine kept running.
-pub fn format_into<const N: usize>(
-    sink: &mut ByteSink<N>,
-    info: &FaultInfo,
-    level: Option<Level>,
-) {
-    let tag = level.map_or(Level::Error, |level| level).tag();
+pub fn format_into<const N: usize>(sink: &mut ByteSink<N>, info: &FaultInfo, level: Option<Level>) {
+    let tag = level.unwrap_or(Level::Error).tag();
 
     sink.push_str("[NOVA] ");
     sink.push_str(tag);

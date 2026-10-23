@@ -175,8 +175,7 @@ static mut KERNEL_STACK: UnsafeCell<[u8; KERNEL_STACK_SIZE]> =
 /// A separate stack is mandatory: if a user thread overflowed its own stack,
 /// reusing it to report the fault would fault again, producing a triple fault
 /// that destroys all diagnostic context.
-static mut FAULT_STACK: UnsafeCell<[u8; FAULT_STACK_SIZE]> =
-    UnsafeCell::new([0; FAULT_STACK_SIZE]);
+static mut FAULT_STACK: UnsafeCell<[u8; FAULT_STACK_SIZE]> = UnsafeCell::new([0; FAULT_STACK_SIZE]);
 
 /// Borrow the TSS.
 ///
@@ -239,8 +238,16 @@ pub unsafe fn init() {
 
         // Slots 0-2: null, kernel code, kernel data.
         write_slot(gdt_base, 0, encode(null_descriptor()));
-        write_slot(gdt_base, 1, encode(code_segment(KERNEL_CODE_SELECTOR, DPL_RING0)));
-        write_slot(gdt_base, 2, encode(data_segment(KERNEL_DATA_SELECTOR, DPL_RING0)));
+        write_slot(
+            gdt_base,
+            1,
+            encode(code_segment(KERNEL_CODE_SELECTOR, DPL_RING0)),
+        );
+        write_slot(
+            gdt_base,
+            2,
+            encode(data_segment(KERNEL_DATA_SELECTOR, DPL_RING0)),
+        );
         // Slot 3 intentionally left null: it is reserved so the TSS lands on a
         // 16-byte boundary at index 4.
         write_slot(gdt_base, 3, 0);
@@ -353,20 +360,23 @@ fn write_tss_descriptor(gdt: *mut Gdt, slot: usize, base: u64, limit: u16) {
     // writing a 16-byte descriptor at slot 4 stays within the array.
     unsafe {
         let target = addr_of_mut!((*gdt).entries) as *mut u8;
-        target.add(slot * 8).cast::<TssDescriptor>().write(TssDescriptor {
-            limit_low: limit,
-            base_low: (base & 0xFFFF) as u16,
-            base_mid: ((base >> 16) & 0xFF) as u8,
-            access: (1 << 7) | (DPL_RING0 << 5) | TSS_TYPE,
-            // No granularity bit: a TSS limit is a byte count, not page count.
-            //
-            // `limit` is already a `u16`, so the architectural bits 19:16 are
-            // zero by construction. Writing `(limit >> 16) & 0xF` would be an
-            // arithmetic overflow, not a masked zero — which is the compiler
-            // telling us the *caller* has already done the narrowing.
-            limit_flags: 0,
-            base_high: ((base >> 24) & 0xFF) as u8,
-        });
+        target
+            .add(slot * 8)
+            .cast::<TssDescriptor>()
+            .write(TssDescriptor {
+                limit_low: limit,
+                base_low: (base & 0xFFFF) as u16,
+                base_mid: ((base >> 16) & 0xFF) as u8,
+                access: (1 << 7) | (DPL_RING0 << 5) | TSS_TYPE,
+                // No granularity bit: a TSS limit is a byte count, not page count.
+                //
+                // `limit` is already a `u16`, so the architectural bits 19:16 are
+                // zero by construction. Writing `(limit >> 16) & 0xF` would be an
+                // arithmetic overflow, not a masked zero — which is the compiler
+                // telling us the *caller* has already done the narrowing.
+                limit_flags: 0,
+                base_high: ((base >> 24) & 0xFF) as u8,
+            });
     }
 }
 

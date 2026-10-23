@@ -216,7 +216,11 @@ pub unsafe fn capture() -> &'static BootInfo {
         };
 
         let entries = response.entries();
-        klog!(Level::Debug, "limine: {} raw memory map entries", entries.len());
+        klog!(
+            Level::Debug,
+            "limine: {} raw memory map entries",
+            entries.len()
+        );
 
         if entries.len() > MAX_MEMMAP_ENTRIES {
             panic!(
@@ -274,8 +278,9 @@ pub unsafe fn capture() -> &'static BootInfo {
     let validation = unsafe { read_boot_info() }.validate(MAX_PHYSICAL_ADDRESS);
 
     if !validation.is_ok() {
-        let problems = &validation.problems
-            [..validation.problem_count.min(crate::boot::info::MAX_PROBLEMS)];
+        let problems = &validation.problems[..validation
+            .problem_count
+            .min(crate::boot::info::MAX_PROBLEMS)];
         for problem in problems {
             klog!(Level::Error, "boot: {}", problem.describe());
         }

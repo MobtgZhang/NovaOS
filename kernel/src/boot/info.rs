@@ -221,7 +221,7 @@ impl BootInfo {
             record(&mut result, Problem::NoProtocolRevision);
         }
 
-        if self.direct_map_offset == 0 || self.direct_map_offset % PAGE_SIZE != 0 {
+        if self.direct_map_offset == 0 || !self.direct_map_offset.is_multiple_of(PAGE_SIZE) {
             record(&mut result, Problem::BadDirectMapOffset);
         }
 
@@ -300,7 +300,11 @@ pub const MAX_PHYSICAL_ADDRESS: u64 = {
     } else {
         52
     };
-    if bits >= 64 { u64::MAX } else { (1u64 << bits) - 1 }
+    if bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    }
 };
 
 #[cfg(test)]
@@ -328,7 +332,11 @@ mod tests {
     #[test]
     fn a_well_formed_map_validates() {
         let validation = sample().validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.is_ok(), "unexpected problems: {:?}", validation.problems);
+        assert!(
+            validation.is_ok(),
+            "unexpected problems: {:?}",
+            validation.problems
+        );
         assert_eq!(validation.out_of_order, 0);
     }
 
@@ -337,7 +345,9 @@ mod tests {
         let mut info = sample();
         info.protocol_revision = 0;
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count].contains(&Problem::NoProtocolRevision));
+        assert!(
+            validation.problems[..validation.problem_count].contains(&Problem::NoProtocolRevision)
+        );
     }
 
     #[test]
@@ -345,8 +355,9 @@ mod tests {
         let mut info = sample();
         info.direct_map_offset = 0;
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::BadDirectMapOffset));
+        assert!(
+            validation.problems[..validation.problem_count].contains(&Problem::BadDirectMapOffset)
+        );
     }
 
     #[test]
@@ -354,8 +365,9 @@ mod tests {
         let mut info = sample();
         info.direct_map_offset = 0xFFFF_8000_0000_1000 + 1;
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::BadDirectMapOffset));
+        assert!(
+            validation.problems[..validation.problem_count].contains(&Problem::BadDirectMapOffset)
+        );
     }
 
     #[test]
@@ -371,8 +383,7 @@ mod tests {
         let mut info = sample();
         info.memmap_len = MAX_MEMMAP_ENTRIES + 1;
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::TooManyEntries));
+        assert!(validation.problems[..validation.problem_count].contains(&Problem::TooManyEntries));
     }
 
     #[test]
@@ -380,8 +391,9 @@ mod tests {
         let mut info = sample();
         info.memmap[0].base = 0x10_0001;
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::UnalignedEntryBase));
+        assert!(
+            validation.problems[..validation.problem_count].contains(&Problem::UnalignedEntryBase)
+        );
     }
 
     #[test]
@@ -412,8 +424,10 @@ mod tests {
         info.memmap[0].base = 0x1000;
         info.memmap[0].length = 0x10_0000;
         let validation = info.validate(0x2000);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::EntryPastAddressLimit));
+        assert!(
+            validation.problems[..validation.problem_count]
+                .contains(&Problem::EntryPastAddressLimit)
+        );
     }
 
     #[test]
@@ -421,8 +435,9 @@ mod tests {
         let mut info = sample();
         info.memmap[0].type_ = 1; // reserved
         let validation = info.validate(MAX_PHYSICAL_ADDRESS);
-        assert!(validation.problems[..validation.problem_count]
-            .contains(&Problem::NoUsableRegions));
+        assert!(
+            validation.problems[..validation.problem_count].contains(&Problem::NoUsableRegions)
+        );
     }
 
     #[test]

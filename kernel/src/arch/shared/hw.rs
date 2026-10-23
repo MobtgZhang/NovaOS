@@ -41,7 +41,11 @@ impl AddressSpace {
     /// computation (`align_up`, frame indexing, offset masking) assumes a power of
     /// two. Catching it here means the error surfaces at boot rather than as
     /// silent misalignment much later.
-    pub const fn new(page_size: u64, physical_bits: Option<u32>, virtual_bits: Option<u32>) -> Option<Self> {
+    pub const fn new(
+        page_size: u64,
+        physical_bits: Option<u32>,
+        virtual_bits: Option<u32>,
+    ) -> Option<Self> {
         if page_size == 0 || !page_size.is_power_of_two() {
             return None;
         }

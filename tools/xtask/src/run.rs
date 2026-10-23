@@ -71,9 +71,7 @@ fn qemu_command(
     vars: &std::path::Path,
     serial_log: &std::path::Path,
 ) -> Vec<String> {
-    let device = |flag: &str, value: String| -> Vec<String> {
-        vec![flag.to_string(), value]
-    };
+    let device = |flag: &str, value: String| -> Vec<String> { vec![flag.to_string(), value] };
 
     let mut command: Vec<String> = Vec::new();
 
@@ -94,7 +92,10 @@ fn qemu_command(
     // See `qemu`'s module docs for why `-bios` does not work here.
     command.extend(device(
         "-drive",
-        format!("if=pflash,format=raw,unit=0,readonly=on,file={}", code.display()),
+        format!(
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            code.display()
+        ),
     ));
     command.extend(device(
         "-drive",
@@ -117,10 +118,7 @@ fn qemu_command(
 
     // The serial log goes to a file rather than to stdio so that the output is
     // preserved after QEMU exits and can be attached to a CI run.
-    command.extend(device(
-        "-serial",
-        format!("file:{}", serial_log.display()),
-    ));
+    command.extend(device("-serial", format!("file:{}", serial_log.display())));
 
     command.extend(device("-display", "none".to_string()));
     // Without this, a triple fault reboots the machine and the harness waits out
@@ -131,7 +129,11 @@ fn qemu_command(
 }
 
 /// Run QEMU under a wall-clock timeout and classify the outcome.
-fn invoke(command: &[String], timeout_seconds: u64, serial_log: &std::path::Path) -> Result<(), String> {
+fn invoke(
+    command: &[String],
+    timeout_seconds: u64,
+    serial_log: &std::path::Path,
+) -> Result<(), String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
 
@@ -190,7 +192,11 @@ fn invoke(command: &[String], timeout_seconds: u64, serial_log: &std::path::Path
 }
 
 /// Decide pass or fail from the exit status and the serial log.
-fn classify(status: std::process::ExitStatus, qemu_output: &str, serial_log: &std::path::Path) -> Result<(), String> {
+fn classify(
+    status: std::process::ExitStatus,
+    qemu_output: &str,
+    serial_log: &std::path::Path,
+) -> Result<(), String> {
     let log = strip_ansi(&std::fs::read_to_string(serial_log).unwrap_or_default());
 
     // The kernel's own verdict comes first: the exit status only proves the
@@ -203,7 +209,8 @@ fn classify(status: std::process::ExitStatus, qemu_output: &str, serial_log: &st
     }
 
     let passed = log.contains("[NOVA-TEST] SUMMARY all suites passed");
-    let reached_exit = status.success() || status.code() == Some(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+    let reached_exit =
+        status.success() || status.code() == Some(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
 
     match (passed, reached_exit) {
         (true, true) => {
@@ -366,18 +373,33 @@ mod tests {
         // Each of these was found by removing it and getting a failure that
         // looked like something else entirely.
         assert!(joined.contains("q35"), "machine type");
-        assert!(joined.contains("accel=tcg"), "no KVM in the reference environment");
+        assert!(
+            joined.contains("accel=tcg"),
+            "no KVM in the reference environment"
+        );
         assert!(joined.contains("-smp 1"), "single CPU");
         assert!(joined.contains("-m 256M"), "memory size");
         assert!(joined.contains("if=pflash"), "OVMF needs pflash, not -bios");
-        assert!(joined.contains("readonly=on"), "the code drive must be read-only");
-        assert!(joined.contains("unit=1"), "the variable store is a second drive");
+        assert!(
+            joined.contains("readonly=on"),
+            "the code drive must be read-only"
+        );
+        assert!(
+            joined.contains("unit=1"),
+            "the variable store is a second drive"
+        );
         assert!(joined.contains("media=cdrom"), "the ISO is a CD");
         assert!(joined.contains("isa-debug-exit"), "the exit device");
         assert!(joined.contains("iobase=0xf4"), "the port the kernel writes");
-        assert!(joined.contains("-serial file:"), "the serial log goes to a file");
+        assert!(
+            joined.contains("-serial file:"),
+            "the serial log goes to a file"
+        );
         assert!(joined.contains("-display none"), "no window in CI");
-        assert!(joined.contains("-no-reboot"), "a triple fault must not loop");
+        assert!(
+            joined.contains("-no-reboot"),
+            "a triple fault must not loop"
+        );
     }
 
     #[test]

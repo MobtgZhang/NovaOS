@@ -43,14 +43,14 @@ use shared::hw::AddressSpace;
 pub mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, NAME, ConsoleImpl, ExitImpl, Interrupts, arch_init,
+    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, ConsoleImpl, ExitImpl, Interrupts, NAME, arch_init,
 };
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, NAME, ConsoleImpl, ExitImpl, Interrupts, arch_init,
+    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, ConsoleImpl, ExitImpl, Interrupts, NAME, arch_init,
 };
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -208,10 +208,7 @@ mod tests {
     fn an_unknown_code_reports_a_version_mismatch_not_bad_input() {
         // A syscall made against a newer ABI must not be reported as the
         // caller's fault.
-        assert_eq!(
-            ErrorCode::from_result(-9999),
-            Some(ErrorCode::Unsupported)
-        );
+        assert_eq!(ErrorCode::from_result(-9999), Some(ErrorCode::Unsupported));
     }
 
     #[test]
@@ -228,7 +225,10 @@ mod tests {
         for error in ALL {
             let expected = matches!(
                 error,
-                ErrorCode::Busy | ErrorCode::Timeout | ErrorCode::WouldBlock | ErrorCode::Interrupted
+                ErrorCode::Busy
+                    | ErrorCode::Timeout
+                    | ErrorCode::WouldBlock
+                    | ErrorCode::Interrupted
             );
             assert_eq!(error.is_retryable(), expected, "{}", error.name());
         }

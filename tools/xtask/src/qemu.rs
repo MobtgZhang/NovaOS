@@ -162,6 +162,13 @@ mod tests {
         // The kernel's `memory_map_is_usable` test fails below 16 MiB, so a
         // smaller value here would fail for a reason unrelated to what was
         // being tested.
-        assert!(MEMORY_MIB >= 16);
+        //
+        // A `const` block rather than a plain `assert!`: `MEMORY_MIB` is a
+        // constant, so clippy evaluates the assertion at compile time and
+        // warns that the check is vacuous. That warning is wrong about the
+        // intent — the point is to catch someone *lowering* the constant — so
+        // the check is kept as a compile-time assertion where it is a genuine
+        // invariant rather than a runtime one.
+        const { assert!(MEMORY_MIB >= 16) };
     }
 }

@@ -30,7 +30,11 @@ const COM1: u16 = 0x3F8;
 /// Interrupt enable register.
 const IER: u16 = COM1 + 1;
 /// Divisor latch low byte.
-const DLL: u16 = COM1 + 0;
+///
+/// Spelled `+ 0` rather than as `COM1` so the register block reads in ascending
+/// port order alongside `IER`, `FCR` and the rest. It is the same address as the
+/// data port; only `LCR.DLAB` decides which of the two it is.
+const DLL: u16 = COM1;
 /// Divisor latch high byte.
 const DLM: u16 = COM1 + 1;
 /// FIFO control register.

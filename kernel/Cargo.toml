@@ -18,6 +18,17 @@ bench = false
 [dependencies]
 limine = { workspace = true }
 
+# The ABI crate is a real dependency of the kernel, not a declaration of intent.
+# It is `no_std` and architecture-neutral, so it links into the bare-metal
+# target unchanged, and it is the single source of truth for the numbers the
+# kernel exposes: a syscall name in a panic message and the number the CPU
+# dispatches on must not be able to drift apart.
+#
+# Cargo warns about an unused `[workspace.dependencies]` entry, and that warning
+# is the manifest keeping this honest -- if the dependency is ever dropped from
+# here while the crate still exists, the warning says so.
+nova-abi = { workspace = true }
+
 [lints.rust]
 # An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`
 # block, so every one of them carries an explicit SAFETY comment. The kernel's

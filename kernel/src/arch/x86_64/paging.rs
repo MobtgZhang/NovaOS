@@ -17,6 +17,13 @@ pub const ENTRIES_PER_TABLE: usize = 512;
 /// Mask for selecting the 9 bits of a virtual address within one table level.
 pub const INDEX_MASK: u64 = 0x1FF;
 
+/// Number of significant bits in a virtual address under 4-level paging.
+///
+/// 48, not 64: bits 63:48 are the sign extension of bit 47 and carry no
+/// information of their own. A canonical address is therefore reproduced by
+/// filling every bit above 47 with the value of bit 47.
+pub const VIRTUAL_ADDRESS_BITS: u64 = 48;
+
 /// Flags stored in a page table entry.
 ///
 /// Bits 0-8 are architectural; bits 9-11 are the OS-available bits, which NovaOS
@@ -48,9 +55,8 @@ impl PageFlags {
     pub const HUGE: PageFlags = PageFlags(1 << 7);
 
     /// Every architecturally defined flag, used to validate external bits.
-    pub const RESERVED_MASK: PageFlags = PageFlags(
-        0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100,
-    );
+    pub const RESERVED_MASK: PageFlags =
+        PageFlags(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100);
 
     /// Raw bit pattern.
     pub const fn bits(self) -> u64 {
@@ -110,13 +116,47 @@ pub struct AddressParts {
 impl AddressParts {
     /// Reassemble the virtual address these parts describe.
     ///
-    /// `PAGE_OFFSET` bits are dropped, which is exactly what a page table encodes:
-    /// the hardware supplies the offset itself.
+    /// The low 12 bits are dropped, which is exactly what a page table encodes:
+    /// the hardware supplies the page offset itself. Callers comparing against
+    /// an address with a non-zero offset must compare against
+    /// [`page_base`] of it.
+    ///
+    /// # Why the top index is sign-extended
+    ///
+    /// With 4-level paging the `p4` index occupies bits 47:39, but bits 48-63
+    /// are *not* part of the address the hardware walks -- they are the sign
+    /// extension of bit 47. A kernel address such as `0xFFFF_8000_0000_0000`
+    /// has `p4 == 0x100`, and shifting that by 39 yields `0x80_0000_0000`
+    /// rather than the original `0xFFFF_8000_…`. Without the extension below,
+    /// every higher-half address fails to round-trip, which is precisely the
+    /// direction the kernel actually lives in.
+    ///
+    /// Bits 63:48 are therefore reconstructed from bit 47 of the assembled
+    /// value. Under LA57 the same expression widens naturally, because the
+    /// shift is expressed in terms of [`VIRTUAL_ADDRESS_BITS`].
     pub const fn recompose(&self) -> u64 {
-        ((self.p4 as u64 & INDEX_MASK) << 39)
+        let assembled = ((self.p4 as u64 & INDEX_MASK) << 39)
             | ((self.p3 as u64 & INDEX_MASK) << 30)
             | ((self.p2 as u64 & INDEX_MASK) << 21)
-            | ((self.p1 as u64 & INDEX_MASK) << 12)
+            | ((self.p1 as u64 & INDEX_MASK) << 12);
+
+        // Sign-extend from bit 47: the hardware addresses 48 bits, and the top
+        // 16 bits must replicate bit 47.
+        //
+        // The mask is `1 << 47`, *not* `VIRTUAL_ADDRESS_BITS - 1` read as a bit
+        // count. That looks equivalent and is not: `VIRTUAL_ADDRESS_BITS - 1` is
+        // 47, so `u64::MAX >> 47` is the mask of bits 12-16, which asks whether
+        // the offset within a 32 KiB region is non-zero. That is a question
+        // about page alignment, not about the sign — and its answer is
+        // independent of the higher half, so it mistranslates roughly half of
+        // all addresses.
+        let sign_bit = 1u64 << (VIRTUAL_ADDRESS_BITS - 1);
+        if assembled & sign_bit == 0 {
+            assembled
+        } else {
+            // Fill bits 63:VIRTUAL_ADDRESS_BITS with ones.
+            assembled | !(sign_bit - 1)
+        }
     }
 }
 
@@ -145,16 +185,39 @@ pub const fn page_offset(address: u64) -> usize {
     (address & (PAGE_SIZE - 1)) as usize
 }
 
-/// Whether a 48-bit address is in canonical form.
+/// Whether an address is in canonical form.
 ///
-/// Canonical addresses are `0..=0x0000_7FFF_FFFF_FFFF` or
+/// A canonical address is `0..=0x0000_7FFF_FFFF_FFFF` or
 /// `0xFFFF_8000_0000_0000..=0xFFFF_FFFF_FFFF_FFFF`. The middle 16 bits must be
 /// all-zero or all-one, which is the single most important check before ever
 /// dereferencing a pointer.
+///
+/// # Why the mask, and not `address >> 47`
+///
+/// Comparing `address >> 47` against `0xFFFF` looks equivalent and is not. That
+/// shift yields a value in `0..=0xFFFF_FFFF`, and any kernel address whose bits
+/// 63:48 are all-one compares unequal to `0xFFFF` -- so `0xFFFF_8000_0000_0000`,
+/// the canonical form of every higher-half address including the kernel's own,
+/// is reported as *non*-canonical.
+///
+/// That is the worst possible way for this function to fail: it rejects the
+/// kernel's entire address range while accepting nothing exotic, so a caller
+/// that trusts it concludes the higher half is unmappable and never gets past
+/// boot. Extracting exactly bits 63:48 first is what makes the comparison
+/// meaningful.
+///
+/// # Where the boundary actually is
+///
+/// Bit 47 is the last addressable bit, so `0x0000_8000_0000_0000` — bit 47 set
+/// with a zero sign extension — **is** canonical. The first non-canonical
+/// address is `0x0000_FFFF_8000_0000`, where the sign extension disagrees with
+/// bit 47. Any test that treats `0x8000_0000_0000` as non-canonical is asserting
+/// that the *top of user space* is unaddressable, which is not what the
+/// hardware does.
 #[inline]
 pub const fn is_canonical(address: u64) -> bool {
-    let top = address >> 47;
-    top == 0 || top == 0xFFFF
+    let sign = (address >> VIRTUAL_ADDRESS_BITS) & 0xFFFF;
+    sign == 0 || sign == 0xFFFF
 }
 
 /// A physical address is canonical as an identity mapping only in the first

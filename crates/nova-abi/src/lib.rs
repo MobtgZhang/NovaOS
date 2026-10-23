@@ -96,7 +96,10 @@ mod tests {
 
     impl Sink {
         fn new() -> Self {
-            Sink { bytes: [0; 16], len: 0 }
+            Sink {
+                bytes: [0; 16],
+                len: 0,
+            }
         }
 
         fn as_str(&self) -> &str {

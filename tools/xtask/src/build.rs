@@ -156,31 +156,31 @@ mod tests {
         assert!(!HOST_PACKAGES.contains(&"nova-utils"));
     }
 
-/// Every host package must actually exist in the workspace.
-///
-/// `cargo build --package <name>` fails loudly on a typo, but only once
-/// someone runs a host build; this catches it in `cargo test` instead.
-///
-/// Each package's own manifest is checked rather than the workspace root. The
-/// root manifest is a *virtual* manifest — it lists members by path and contains
-/// no `name =` lines at all — so searching it for package names can never
-/// match.
-#[test]
-fn every_host_package_exists_in_the_workspace() {
-    let root = crate::boot::repo_root();
-    let members = std::fs::read_to_string(root.join("Cargo.toml"))
-        .unwrap_or_else(|error| panic!("cannot read workspace Cargo.toml: {error}"));
+    /// Every host package must actually exist in the workspace.
+    ///
+    /// `cargo build --package <name>` fails loudly on a typo, but only once
+    /// someone runs a host build; this catches it in `cargo test` instead.
+    ///
+    /// Each package's own manifest is checked rather than the workspace root. The
+    /// root manifest is a *virtual* manifest — it lists members by path and contains
+    /// no `name =` lines at all — so searching it for package names can never
+    /// match.
+    #[test]
+    fn every_host_package_exists_in_the_workspace() {
+        let root = crate::boot::repo_root();
+        let members = std::fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("cannot read workspace Cargo.toml: {error}"));
 
-    for package in super::HOST_PACKAGES {
-        let found = members.lines().any(|line| {
-            let line = line.trim().trim_end_matches(',').trim_matches('"');
-            line == *package || line.ends_with(&format!("/{package}"))
-        });
+        for package in super::HOST_PACKAGES {
+            let found = members.lines().any(|line| {
+                let line = line.trim().trim_end_matches(',').trim_matches('"');
+                line == *package || line.ends_with(&format!("/{package}"))
+            });
 
-        assert!(
-            found,
-            "HOST_PACKAGES names `{package}`, which is not a member of the workspace"
-        );
+            assert!(
+                found,
+                "HOST_PACKAGES names `{package}`, which is not a member of the workspace"
+            );
+        }
     }
-}
 }

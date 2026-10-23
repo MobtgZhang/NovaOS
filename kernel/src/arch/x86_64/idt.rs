@@ -227,7 +227,7 @@ pub struct ExceptionFrame {
 impl ExceptionFrame {
     /// Whether the fault happened in ring 3.
     #[inline]
-    pub fn from_user(&self) -> bool {
+    pub fn in_user_ring(&self) -> bool {
         // CS holds a selector; its low two bits encode the privilege level.
         (self.cs & 0x3) == 3
     }
@@ -270,7 +270,7 @@ unsafe extern "C" fn dispatch(vector: u64, frame: &ExceptionFrame) -> ! {
             ip: frame.rip,
             sp: frame.rsp,
             address: None,
-            from_user: frame.from_user(),
+            from_user: frame.in_user_ring(),
             detail: 0,
         },
     };
@@ -326,7 +326,7 @@ fn decode(exception: Exception, frame: &ExceptionFrame) -> FaultInfo {
         ip: frame.rip,
         sp: frame.rsp,
         address,
-        from_user: frame.from_user(),
+        from_user: frame.in_user_ring(),
         // For `#PF` this carries the P/W/U/I bits, which are the first thing
         // anyone debugging a translation fault looks at.
         detail: if exception.has_error_code() {
@@ -446,7 +446,7 @@ pub unsafe fn init() {
         entries.add(8).write(gate(
             super::gdt::FAULT_IST_INDEX as u8,
             TRAP_GATE,
-            double_fault_stub as *const () as *const (),
+            double_fault_stub as *const (),
         ));
         set!(9, coprocessor_overrun_stub);
         set!(10, invalid_tss_stub);
@@ -466,11 +466,9 @@ pub unsafe fn init() {
         // uninformative "unexpected interrupt", so they share a stub that at
         // least names the vector.
         for index in 22..32 {
-            entries.add(index).write(gate(
-                0,
-                INTERRUPT_GATE,
-                reserved15_stub as *const () as *const (),
-            ));
+            entries
+                .add(index)
+                .write(gate(0, INTERRUPT_GATE, reserved15_stub as *const ()));
         }
 
         let descriptor = IdtPseudoDescriptor {

@@ -424,7 +424,11 @@ mod tests {
             Rights::MAP,
             Rights::REPLY,
         ] {
-            assert!(Rights::ALL.contains(rights), "{} is outside ALL", rights.names());
+            assert!(
+                Rights::ALL.contains(rights),
+                "{} is outside ALL",
+                rights.names()
+            );
         }
     }
 }

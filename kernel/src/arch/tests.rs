@@ -13,7 +13,10 @@ fn the_compiled_address_space_is_self_consistent() {
     // Every derived value in `AddressSpace` is computed from `page_size` in
     // `new`, so a mismatch here means the derivation is wrong for every caller
     // that trusted `page_shift`.
-    assert_eq!(ADDRESS_SPACE.page_shift, ADDRESS_SPACE.page_size.trailing_zeros());
+    assert_eq!(
+        ADDRESS_SPACE.page_shift,
+        ADDRESS_SPACE.page_size.trailing_zeros()
+    );
     assert_eq!(1u64 << ADDRESS_SPACE.page_shift, ADDRESS_SPACE.page_size);
     assert_eq!(ADDRESS_SPACE.page_mask, ADDRESS_SPACE.page_size - 1);
 }
@@ -41,7 +44,8 @@ fn the_canonical_half_boundary_is_derived_not_hardcoded() {
 fn a_57_bit_space_moves_the_boundary() {
     // LA57 shifts the boundary up; the formula must follow, or a future 5-level
     // target would compute a kernel-half start below its own image.
-    let space = AddressSpace::new(0x1000, Some(52), Some(57)).expect("4 KiB pages are a power of two");
+    let space =
+        AddressSpace::new(0x1000, Some(52), Some(57)).expect("4 KiB pages are a power of two");
     assert_eq!(space.kernel_half_start(), 0xFF00_0000_0000_0000);
 }
 

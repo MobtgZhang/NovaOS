@@ -51,7 +51,9 @@ const LOCAL_CACHE: &str = ".cache/novaos/limine";
 
 /// The download URL for the pinned release.
 fn release_url() -> String {
-    format!("https://github.com/limine-bootloader/limine/releases/download/limine-{RELEASE}/limine-binary.tar.xz")
+    format!(
+        "https://github.com/limine-bootloader/limine/releases/download/limine-{RELEASE}/limine-binary.tar.xz"
+    )
 }
 
 /// Where the release is unpacked, under the target directory.
@@ -67,9 +69,7 @@ pub fn release_dir() -> PathBuf {
 /// Limine unpacks into `limine-binary/`, which is why the constant below is part
 /// of the path rather than of the release layout.
 pub fn binary_path(name: &str) -> Result<PathBuf, String> {
-    let path = release_dir()
-        .join("limine-binary")
-        .join(name);
+    let path = release_dir().join("limine-binary").join(name);
 
     if !path.exists() {
         return Err(format!(
@@ -116,9 +116,8 @@ pub fn fetch() -> Result<(), String> {
     // checksum mismatch — never an unverified bootloader.
     let cached = home_dir().join(LOCAL_CACHE).join("limine-binary.tar.xz");
     if cached.exists() && cached != archive {
-        std::fs::copy(&cached, &archive).map_err(|error| {
-            format!("cannot copy cached Limine {}: {error}", cached.display())
-        })?;
+        std::fs::copy(&cached, &archive)
+            .map_err(|error| format!("cannot copy cached Limine {}: {error}", cached.display()))?;
         crate::log(&format!("using cached Limine archive {}", cached.display()));
     } else {
         download(&release_url(), &archive)?;
@@ -129,7 +128,10 @@ pub fn fetch() -> Result<(), String> {
     unpack(&archive, &directory)?;
     require()?;
 
-    crate::log(&format!("Limine {RELEASE} ready in {}", directory.display()));
+    crate::log(&format!(
+        "Limine {RELEASE} ready in {}",
+        directory.display()
+    ));
     Ok(())
 }
 
@@ -138,7 +140,7 @@ pub fn fetch() -> Result<(), String> {
 /// Returns an empty path rather than panicking when `HOME` is unset: the caller
 /// then treats the cache as absent and downloads, which is the correct fallback.
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::new(), PathBuf::from)
+    std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from)
 }
 
 /// Download `url` to `destination`.
@@ -207,12 +209,15 @@ fn unpack(archive: &Path, directory: &Path) -> Result<(), String> {
     let archive = archive.to_string_lossy().into_owned();
     let directory = directory.to_string_lossy().into_owned();
 
-    crate::run_command(&["tar", "-xJf", &archive, "-C", &directory], "unpack Limine")
+    crate::run_command(
+        &["tar", "-xJf", &archive, "-C", &directory],
+        "unpack Limine",
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BOOT_BINARIES, BIOS_BINARY, RELEASE, UEFI_BINARY};
+    use super::{BIOS_BINARY, BOOT_BINARIES, RELEASE, UEFI_BINARY};
 
     #[test]
     fn both_boot_paths_are_staged() {

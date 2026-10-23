@@ -455,7 +455,7 @@ impl<const WORDS: usize> Bitmap<WORDS> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bitmap, MAX_FRAMES, MAX_BITMAP_WORDS};
+    use super::{Bitmap, MAX_BITMAP_WORDS, MAX_FRAMES};
 
     #[test]
     fn capacity_matches_the_documented_bound() {

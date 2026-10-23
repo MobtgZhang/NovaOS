@@ -296,18 +296,25 @@ mod tests {
         // slow one, which is exactly the failure mode the exit port exists to
         // avoid — but a timeout is still the backstop for when it does not fire.
         assert_eq!(parse(&["run"]).expect("parses").timeout(), 30);
-        assert_eq!(parse(&["run", "--timeout", "5"]).expect("parses").timeout(), 5);
+        assert_eq!(
+            parse(&["run", "--timeout", "5"]).expect("parses").timeout(),
+            5
+        );
     }
 
     #[test]
     fn release_and_profile_both_select_a_profile() {
         assert_eq!(parse(&["build"]).expect("parses").cargo_profile(), None);
         assert_eq!(
-            parse(&["build", "--release"]).expect("parses").cargo_profile(),
+            parse(&["build", "--release"])
+                .expect("parses")
+                .cargo_profile(),
             Some("release")
         );
         assert_eq!(
-            parse(&["build", "--profile", "dev"]).expect("parses").cargo_profile(),
+            parse(&["build", "--profile", "dev"])
+                .expect("parses")
+                .cargo_profile(),
             Some("dev")
         );
     }
@@ -342,7 +349,11 @@ mod tests {
     #[test]
     fn keep_image_is_opt_in() {
         assert!(!parse(&["run"]).expect("parses").keep_image());
-        assert!(parse(&["run", "--keep-image"]).expect("parses").keep_image());
+        assert!(
+            parse(&["run", "--keep-image"])
+                .expect("parses")
+                .keep_image()
+        );
     }
 
     #[test]

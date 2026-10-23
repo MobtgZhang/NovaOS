@@ -161,7 +161,7 @@ pub mod nr {
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so
             // adding a reserved name later cannot change this function's shape.
-            _ => return "reserved",
+            _ => "reserved",
         }
     }
 }
@@ -237,7 +237,10 @@ mod tests {
         let mut seen = [false; 64];
         for syscall in nr::ALL {
             let index = syscall.number() as usize;
-            assert!(index < seen.len(), "syscall number out of the table: {index}");
+            assert!(
+                index < seen.len(),
+                "syscall number out of the table: {index}"
+            );
             assert!(!seen[index], "duplicate syscall number {index}");
             seen[index] = true;
         }
@@ -246,7 +249,11 @@ mod tests {
     #[test]
     fn every_syscall_has_a_name() {
         for syscall in nr::ALL {
-            assert_ne!(nr::name(*syscall), "reserved", "syscall {syscall:?} has no name");
+            assert_ne!(
+                nr::name(*syscall),
+                "reserved",
+                "syscall {syscall:?} has no name"
+            );
             assert!(!nr::name(*syscall).is_empty());
         }
     }

@@ -122,7 +122,7 @@ const _: () = assert!(core::mem::offset_of!(IpcHeader, reserved) == 16);
 
 #[cfg(test)]
 mod tests {
-    use super::{IpcHeader, IPC_HEADER_SIZE, MAX_CAPS_PER_MSG, MAX_INLINE_PAYLOAD};
+    use super::{IPC_HEADER_SIZE, IpcHeader, MAX_CAPS_PER_MSG, MAX_INLINE_PAYLOAD};
 
     #[test]
     fn the_header_is_exactly_the_documented_size() {
