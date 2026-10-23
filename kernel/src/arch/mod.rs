@@ -86,6 +86,23 @@ pub fn console_init() {
     console().init();
 }
 
+/// Print the architecture's boot-time tables to the console.
+///
+/// Diagnostics only; safe to call more than once.
+pub fn dump_tables() {
+    x86_64::gdt::dump_tables();
+}
+
+/// Move the CPU onto the kernel's own stack.
+///
+/// # Safety
+///
+/// Interrupts must be masked. The caller's frame is abandoned, so this must be
+/// called only from `_start`.
+pub unsafe fn switch_to_kernel_stack() {
+    // SAFETY: delegated to this function's contract.
+    unsafe { x86_64::gdt::switch_to_kernel_stack() }
+}
 /// The process-wide console.
 #[inline]
 pub fn console() -> &'static ConsoleImpl {

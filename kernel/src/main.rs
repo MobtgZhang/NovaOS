@@ -103,6 +103,22 @@ pub unsafe extern "C" fn _start() -> ! {
         arch::console_init();
     }
 
+    // Diagnostics: dump the GDT and IDT now that the console exists.
+    arch::dump_tables();
+
+    // Move off the bootloader's stack and onto the kernel's own.
+    //
+    // This must happen after the tables are installed and before anything that
+    // can fault, so that the exception frame the CPU pushes lands on a stack
+    // this kernel owns — see the long note on the function.
+    //
+    // SAFETY: interrupts are still masked. The function abandons this frame,
+    // so nothing that lives on the bootloader's stack may be read afterwards;
+    // `_start` only reads its own locals, which are re-read after the switch.
+    unsafe {
+        arch::switch_to_kernel_stack();
+    }
+
     logger::init();
 
     // Now that output exists, the checks that can panic are safe to run.
