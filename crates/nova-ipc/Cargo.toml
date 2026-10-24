@@ -1,0 +1,19 @@
+[package]
+name = "nova-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS IPC: endpoint rendezvous, reply tokens, capability transfer, and peer-death wakeup"
+
+# `no_std` and free of `unsafe`: the IPC state machine is pure logic over the
+# ABI's fixed-layout message header, so it is testable on the host.
+[dependencies]
+nova-abi = { workspace = true }
+nova-cap = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"

@@ -13,10 +13,52 @@ name = "nova-abi"
 version = "0.1.0"
 
 [[package]]
+name = "nova-cap"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+]
+
+[[package]]
+name = "nova-core"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+]
+
+[[package]]
+name = "nova-elf"
+version = "0.1.0"
+
+[[package]]
+name = "nova-fs"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+]
+
+[[package]]
+name = "nova-ipc"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+ "nova-cap",
+]
+
+[[package]]
 name = "nova-kernel"
 version = "0.1.0"
 dependencies = [
  "limine",
+ "nova-abi",
+ "nova-core",
+ "nova-elf",
+]
+
+[[package]]
+name = "nova-protocols"
+version = "0.1.0"
+dependencies = [
  "nova-abi",
 ]
 

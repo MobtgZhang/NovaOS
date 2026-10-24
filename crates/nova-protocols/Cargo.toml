@@ -1,0 +1,27 @@
+[package]
+name = "nova-protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS versioned service protocols: console and file service message formats, and the service manifest"
+
+# `no_std` and free of `unsafe`: the protocol layouts and the manifest parser
+# are pure logic, so they are testable on the host.
+[dependencies]
+nova-abi = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# The crate must never grow an `unsafe` block: a protocol layout is plain
+# data, and an `unsafe` here would be a hole in the cross-binary layout
+# contract that the compile-time size assertions are there to protect.
+unsafe_code = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+# An arithmetic overflow in a length or an offset is a memory-safety bug: the
+# overflowing value is what says how much of a buffer is real. The lint is on
+# for this crate because the crate is pure logic and has no legitimate reason
+# to wrap.
+arithmetic_side_effects = "deny"

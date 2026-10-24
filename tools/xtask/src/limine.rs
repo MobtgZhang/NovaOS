@@ -49,10 +49,20 @@ pub const RELEASE_SHA256: &str = "9880cc04681262214db9b824ed8a5c55296955027d8caa
 /// cache entry can only cause a mismatch, never an unverified boot.
 const LOCAL_CACHE: &str = ".cache/novaos/limine";
 
+/// The release *tag* for the pinned version.
+///
+/// Separate from [`RELEASE`] because upstream tags releases with a `v` prefix
+/// (`v12.9.4`) while the asset *names* inside the release carry none
+/// (`limine-binary.tar.xz`). Guessing the tag from the version — writing
+/// `limine-{RELEASE}`, which is what this used to do — yields a 404 from a
+/// perfectly healthy network, and the resulting `curl: (22)` names neither the
+/// tag nor the URL, so the failure is indistinguishable from a network outage.
+pub const RELEASE_TAG: &str = "v12.9.4";
+
 /// The download URL for the pinned release.
 fn release_url() -> String {
     format!(
-        "https://github.com/limine-bootloader/limine/releases/download/limine-{RELEASE}/limine-binary.tar.xz"
+        "https://github.com/Limine-Bootloader/Limine/releases/download/{RELEASE_TAG}/limine-binary.tar.xz"
     )
 }
 
@@ -217,7 +227,9 @@ fn unpack(archive: &Path, directory: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BIOS_BINARY, BOOT_BINARIES, RELEASE, UEFI_BINARY};
+    use super::{
+        BIOS_BINARY, BOOT_BINARIES, RELEASE, RELEASE_SHA256, RELEASE_TAG, UEFI_BINARY, release_url,
+    };
 
     #[test]
     fn both_boot_paths_are_staged() {
@@ -241,5 +253,54 @@ mod tests {
     fn the_binary_names_match_what_limine_ships() {
         assert_eq!(UEFI_BINARY, "limine-uefi-cd.bin");
         assert_eq!(BIOS_BINARY, "limine-bios-cd.bin");
+    }
+
+    /// The download URL must name the *tag*, which upstream prefixes with `v`.
+    ///
+    /// The version (`12.9.4`) and the tag (`v12.9.4`) are different strings,
+    /// and building the URL from the version yields a 404 whose only symptom is
+    /// `curl: (22)` — indistinguishable from the machine being offline. Pinning
+    /// the relationship here means renaming either constant breaks `cargo test`
+    /// in milliseconds instead of `fetch-limine` after a full build.
+    #[test]
+    fn the_url_uses_the_v_prefixed_tag() {
+        let url = release_url();
+        assert!(
+            url.contains(&format!("/releases/download/{RELEASE_TAG}/")),
+            "the URL must use the tag `{RELEASE_TAG}`, got {url}"
+        );
+        // The `v` is the whole point: a URL built from the bare version string
+        // 404s even though the release exists.
+        assert_eq!(RELEASE_TAG, format!("v{RELEASE}"));
+    }
+
+    /// The archive name is *not* tag-derived, which is exactly why the two
+    /// constants are separate. Every release publishes `limine-binary.tar.xz`.
+    #[test]
+    fn the_asset_name_carries_no_version() {
+        assert!(
+            release_url().ends_with("limine-binary.tar.xz"),
+            "the asset is a stable name across releases: {}",
+            release_url()
+        );
+    }
+
+    /// The pinned digest must be a full 64-character hex SHA-256.
+    ///
+    /// A truncated or empty digest still "verifies" against a truncated
+    /// comparison, which would turn the bootloader integrity check into a no-op
+    /// while still reporting success.
+    #[test]
+    fn the_pinned_digest_is_a_full_sha256() {
+        assert_eq!(RELEASE_SHA256.len(), 64);
+        assert!(
+            RELEASE_SHA256.chars().all(|c| c.is_ascii_hexdigit()),
+            "the pinned digest must be lowercase hex"
+        );
+        assert_eq!(
+            RELEASE_SHA256,
+            RELEASE_SHA256.to_ascii_lowercase(),
+            "sha256sum output is lower-case; a mixed-case constant can never match"
+        );
     }
 }

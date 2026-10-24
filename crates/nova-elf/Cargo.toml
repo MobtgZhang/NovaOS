@@ -1,0 +1,18 @@
+[package]
+name = "nova-elf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ELF64 little-endian executable parser and validator for NovaOS"
+
+# `no_std` and architecture-neutral: the kernel links this crate unchanged, and
+# the host test suite compiles it under `std` to prove the validator rejects
+# exactly what it claims to reject.
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"

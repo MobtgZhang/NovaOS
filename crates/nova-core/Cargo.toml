@@ -1,0 +1,23 @@
+[package]
+name = "nova-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS address-space and scheduler algorithms, shared by the kernel and the host test suite"
+
+# `no_std` and free of `unsafe`: everything here is a pure algorithm over
+# traits the kernel implements. That is what lets the host test suite exercise
+# exactly the code the kernel runs, rather than a re-implementation of it.
+[dependencies]
+# The syscall dispatch table needs the ABI's numbers and error codes, and
+# shares them with the kernel rather than restating them — a syscall number
+# that the kernel and the dispatcher disagreed about would be the single most
+# expensive bug in this layer.
+nova-abi = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"

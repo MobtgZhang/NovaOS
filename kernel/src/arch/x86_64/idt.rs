@@ -213,12 +213,55 @@ const _: () = {
 };
 
 /// The pseudo-descriptor form used by `lidt`.
+///
+/// The explicit alignment is load-bearing, not tidiness. `packed` gives the type
+/// an alignment of 1, so without it the linker is free to place this ten-byte
+/// value at *any* address — and it does: the linker put it at `...02`, two bytes
+/// into whatever it was packed next to.
+///
+/// `lidt` then reads its ten bytes starting from that unaligned address. The
+/// x86 memory-access rules make a misaligned `lidt` operand a general-protection
+/// fault on real hardware; QEMU is more forgiving and reads the bytes anyway,
+/// which is why the kernel appears to install a table at all. The result is the
+/// same either way in practice: the table the CPU ends up using is not the one
+/// this code wrote.
+///
+/// The symptom is entirely silent and points nowhere near the cause. The kernel
+/// boots, publishes correct GDT and IDT bytes into the debug dump — because the
+/// *table* is fine and only the descriptor is misaligned — runs every test that
+/// takes no exception, and then on the first exception the CPU rejects the
+/// vector-0 gate, raises `#GP` in its place, rejects that gate identically, and
+/// triple-faults with an empty serial log. Every table dump is green; the only
+/// broken thing is a ten-byte operand the dumps never show.
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
-struct IdtPseudoDescriptor {
-    limit: u16,
-    base: u64,
+#[repr(C, align(8))]
+struct IdtPseudoDescriptor([u8; 10]);
+
+impl IdtPseudoDescriptor {
+    /// Build a descriptor from an IDT's limit and base.
+    fn new(limit: u16, base: u64) -> Self {
+        let mut bytes = [0u8; 10];
+        bytes[0..2].copy_from_slice(&limit.to_le_bytes());
+        bytes[2..10].copy_from_slice(&base.to_le_bytes());
+        Self(bytes)
+    }
 }
+
+const _: () = {
+    assert!(
+        size_of::<IdtPseudoDescriptor>() >= 10,
+        "the pseudo-descriptor payload is ten bytes"
+    );
+    assert!(
+        align_of::<IdtPseudoDescriptor>() >= 8,
+        "lidt reads an unaligned pseudo-descriptor operand; the CPU rejects it"
+    );
+    // The payload must still start at offset 0, or `base` is no longer at 2.
+    assert!(
+        core::mem::offset_of!(IdtPseudoDescriptor, 0) == 0,
+        "the payload must start at offset 0 or the limit/base offsets shift"
+    );
+};
 
 /// CPU exceptions, vectors 0-31.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -313,20 +356,25 @@ impl Exception {
     }
 
     /// Whether the CPU pushes an error code for this exception.
+    ///
+    /// This is the Intel SDM's list, verbatim. It is *not* the same question as
+    /// "is this exception a fault": `#DE`, `#OF` and `#BR` are faults that push
+    /// nothing, and `#UD` is a fault that pushes nothing on Intel-family CPUs.
+    ///
+    /// Getting this wrong does not merely mislabel a fault — it shifts every
+    /// field in the frame by one word, because the error code occupies the
+    /// frame's lowest address when it is present. The measured layouts are in
+    /// `docs/adr/0004-x86-64-exception-frame.md`.
     pub const fn has_error_code(self) -> bool {
         matches!(
             self,
-            Exception::DivideError
-                | Exception::Overflow
-                | Exception::BoundRangeExceeded
-                | Exception::DoubleFault
+            Exception::DoubleFault
                 | Exception::InvalidTss
                 | Exception::SegmentNotPresent
                 | Exception::StackSegmentFault
                 | Exception::GeneralProtectionFault
                 | Exception::PageFault
                 | Exception::AlignmentCheck
-                | Exception::MachineCheck
                 | Exception::Virtualization
                 | Exception::ControlProtection
         )
@@ -371,62 +419,88 @@ impl PageFaultError {
 
 /// The CPU-pushed exception frame, in the layout the CPU actually produces.
 ///
-/// # In 64-bit mode the frame size never varies
+/// # The layout, as measured
 ///
-/// The instinct imported from 32-bit mode is that the frame has *two* shapes —
-/// one for vectors that push an error code and one for those that do not — and
-/// that `RSP`/`SS` appear only on a privilege change. All three of those are
-/// 32-bit-mode rules, and all three are wrong here.
+/// The frame's *lowest* address is where the CPU's last push landed. In
+/// 64-bit mode the CPU pushes `SS`, `RSP`, `RFLAGS`, `CS`, `RIP`, and — for
+/// the vectors that define one — an error code. Each push decrements `RSP`,
+/// so the error code, being pushed last, ends up at the **lowest** address.
 ///
-/// `do_interrupt64` in QEMU's `seg_helper.c` is the reference:
+/// Measured at the entry of the dispatcher; the full capture is in
+/// `docs/adr/0004-x86-64-exception-frame.md`:
 ///
 /// ```text
-///     pushq(&sa, env->segs[R_SS].selector);
-///     pushq(&sa, env->regs[R_ESP]);
-///     pushq(&sa, eflags);
-///     pushq(&sa, env->segs[R_CS].selector);
-///     pushq(&sa, old_eip);
-///     if (has_error_code) {
-///         pushq(&sa, error_code);
-///     }
+///     #DE  (no error code)      #PF  (error code)
+///     [0] RIP                   [0] error code
+///     [1] CS                    [1] RIP
+///     [2] RFLAGS                [2] CS
+///     [3] RSP                   [3] RFLAGS
+///     [4] SS                    [4] RSP
+///                              [5] SS
 /// ```
 ///
-/// The five frame words are unconditional. Only the error code is conditional,
-/// and it is pushed *last*, so it lands at the *lowest* address — it is a
-/// discardable word *above* `RSP`'s perspective of the frame, not a displacement
-/// that shifts `RIP`.
+/// # The stub makes both shapes identical
 ///
-/// # Why the wrong model survives review
+/// Rather than teaching every reader to handle two shapes, the IDT stub
+/// pushes a zero placeholder for the vectors that push no error code. The
+/// dispatcher therefore always sees the same six words:
 ///
-/// An implementation that assumes a 5-word frame and a conditional `RSP`/`SS`
-/// still produces plausible output for a kernel-space fault: there is no error
-/// code, the displacements line up, and the log reads correctly. The failure
-/// only appears when the resume path runs, because that path *counts* words —
-/// and `iretq` will then consume the wrong stack slots and transfer control
-/// to whatever they happen to contain. That is a wild jump, usually to an
-/// unmapped address, so the machine takes a `#PF` inside the handler, the
-/// `#DF` handler cannot run because the stack is gone, and the log ends at the
-/// line before the fault with no error at all.
+/// ```text
+///     [0] error code   (CPU-pushed, or the stub's zero placeholder)
+///     [1] RIP
+///     [2] CS
+///     [3] RFLAGS
+///     [4] RSP
+///     [5] SS
+/// ```
 ///
-/// So the frame is modelled as five fixed words plus an optional error code on
-/// top, [`ExceptionFrame::has_error_code`] is the only place that knows whether
-/// the extra word is there, and the resume path asks it rather than assuming.
+/// `RIP` is then at a **fixed** offset for every vector, which is what makes
+/// the resume trampoline vector-independent: it steps over the error code,
+/// writes the resume target into the `RIP` slot, and `iretq` pops the five
+/// words above it.
+///
+/// # Why the offset is fixed rather than computed
+///
+/// A per-vector `RIP` offset would work too, and would cost one branch. It
+/// would also mean the resume trampoline had to know which vector it was
+/// resuming, and the *shape* of the frame would depend on a value only the
+/// dispatcher knows — a property the trap sequence cannot see. Fixing the
+/// shape at the stub is the one place that knows the vector, so it is the one
+/// place that gets to make the decision.
 #[repr(C)]
 pub struct ExceptionFrame {
-    /// `RIP`, or the error code when the vector pushes one.
-    pub first: u64,
-    /// `CS`, or `RIP` when the vector pushes one.
-    pub second: u64,
-    /// `RFLAGS`, or `CS` when the vector pushes one.
-    pub third: u64,
-    /// `RSP`, or `RFLAGS` when the vector pushes one.
-    pub fourth: u64,
-    /// `SS`, or `RSP` when the vector pushes one.
-    pub fifth: u64,
+    /// The CPU-pushed error code, or the stub's zero placeholder.
+    ///
+    /// Read through [`ExceptionFrame::error_code`] rather than directly: for
+    /// the vectors that push none this word is the stub's placeholder, which
+    /// is zero by construction — but it is not a value the CPU produced.
+    pub error_code: u64,
+    /// `RIP`.
+    pub rip: u64,
+    /// `CS`.
+    pub cs: u64,
+    /// `RFLAGS`.
+    pub rflags: u64,
+    /// `RSP`.
+    pub rsp: u64,
+    /// `SS`.
+    pub ss: u64,
 }
 
+/// The byte offset of `RIP` within the uniform frame.
+///
+/// The error code occupies the first word, so `RIP` is the second.
+const RIP_OFFSET: u64 = 8;
+
+/// The size of the uniform frame, in bytes.
+const FRAME_BYTES: u64 = 48;
+
 impl ExceptionFrame {
-    /// The vector that produced this frame decides which layout is in play.
+    /// The vector that produced this frame decides whether an error code exists.
+    ///
+    /// This answers "was an error code pushed", nothing more. It does **not**
+    /// displace any of the five unconditional words: the stub has already made
+    /// the frame's shape uniform.
     fn has_error_code(vector: u64) -> bool {
         Exception::from_vector(vector as u8).is_some_and(|e| e.has_error_code())
     }
@@ -434,64 +508,46 @@ impl ExceptionFrame {
     /// The CPU-pushed error code, or `0` for a vector that pushes none.
     ///
     /// Reading this instead of indexing the frame directly is what keeps the
-    /// displacement rule in one place: for a vector without an error code the
-    /// slot is `RIP`, which would otherwise be reported as a bogus error code
-    /// and decoded into nonsense `#PF` P/W/U bits.
+    /// rule in one place. For a vector that pushes no error code, the frame's
+    /// first word is the stub's placeholder, which is zero by construction —
+    /// so returning it would report a bogus error code and, for `#PF`, decode
+    /// it into nonsense P/W/U bits.
     #[inline]
     pub fn error_code(&self, vector: u64) -> u64 {
         if Self::has_error_code(vector) {
-            self.first
+            self.error_code
         } else {
             0
         }
     }
 
     /// Instruction pointer at the fault.
+    ///
+    /// Always at the fixed offset [`RIP_OFFSET`], for every vector.
     #[inline]
-    pub fn rip(&self, vector: u64) -> u64 {
-        if Self::has_error_code(vector) {
-            self.second
-        } else {
-            self.first
-        }
+    pub fn rip(&self, _vector: u64) -> u64 {
+        self.rip
     }
 
     /// Code segment selector at the fault.
-    ///
-    /// Only meaningful when the privilege level changed; see the module note on
-    /// the two layouts.
     #[inline]
-    pub fn cs(&self, vector: u64) -> u64 {
-        if Self::has_error_code(vector) {
-            self.third
-        } else {
-            self.second
-        }
+    pub fn cs(&self, _vector: u64) -> u64 {
+        self.cs
     }
 
     /// `RFLAGS` at the fault.
     #[inline]
-    pub fn rflags(&self, vector: u64) -> u64 {
-        if Self::has_error_code(vector) {
-            self.fourth
-        } else {
-            self.third
-        }
+    pub fn rflags(&self, _vector: u64) -> u64 {
+        self.rflags
     }
 
     /// Stack pointer the faulting code was using.
     ///
-    /// In 64-bit mode the CPU always pushes `RSP`, so this is the word after
-    /// `RFLAGS` with the same displacement rule as the rest of the frame.
+    /// Always present in 64-bit mode — `RSP` is pushed for every exception, not
+    /// only on a privilege change.
     #[inline]
-    pub fn rsp(&self, vector: u64) -> Option<u64> {
-        Some(if Self::has_error_code(vector) {
-            // error code, RIP, CS, RFLAGS, RSP
-            self.fifth
-        } else {
-            // RIP, CS, RFLAGS, RSP
-            self.fourth
-        })
+    pub fn rsp(&self, _vector: u64) -> Option<u64> {
+        Some(self.rsp)
     }
 
     /// Whether the fault was taken from ring 3.
@@ -512,9 +568,9 @@ impl ExceptionFrame {
     /// which is the question callers actually want, and it is answered by the
     /// saved `CS`'s requested privilege level.
     ///
-    /// The name matters because the 32-bit-mode predicate of the same meaning is
-    /// usually called "did the CPU push `RSP`/`SS`", and conflating the two is
-    /// how a resume path ends up skipping two words that were never absent.
+    /// The name matters because the 32-bit-mode predicate of the same meaning
+    /// is usually called "did the CPU push `RSP`/`SS`", and conflating the two
+    /// is how a resume path ends up skipping two words that were never absent.
     #[inline]
     pub fn privilege_changed(&self, vector: u64) -> bool {
         self.cs(vector) & 0x3 != 0
@@ -629,13 +685,8 @@ pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &Exception
     {
         let frame_pointer = frame as *const ExceptionFrame as u64;
 
-        // The error code, where the vector pushes one, sits *below* the five
-        // words `iretq` consumes and must be discarded first.
-        let has_error_code = Exception::from_vector(vector as u8)
-            .is_some_and(|exception| exception.has_error_code());
-
         // SAFETY: delegated to this trampoline's contract below.
-        unsafe { enter_resume(frame_pointer, target, has_error_code) };
+        unsafe { enter_resume(frame_pointer, target) };
     }
 
     // Halt rather than resume: an unhandled kernel fault means the register file
@@ -647,71 +698,82 @@ pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &Exception
 
 /// Restore the CPU's pushed frame and return to the faulting code at `target`.
 ///
-/// # Why this is a naked trampoline and not three `asm!` statements
+/// # The frame's shape
 ///
-/// The sequence is three instructions that must run as a unit with *no* register
-/// allocation and *no* code in between:
+/// The stub uniformises the frame, so the six words below always sit at the
+/// same offsets from the frame address `RBX`:
 ///
 /// ```text
-///     mov rsp, frame        ; undo this function's own prologue
-///     add rsp, 8            ; drop the error code, where the vector pushed one
-///     mov qword [rsp], target ; resume somewhere other than the faulting insn
-///     iretq                 ; pop RIP, CS, RFLAGS, RSP, SS
+///     [rbx + 0x00]  error code   (CPU-pushed, or the stub's zero placeholder)
+///     [rbx + 0x08]  RIP
+///     [rbx + 0x10]  CS
+///     [rbx + 0x18]  RFLAGS
+///     [rbx + 0x20]  RSP
+///     [rbx + 0x28]  SS
 /// ```
 ///
-/// Written as ordinary `asm!` inside a normal Rust function, the compiler is
-/// free to use `RSP` for anything and to restore it from a callee-saved register
-/// between the statements. `options(nostack)` does not prevent this — it asserts
-/// that the asm does not touch `RSP`, which is exactly what these instructions
-/// do, so the compiler is told the stack pointer is invariant and schedules its
-/// own `mov %reg, %rsp` to run *after* the reset. `RSP` then points at a
-/// register that no longer holds the frame pointer, `iretq` pops whatever the
-/// register happened to contain, and control transfers to a word of the
-/// interpreter's choosing.
+/// `iretq` pops five words, starting at `RIP`. It never sees the error code,
+/// which sits *below* the words it consumes — so the resume path has to step
+/// over it, and stepping over it means moving **down**, towards lower
+/// addresses.
 ///
-/// That failure is silent and unique to this path. The report has already been
-/// printed by the time this runs, so the log shows a correctly-diagnosed fault
-/// and then stops — which reads as "the report hung", not "the resume sequence
-/// corrupted the stack".
+/// That is what the `add rsp, 8` does. Skipping eight bytes steps over the
+/// error-code word and lands exactly on the saved `RIP`.
 ///
-/// A naked trampoline has no prologue, no register allocation and no epilogue, so
-/// the four instructions execute exactly as written. `options(noreturn)` states
-/// that control does not return, which is what lets the caller treat this as a
-/// terminating branch.
+/// # The register save area
 ///
-/// # Safety
+/// The stub saved the fifteen general-purpose registers below the frame, at
+/// `[rbx - 8 - 8*k]` for `k` in `0..15`, in push order: `rax` at the highest
+/// address, `r15` at the lowest. The trampoline pops them back in the reverse
+/// order, which restores both the values and the stack pointer.
 ///
-/// `frame` must be the address the CPU pushed, `target` must be a valid kernel
-/// instruction address, and the whole function must be called only while the
-/// fault interlock is armed. It does not return.
-/// Restore the CPU's pushed frame and return to the faulting code at `target`.
+/// This is not optional bookkeeping. The dispatcher is an ordinary Rust
+/// function, so it clobbers the caller-saved registers — including `rcx`,
+/// which is the *divisor* of the `idiv` that raised the `#DE`. Resuming
+/// without restoring it would re-execute the divide with a different divisor,
+/// re-fault immediately, and spin the machine at fault speed with no way out.
+/// The symptom is a fault report that looks completely correct followed by an
+/// endless stream of identical faults.
+///
+/// The area's lowest word is therefore 120 bytes below the frame base, and
+/// the `sub rsp, 120` reaches it exactly. The stub's eight-byte alignment
+/// pad sits *below* the area, and is skipped by neither — it is the word the
+/// `call` to the dispatcher pushed, and the resume path discards the whole
+/// region below the frame.
 ///
 /// # Why this is a naked trampoline and not three `asm!` statements
 ///
-/// The sequence is four instructions that must run as a unit with *no* register
-/// allocation and *no* compiled code in between:
+/// These instructions must run as a unit, with *no* register allocation and
+/// *no* compiled code in between:
 ///
 /// ```text
-///     mov rsp, rbx          ; undo this function's own prologue
-///     add rsp, 8            ; drop the error code, where the vector pushed one
-///     mov qword [rsp], r12  ; resume somewhere other than the faulting insn
-///     iretq                 ; pop RIP, CS, RFLAGS, RSP, SS
+///     mov rsp, rbx          ; adopt the CPU's frame
+///     mov qword [rbx+8], r12; overwrite the saved RIP with the resume target
+///     sub rsp, 120          ; reach the register save area
+///     pop r15 ... pop rax   ; restore the general-purpose registers
+///     add rsp, 8            ; step over the error code
+///     iretq
 /// ```
 ///
 /// Written as ordinary `asm!` statements inside a normal Rust function, the
 /// compiler allocates registers around them and is entitled to restore `RSP`
 /// from a callee-saved register *after* the reset. `options(nostack)` does not
-/// prevent this — it asserts that the asm does not touch `RSP`, which is exactly
-/// what these instructions do, so the compiler is told the stack pointer is
-/// invariant and schedules its own `mov %reg, %rsp` to run last. `RSP` then
-/// points at a register that no longer holds the frame address, `iretq` pops
-/// whatever that register happened to contain, and control transfers to a word
-/// of the compiler's choosing.
+/// prevent this — it asserts that the asm does not touch `RSP`, which is
+/// exactly what these instructions do, so the compiler is told the stack
+/// pointer is invariant and schedules its own `mov %reg, %rsp` to run last.
+/// `RSP` then points at a register that no longer holds the frame address,
+/// `iretq` pops whatever that register happened to contain, and control
+/// transfers to a word of the compiler's choosing.
 ///
 /// That failure is silent and unique to this path. The report has already been
 /// printed by the time this runs, so the log shows a correctly-diagnosed fault
 /// and then stops — which reads as "the report hung", not "the resume sequence
 /// corrupted the stack".
+///
+/// A naked trampoline has no prologue, no register allocation and no epilogue,
+/// so the instructions execute exactly as written. `options(noreturn)` states
+/// that control does not return, which is what lets the caller treat this as a
+/// terminating branch.
 ///
 /// # Why the values arrive in registers
 ///
@@ -723,48 +785,134 @@ pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &Exception
 /// exception stubs do: the register set is named once, in a constant, so the
 /// caller and the trampoline cannot disagree about it.
 ///
-/// `RBX` carries the frame address, `R12` the resume target, and `DL` the
-/// "the vector pushed an error code" flag. All three are callee-saved, so
-/// loading them costs the caller nothing and clobbers nothing on the way.
+/// `RBX` carries the frame address and `R12` the resume target. Both are
+/// callee-saved, so loading them costs the caller nothing. Both are also
+/// overwritten by the restore — `pop rbx` and `pop r12` — but only *after*
+/// their last use, which is why the target is written to memory before the
+/// pops begin.
 ///
 /// # Safety
 ///
-/// `RESUME_FRAME_REG` must hold the address the CPU pushed, `R12` must be a
-/// valid kernel instruction address, and this must be called only while the
-/// fault interlock is armed. It does not return.
+/// `RBX` must hold the address the CPU pushed, `R12` must be a valid kernel
+/// instruction address, and this must be called only while the fault interlock
+/// is armed. It does not return.
 #[unsafe(naked)]
 unsafe extern "C" fn resume_from_frame() -> ! {
     naked_asm!(
-        // SAFETY: by contract, `RBX` holds the address the CPU pushed.
+        // SAFETY: by contract, `RBX` holds the frame address. `RSP` is moved
+        // there so the frame the CPU pushed is what the sequence below
+        // operates on.
         "mov rsp, rbx",
-        // The flag is a byte in `DL`: `test dl, dl` sets the zero flag when the
-        // vector pushed no error code, and there is then nothing to skip.
-        "test dl, dl",
-        "jz 2f",
-        // The error code, where the vector pushed one, is the word immediately
-        // *below* `RIP`. Skipping exactly that word and nothing else is what puts
-        // `RIP` at `[rsp]` for the overwrite that follows.
+        // SAFETY: `RBX + 8` is the saved `RIP` slot of the uniform frame, and
+        // it is a word of the pushed frame, so it is mapped and writable. The
+        // operand is written LLVM-style (`ptr`) because `naked_asm!` parses
+        // with LLVM's assembler, not the Intel one the `asm!` macro uses
+        // elsewhere.
+        //
+        // Writing the resume target there is what makes `iretq` continue at
+        // the target rather than re-executing the faulting instruction.
+        "mov qword ptr [rbx + 8], r12",
+        // SAFETY: the register save area holds the fifteen general-purpose
+        // registers the stub pushed, in push order: `r15` at the lowest
+        // address and `rax` at the highest. It sits immediately below the
+        // frame, and the stub's eight-byte alignment pad sits below *that*.
+        //
+        // The area is fifteen words — 120 bytes — below the frame's base, so
+        // subtracting 120 reaches `r15`.
+        //
+        // The number is 120 and not 128 because the pad occupies the word
+        // *below* `r15`. Subtracting 128 lands on the pad, and every pop then
+        // reads one word too low: `r15` receives the pad's stale contents and
+        // every other register receives its neighbour's value. The register
+        // file ends up shifted by one word.
+        //
+        // That failure is silent and uniquely confusing. The stack *position*
+        // at the `iretq` still comes out right, because the extra word
+        // skipped below is compensated for by the `add rsp` at the end, so
+        // control transfers correctly to the resume target — with a corrupt
+        // register file. The resumed code then reads a pointer that was never
+        // the pointer it stored, and dereferences it. The symptom is a page
+        // fault in an unrelated function, several frames away from the
+        // exception that actually went wrong, with a faulting address of
+        // zero and a register set that does not match the source.
+        "sub rsp, 120",
+        // SAFETY: the fifteen pops restore the general-purpose registers the
+        // stub saved, in the reverse of the order they were pushed. The stack
+        // is mapped and the values are the ones the stub wrote.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        // SAFETY: `RSP` now addresses the frame's error-code word, which sits
+        // immediately below the saved `RIP`. Skipping eight bytes steps over
+        // it and lands on the saved `RIP`, which is where `iretq` expects to
+        // start popping.
+        //
+        // Eight bytes, not sixteen: the word below `RIP` is the error code,
+        // and nothing else. The stub's alignment pad is 128 bytes below the
+        // frame, fifteen register words further down, and was already skipped
+        // by the `sub rsp` above.
         "add rsp, 8",
-        "2:",
-        // SAFETY: `RSP` now addresses the saved `RIP`, which is a word of the
-        // pushed frame and therefore mapped and writable. The operand is
-        // written LLVM-style (`ptr`) because `naked_asm!` parses with LLVM's
-        // assembler, not the Intel one the `asm!` macro uses elsewhere.
-        "mov qword ptr [rsp], r12",
+        // SAFETY: `RSP` addresses the saved `RIP`, and the five words above it
+        // are the CPU's saved `CS`, `RFLAGS`, `RSP` and `SS`. `iretq` pops
+        // exactly those five and returns to the interrupted code, with `RIP`
+        // now holding the resume target.
         "iretq",
     )
 }
 
-/// Load the three registers [`resume_from_frame`] reads, then enter it.
+/// Load the two registers [`resume_from_frame`] reads, then enter it.
 ///
 /// Split from the trampoline because a naked body cannot contain the loads: the
 /// values are computed here, in ordinary Rust, and moved into registers by the
 /// `mov`s below.
 ///
+/// # Why the registers are pinned rather than left to the allocator
+///
+/// `in(reg)` lets the compiler pick *any* register for an operand, including
+/// `rbx` and `r12` — the two registers [`resume_from_frame`] reads. It is
+/// allowed to do so, because at the point of the `asm!` there is no contract
+/// saying otherwise.
+///
+/// When it does, the sequence still *appears* to work. The compiler loads the
+/// frame address into, say, `rbx` and the resume target into `r12`, the
+/// template's own `mov` instructions then write the same values to the same
+/// registers, and the jump transfers control correctly. The register file
+/// ends up right.
+///
+/// The hazard is that the compiler is free to *also* keep a live value in one
+/// of those registers across the `asm!`, or to use one as a scratch
+/// register for a value it needs afterwards — and the template's `mov`
+/// silently destroys it. The result is a value that was correct before the
+/// jump and wrong after it, with no diagnostic: the jump is unconditional and
+/// the trampoline restores the *interrupted* register file, not the compiler's.
+///
+/// `in("rbx")` and `in("r12")` remove the freedom entirely: the compiler must
+/// place those operands in exactly those registers, and must not keep a live
+/// value there across the `asm!`. The template's `mov` then becomes a
+/// redundant copy of a value that is already in the right place — which is
+/// precisely the property that makes the sequence safe.
+///
+/// The redundancy is deliberate. The alternative — loading the values with
+/// `mov` from registers the compiler chose — cannot be made safe without the
+/// same pinning, and pinning the *source* register is the same amount of
+/// constraint with less to get wrong.
+///
 /// # Safety
 ///
 /// Same contract as [`resume_from_frame`]. Does not return.
-unsafe fn enter_resume(frame: u64, target: u64, has_error_code: bool) -> ! {
+unsafe fn enter_resume(frame: u64, target: u64) -> ! {
     // SAFETY: each register is loaded immediately before the jump, and the jump is
     // unconditional, so no instruction can observe a stale value.
     //
@@ -773,26 +921,40 @@ unsafe fn enter_resume(frame: u64, target: u64, has_error_code: bool) -> ! {
     // interleaving operands and templates is what the parser rejects:
     // `"mov rbx, {frame}", frame = in(reg) frame, "mov r12, {target}"` is a
     // syntax error, not a formatting preference.
+    //
+    // The operands are pinned to named registers rather than left as
+    // `in(reg)`, so the compiler cannot choose a register the template is
+    // about to overwrite. See the function's documentation for why that
+    // matters.
+    //
+    // `rbx` cannot be an operand register: LLVM reserves it internally and
+    // rejects it outright ("rbx is used internally by LLVM and cannot be used
+    // as an operand for inline asm"). The frame address therefore arrives in
+    // `r15` and the template's `mov` puts it in `rbx`.
+    //
+    // Explicitly named operands are referred to by their register name in the
+    // template, not by an `{name}` placeholder, and they cannot carry an
+    // operand name of their own — which is why `frame` and `target` appear
+    // here without a `name =` prefix.
+    //
+    // The `mov r12, r12` is a self-move. It exists only to make the template
+    // mention `r12`, so the operand is not reported as unused; it changes no
+    // bit. `r12` already holds the target because the operand was placed there.
+    //
+    // The `mov rbx, r15` is safe because the block is `noreturn`: LLVM treats
+    // every register as dead after it, so nothing it had in `rbx` can be live
+    // across the block. The trampoline consumes `rbx` and `r12` in its first
+    // two instructions, before the `pop` sequence restores the interrupted
+    // register file over both of them.
     unsafe {
         core::arch::asm!(
             concat!(
-                "mov rbx, {frame}\n",
-                "mov r12, {target}\n",
-                // `mov dl, {flag}` is not encodable — `dl` and a 64-bit general
-                // register are different operand sizes, so the assembler rejects
-                // the pairing outright. Copying through a full-width register
-                // and then narrowing is the encodable form.
-                "mov r11, {flag}\n",
-                "mov dl, r11b\n",
+                "mov rbx, r15\n",
+                "mov r12, r12\n",
                 "jmp {trampoline}",
             ),
-            frame = in(reg) frame,
-            target = in(reg) target,
-            // There is no `reg32` register class on this target, and the
-            // assembler will not pair a 64-bit operand with `r11d`. The flag is
-            // a 0 or a 1, so it moves as a full register and is narrowed by a
-            // second `mov` — which is the encodable form.
-            flag = in(reg) u64::from(has_error_code),
+            in("r15") frame,
+            in("r12") target,
             trampoline = sym resume_from_frame,
             options(noreturn),
         )
@@ -889,17 +1051,100 @@ fn decode(exception: Exception, vector: u64, frame: &ExceptionFrame) -> FaultInf
 /// The vector number is emitted as a literal so the target stays a constant, and
 /// `mov` (not `lea`) is used so the immediate encoding is independent of the
 /// image's code model.
+/// Build one naked exception trampoline for `vector`.
+///
+/// The vector number is emitted as a literal so the target stays a constant, and
+/// `mov` (not `lea`) is used so the immediate encoding is independent of the
+/// image's code model.
+///
+/// # The frame is uniformised here
+///
+/// The CPU pushes a different number of words depending on whether the vector
+/// defines an error code: five for `#DE`, `#UD` and the rest, six for `#PF`,
+/// `#GP` and the rest. That difference is *invisible* to the handler unless
+/// something makes it uniform.
+///
+/// The stub does. For the vectors that push no error code it opens one more
+/// word below the CPU's frame and stores zero there, so every vector presents
+/// the same six words:
+///
+/// ```text
+///     [0] error code   (CPU-pushed, or this zero placeholder)
+///     [1] RIP
+///     [2] CS
+///     [3] RFLAGS
+///     [4] RSP
+///     [5] SS
+/// ```
+///
+/// `RIP` is then at a fixed offset of 8 for every vector, which is what lets
+/// the dispatcher and the resume trampoline stay vector-independent. Making the
+/// shape uniform in the stub is the right place for the decision: the stub is
+/// the only code that knows the vector.
+///
+/// The frame is 48 bytes either way, and it ends at the same address in both
+/// cases — the CPU's five-word frame is *at* the six-word frame's last five
+/// words, so the placeholder slot is exactly the one word the CPU did not use.
+/// That is what keeps the stack pointer's residue identical for every vector.
+///
+/// # Why the general-purpose registers are saved
+///
+/// An exception suspends the interrupted code with its registers live. A
+/// handler that clobbers them and then resumes destroys the interrupted
+/// computation — the divide-by-zero test would come back with a different
+/// divisor, and the illegal-instruction test with a different opcode table
+/// entry. Saving them in the stub and restoring them in the resume trampoline
+/// is what makes "resume" mean "continue", rather than "continue with whatever
+/// the handler happened to leave behind".
+///
+/// The registers are saved *above* the frame (the stack grows down, so a push
+/// goes to a lower address) and are restored from the same place.
+///
+/// # Why `call` and not `jmp`
+///
+/// The SysV ABI requires `RSP ≡ 8 (mod 16)` at a function's first instruction,
+/// which is what a `call` produces. The CPU aligns `RSP` to 16 before pushing
+/// its frame, so the stub starts 16-byte aligned; the register save area plus
+/// the alignment pad brings it back to a multiple of 16 before the `call`.
+///
+/// The return address `call` pushes lands *below* the frame, so it does not
+/// disturb it. The resume path discards it by resetting `RSP` to the frame.
 macro_rules! stub {
-    ($fn_name:ident, $vector:expr) => {
+    ($fn_name:ident, $vector:expr, $push_placeholder:expr) => {
         #[unsafe(naked)]
         extern "C" fn $fn_name() -> ! {
             naked_asm!(
-                // SAFETY: on entry the CPU has just pushed the exception frame
-                // and nothing else, so `rsp` addresses `error_code` for the
-                // vectors that push one and `rip` for those that do not. The
-                // callee receives `&ExceptionFrame`, whose layout matches both
-                // cases because the error-code-carrying vectors are the ones
-                // whose first pushed slot is the error code.
+                // SAFETY: `sub` and the store touch only the kernel stack, one
+                // word below the CPU's frame, which is mapped and writable.
+                // The value stored is zero, which is what
+                // `ExceptionFrame::error_code` reports for a vector that pushes
+                // no error code.
+                concat!($push_placeholder),
+                // SAFETY: each `push` writes one word of the register file to
+                // the kernel stack. The stack is mapped and has room: the
+                // kernel reserves a dedicated stack for the boot thread and the
+                // interrupt path uses a separate one.
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                // SAFETY: an eight-byte alignment pad, so the `call` below
+                // happens with `RSP` a multiple of 16 as the ABI requires.
+                "sub rsp, 8",
+                // SAFETY: `RSP` addresses the frame's error-code word, which is
+                // the CPU's own for the error-code vectors and the placeholder
+                // for the others. It is the frame's first word.
                 //
                 // The frame goes in `rsi`, which is the SysV *second* integer
                 // argument slot. The vector number goes in `rdi`, the first.
@@ -912,42 +1157,63 @@ macro_rules! stub {
                 // `#PF` handler, and the machine triple-faults with an empty
                 // serial log. Every layer of that looks like "the fault path is
                 // broken", and none of it points at the argument order.
-                "mov rsi, rsp",
+                "lea rsi, [rsp + 128]",
                 // SAFETY: the vector is a compile-time constant, and `rdi` is the
                 // SysV first integer argument slot that `dispatch` declares.
                 concat!("mov edi, ", $vector),
-                // SAFETY: `nova_kernel_idt_dispatch` diverges, so no return
-                // address is needed and none is pushed — pushing one would sit on
-                // top of the frame we just captured in `rsi`.
-                "jmp nova_kernel_idt_dispatch",
+                // SAFETY: `nova_kernel_idt_dispatch` diverges and never
+                // returns, so the `call` is used only to establish the ABI's
+                // stack alignment. Its return address is pushed below the frame
+                // and is discarded by the resume path.
+                "call nova_kernel_idt_dispatch",
+                // SAFETY: `nova_kernel_idt_dispatch` is declared `-> !`, so this
+                // is unreachable. It is here because the naked function's type
+                // demands a terminator and the assembler needs one.
+                "ud2",
             )
         }
     };
 }
 
-stub!(debug_stub, 1);
-stub!(nmi_stub, 2);
-stub!(breakpoint_stub, 3);
-stub!(coprocessor_overrun_stub, 9);
-stub!(reserved15_stub, 15);
-stub!(x87_stub, 16);
-stub!(machine_check_stub, 18);
-stub!(simd_stub, 19);
-stub!(virtualization_stub, 20);
-stub!(control_protection_stub, 21);
+stub!(debug_stub, 1, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(nmi_stub, 2, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(breakpoint_stub, 3, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(
+    coprocessor_overrun_stub,
+    9,
+    "sub rsp, 8\nmov qword ptr [rsp], 0\n"
+);
+stub!(reserved15_stub, 15, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(x87_stub, 16, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(
+    machine_check_stub,
+    18,
+    "sub rsp, 8\nmov qword ptr [rsp], 0\n"
+);
+stub!(simd_stub, 19, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(virtualization_stub, 20, "");
+stub!(control_protection_stub, 21, "");
 
-stub!(div_error_stub, 0);
-stub!(overflow_stub, 4);
-stub!(bound_range_stub, 5);
-stub!(invalid_opcode_stub, 6);
-stub!(device_not_available_stub, 7);
-stub!(double_fault_stub, 8);
-stub!(invalid_tss_stub, 10);
-stub!(segment_not_present_stub, 11);
-stub!(stack_segment_fault_stub, 12);
-stub!(general_protection_fault_stub, 13);
-stub!(page_fault_stub, 14);
-stub!(alignment_check_stub, 17);
+stub!(div_error_stub, 0, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(overflow_stub, 4, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(bound_range_stub, 5, "sub rsp, 8\nmov qword ptr [rsp], 0\n");
+stub!(
+    invalid_opcode_stub,
+    6,
+    "sub rsp, 8\nmov qword ptr [rsp], 0\n"
+);
+stub!(
+    device_not_available_stub,
+    7,
+    "sub rsp, 8\nmov qword ptr [rsp], 0\n"
+);
+stub!(double_fault_stub, 8, "");
+stub!(invalid_tss_stub, 10, "");
+stub!(segment_not_present_stub, 11, "");
+stub!(stack_segment_fault_stub, 12, "");
+stub!(general_protection_fault_stub, 13, "");
+stub!(page_fault_stub, 14, "");
+stub!(alignment_check_stub, 17, "");
 
 /// The raw bytes of the IDT, for boot-time diagnosis.
 ///
@@ -1119,15 +1385,16 @@ pub unsafe fn init() {
         // descriptor built from whatever the compiler happened to spill into the
         // same stack slots.
         //
-        // A `static` removes the question. Nothing can alias it, so the bytes
-        // `lidt` reads are the bytes that were written.
-        static mut IDT_DESCRIPTOR: IdtPseudoDescriptor = IdtPseudoDescriptor { limit: 0, base: 0 };
+        // A `static` removes the question, and the declared `align(8)` removes
+        // the other one: `lidt` rejects an unaligned operand, and a local's
+        // alignment is whatever the compiler's stack layout happens to give it.
+        static mut IDT_DESCRIPTOR: IdtPseudoDescriptor = IdtPseudoDescriptor([0; 10]);
 
         // SAFETY: `init` is the sole writer, called once from `_start`, and the
         // write happens-before the `lidt` that reads it in the same block.
         let descriptor = &mut *addr_of_mut!(IDT_DESCRIPTOR);
-        descriptor.limit = (size_of::<Idt>() - 1) as u16;
-        descriptor.base = (&raw const IDT) as u64;
+        *descriptor =
+            IdtPseudoDescriptor::new((size_of::<Idt>() - 1) as u16, (&raw const IDT) as u64);
 
         core::arch::asm!(
             "lidt [{descriptor}]",

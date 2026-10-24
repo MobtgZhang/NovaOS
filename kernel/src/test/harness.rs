@@ -209,8 +209,8 @@ static ALL_SUITES: &[TestSuite] = &[
                 opcode_fault_is_not_user,
             ),
             (
-                "the_error_code_carries_the_table_id",
-                the_error_code_has_table_id,
+                "a_vector_with_no_error_code_reports_zero",
+                a_vector_with_no_error_code_reports_zero,
             ),
             ("the_machine_survives_the_fault", opcode_machine_survives),
         ],
@@ -767,11 +767,63 @@ fn provoke_divide_by_zero() -> Option<FaultRecord> {
             // the stack is balanced across the fault. The `asm!` needs no `unsafe`
             // of its own: the enclosing `with_recoverable_faults` block is already
             // the one carrying this function's SAFETY argument.
-            core::arch::asm!("call {entry}", entry = in(reg) entry, options(noreturn));
+            //
+            // `options(nostack)` rather than `options(noreturn)`, and the
+            // difference is the whole test.
+            //
+            // `noreturn` tells the compiler the call never returns, so it emits
+            // an `ud2` immediately after it — a trap to catch a control-flow
+            // bug. But the resume target *is* a naked `ret`, and it pops the
+            // return address the `call` pushed... which is that `ud2`. So the
+            // resume lands on the compiler's trap, raises a second, spurious
+            // `#UD`, and the machine reports a fault the test never provoked.
+            //
+            // `nostack` says only that the asm does not adjust `RSP`, which is
+            // true, and lets the code after it stay reachable. The `0u8` below
+            // is then genuinely unreachable — the resume jumps into
+            // `divide_by_zero_resume`, whose `ret` returns past this closure —
+            // but the compiler cannot see that, so the value is what gives the
+            // closure a return type.
+            //
+            // `clobber_abi("C")` says the same thing about registers that
+            // `options(nostack)` says about the stack pointer: this block
+            // destroys every caller-saved register, exactly as a real `call`
+            // would. Without it the compiler is free to keep a live value in
+            // one of those registers across the block — and the fault path
+            // makes that a lie.
+            //
+            // The reason is the exception trampoline, not the `call`. The
+            // handler restores the *interrupted* register file: the values the
+            // stub saved at fault time. `divide_by_zero` sets `RCX` to zero
+            // before the `idiv`, so the restored `RCX` is zero — not the value
+            // the compiler had there before the block. Any caller-saved
+            // register the compiler had cached a live value in comes back
+            // holding the faulting function's value instead, with no
+            // diagnostic.
+            //
+            // That is exactly the bug this block used to have. `faults_are_repeatable`
+            // kept the first fault's `ip` live in `RCX` across the second
+            // provoke; the restored `RCX` was zero, so the comparison
+            // `first.ip != second.ip` reported a spurious difference and the
+            // milestone test failed. It failed only for *some* code layouts,
+            // because the compiler's choice of register for `first.ip` depended
+            // on the surrounding layout — which is why adding any unrelated
+            // statement made the failure disappear.
+            //
+            // `clobber_abi("C")` removes the compiler's freedom entirely: the
+            // value must be spilled or held in a callee-saved register, and
+            // the callee-saved registers *are* preserved across the fault,
+            // because the stub saves and the trampoline restores them
+            // unchanged.
+            core::arch::asm!(
+                "call {entry}",
+                entry = in(reg) entry,
+                options(nostack),
+                clobber_abi("C")
+            );
 
             // Unreachable in practice; present so the closure has a return type
             // and the caller stays reachable to the compiler.
-            #[allow(unreachable_code)]
             0u8
         });
     }
@@ -797,9 +849,23 @@ fn provoke_invalid_opcode() -> Option<FaultRecord> {
             // `ret`s back into this frame. The `asm!` needs no `unsafe` of its
             // own; the enclosing block already carries this function's SAFETY
             // argument.
-            core::arch::asm!("call {entry}", entry = in(reg) entry, options(nostack));
+            //
+            // `nostack` rather than `noreturn`: `noreturn` would make the
+            // compiler emit an `ud2` after the call, and the resume's `ret`
+            // would pop *that* address and re-trap. See `provoke_divide_by_zero`.
+            //
+            // `clobber_abi("C")` for the same reason as in
+            // `provoke_divide_by_zero`: the fault path restores the *interrupted*
+            // register file, so every caller-saved register comes back holding
+            // the faulting function's value rather than the compiler's. See
+            // that function's comment for the full argument.
+            core::arch::asm!(
+                "call {entry}",
+                entry = in(reg) entry,
+                options(nostack),
+                clobber_abi("C")
+            );
 
-            #[allow(unreachable_code)]
             0u8
         });
     }
@@ -1150,20 +1216,36 @@ fn opcode_fault_is_not_user() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// `#UD` pushes an error code, and for an unrecognised opcode the code is the
-/// table id (1 = "simple", the CPU's fallback). It must not be confused with the
-/// kernel text that sits at the same displacement in the no-error-code layout.
-fn the_error_code_has_table_id() -> Result<(), &'static str> {
+/// A vector that pushes no error code must report one as `0`.
+///
+/// This is the check on the error-code *suppression* rule, and it is the
+/// regression test for the frame misread that made `#UD` look like it had
+/// pushed an opcode table id.
+///
+/// `#UD` is the interesting case because the two x86 vendors disagree about
+/// it. The Intel SDM specifies that `#UD` pushes **no** error code; AMD's APM
+/// specifies that it pushes the opcode table index. QEMU's `qemu64` model
+/// follows Intel, and `docs/adr/0004-x86-64-exception-frame.md` records the
+/// measurement that settled it: the word at the bottom of the `#UD` frame is
+/// `RIP`, not a table id.
+///
+/// So on this machine the correct error code is `0`. Reading a table id of `1`
+/// here would mean the frame was read at the wrong displacement — the word
+/// after `RIP` is `CS`, and `CS` on x86-64 is `0x08`/`0x10`, neither of which
+/// is `1`. The test therefore asserts `0`, which distinguishes "correctly
+/// suppressed" from "read the wrong word" only because it would also fail if
+/// the suppression were simply dropped and the raw frame word leaked through.
+fn a_vector_with_no_error_code_reports_zero() -> Result<(), &'static str> {
     let record = provoke_invalid_opcode().ok_or("the handler never ran")?;
     if !record.is_set() {
         return Err("no fault was recorded for the ud2");
     }
 
-    // Table 0 is the single-byte opcode map, which does not contain `0F 0B`, so
-    // the CPU reports table 1. A zero here would mean the word read was not the
-    // error code at all.
-    if record.error_code != 1 {
-        return Err("the #UD error code did not carry the opcode table id");
+    // Intel-family `#UD` pushes nothing, so the reported code is the stub's
+    // zero placeholder. Any non-zero value means a word that was not an error
+    // code was read as one.
+    if record.error_code != 0 {
+        return Err("a vector that pushes no error code reported one");
     }
 
     Ok(())

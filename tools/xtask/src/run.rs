@@ -515,12 +515,20 @@ mod tests {
     // means these cases cannot be covered by booting a working kernel.
 
     /// Write a serial log and return its path.
+    ///
+    /// The suffix disambiguates concurrent calls within one test binary. It is
+    /// a plain counter rather than a formatted pointer: `{:p}` on a `&str`
+    /// prints the pointer *and its length*, which produces names like
+    /// `novaos-classify-193370-Pointer { addr: 0x.., metadata: 38 }.log`.
+    /// That contains spaces and braces, so it is a legal filename only by
+    /// accident, and the file it names is not the one the test then reads.
     fn log_with(contents: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "novaos-classify-{}-{:p}.log",
-            std::process::id(),
-            contents
-        ));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("novaos-classify-{}-{seq}.log", std::process::id(),));
         std::fs::write(&path, contents).expect("temp file is writable");
         path
     }

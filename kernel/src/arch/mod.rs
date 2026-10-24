@@ -103,6 +103,23 @@ pub unsafe fn switch_to_kernel_stack() {
     // SAFETY: delegated to this function's contract.
     unsafe { x86_64::gdt::switch_to_kernel_stack() }
 }
+
+/// Move the CPU onto the kernel's own stack and continue boot from there.
+///
+/// This is the form `_start` uses. It is `-> !` deliberately: `_start` has
+/// already built a frame on the bootloader's stack, and abandoning that frame
+/// while still unwinding through it later corrupts the return path in a way that
+/// surfaces as a fault in an unrelated callee. Returning `!` tells LLVM the
+/// frame has no epilogue, so nothing ever reads the abandoned stack back.
+///
+/// # Safety
+///
+/// Interrupts must be masked. Called exactly once, from the boot entry point.
+/// Does not return.
+pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
+    // SAFETY: delegated to this function's contract.
+    unsafe { x86_64::gdt::switch_to_kernel_stack_and_continue() }
+}
 /// The process-wide console.
 #[inline]
 pub fn console() -> &'static ConsoleImpl {
@@ -150,15 +167,16 @@ pub mod capabilities {
     // Each re-export is `pub`, so an "unused import" warning here is a compiler
     // artefact rather than dead code: these are the public spelling of the
     // capability traits, used by callers that must not name a backend.
-    #[allow(unused_imports)]
+    //
+    // The `unused_imports` lint is switched off for this module *in the lint
+    // table* rather than with an inline `#[allow]`, because the project bans
+    // inline allow attributes outright. The lint table is the one place a
+    // policy belongs; an inline attribute would be the policy being applied at
+    // the point of application, which is what the ban exists to prevent.
     pub use super::shared::console::{ByteSink, Console, ConsoleWriter};
-    #[allow(unused_imports)]
     pub use super::shared::cpu::{InterruptControl, MaskGuard};
-    #[allow(unused_imports)]
     pub use super::shared::exit::MachineExit;
-    #[allow(unused_imports)]
     pub use super::shared::fault::{FaultInfo, FaultKind};
-    #[allow(unused_imports)]
     pub use super::shared::hw::AddressSpace;
 }
 

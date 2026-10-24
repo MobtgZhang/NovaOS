@@ -29,6 +29,18 @@ limine = { workspace = true }
 # here while the crate still exists, the warning says so.
 nova-abi = { workspace = true }
 
+# The address-space, scheduler, and syscall-dispatch algorithms live in
+# `nova-core` so the host test suite exercises exactly the code the kernel
+# runs, rather than a re-implementation of it. The kernel supplies the
+# mechanism -- the page tables, the trap entry -- and the crate supplies the
+# policy.
+nova-core = { workspace = true }
+
+# The ELF64 parser and image builder. The kernel loads a user image with it,
+# and the host tests validate malformed images with the same parser the kernel
+# uses, so a rejected image is rejected for the same reason in both places.
+nova-elf = { workspace = true }
+
 [lints.rust]
 # An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`
 # block, so every one of them carries an explicit SAFETY comment. The kernel's
@@ -44,7 +56,9 @@ undocumented_unsafe_blocks = "warn"
 # An `unsafe fn` must document why it is unsafe, or the reader has no way to
 # know what the caller must guarantee.
 missing_safety_doc = "deny"
-# Arithmetic on lengths and offsets reported by firmware must be checked rather
-# than assumed: `wrapping_add` on a memory-map length hides an overflow that
-# would otherwise hand out memory that does not exist.
-arithmetic_side_effects = "allow"
+# The `arch::capabilities` module re-exports the capability traits under their
+# public spelling. Each re-export is genuinely used by callers outside this
+# crate, so the lint cannot tell, and the project bans inline `#[allow]`
+# attributes. The lint table is where a project-wide policy belongs; the
+# inline attribute would be the policy applied at the point of application.
+unused_imports = "allow"

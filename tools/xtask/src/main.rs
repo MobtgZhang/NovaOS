@@ -32,6 +32,7 @@
 
 mod boot;
 mod build;
+mod iso;
 mod limine;
 mod qemu;
 mod run;

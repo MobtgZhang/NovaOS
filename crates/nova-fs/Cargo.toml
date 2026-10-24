@@ -1,0 +1,39 @@
+[package]
+name = "nova-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS RAM filesystem: path canonicalisation, checked arithmetic, file handles, and scoped file capabilities"
+
+# `no_std` and free of `unsafe`: the filesystem is a bounded static pool with
+# pure path arithmetic, so it is testable on the host.
+[dependencies]
+# The filesystem speaks in terms of `Rights`, which the ABI crate defines.
+# It deliberately does *not* depend on `nova-cap`: the file server's notion of
+# a scoped grant is a filesystem concept, and the capability *handle* that
+# carries it is the kernel's business. Coupling them here would make the
+# filesystem's scope rules untestable without the capability table, and would
+# create a dependency cycle the moment the table learns about file objects.
+nova-abi = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# The crate must never grow an `unsafe` block: it is a bounded pool of
+# plain-old-data, and an `unsafe` here would be a hole in the memory-safety
+# argument the kernel relies on.
+unsafe_code = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+# An arithmetic overflow in a path length, a file size, or a buffer bound is a
+# memory-safety bug in a filesystem: the overflowing value is what says how
+# much memory is real. The lint is on for this crate because the crate is pure
+# logic and has no legitimate reason to wrap. The kernel relaxes this lint
+# because the kernel has address-space arithmetic that genuinely may wrap;
+# a pure-logic crate does not.
+arithmetic_side_effects = "deny"
+# `Vec`, `String`, and `Box` are already unreachable in this crate: it is
+# `#![no_std]` with no `alloc` dependency, so the types that would need a
+# heap simply are not in scope. The ban is therefore mechanical rather than a
+# convention, and no extra lint is needed to enforce it.

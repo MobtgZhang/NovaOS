@@ -33,12 +33,6 @@
 // root, so these live here rather than in a lint table that a future module
 // could opt out of.
 #![deny(unsafe_op_in_unsafe_fn)]
-// Subsystems for later milestones ship as complete, documented, and tested
-// units but have no caller yet: the page-table writer is built and verified in
-// M0, then installed in M2. Flagging them as dead would mean deleting working
-// code and re-typing it later, so they are allowed — and the tests that *do*
-// call in keep them honest in the meantime.
-#![allow(dead_code)]
 
 mod arch;
 mod boot;
@@ -79,45 +73,72 @@ pub unsafe extern "C" fn _start() -> ! {
     // SAFETY: this is the kernel's entry point; every call below is made with
     // interrupts masked and the exception table installed first where required.
     unsafe {
-        // Order matters within the backend: the exception table must exist before
-        // anything that can fault.
-        arch::init();
-
-        // The console is programmed *before* anything that can panic, and that
-        // ordering is load-bearing rather than cosmetic.
+        // The console is programmed *first*, before anything else.
         //
-        // `check_protocol_revision` and `capture` both `panic!` on a
-        // malformed or unsupported boot protocol, and the panic handler prints
-        // through this console. A console that has not been initialised yet
-        // *drops* those bytes (see `ConsoleImpl::send_byte`), so running it
-        // afterwards turns a precise diagnostic into a silent `EXIT_PANIC`
-        // with an empty serial log.
+        // Port I/O needs no segment registers in long mode, so this is safe to
+        // run before `arch::init`, and running it first is what makes the rest
+        // of the boot diagnosable. `arch::init` installs the GDT/TSS/IDT and
+        // reloads `CS`; that is the most fault-prone code in the kernel, and a
+        // fault there with no console yet is unreportable.
         //
-        // The symptom is genuinely misleading: the machine halts on the panic
-        // status, so a QEMU harness reads it as "kernel ran and panicked",
-        // while in fact the kernel panicked before it had any way to report
-        // why. Nothing about the exit status distinguishes the two.
-        //
-        // It is safe to program the UART this early — it is a polled device
-        // behind a `ioport` access, and nothing here touches memory.
+        // `check_protocol_revision` and `capture` both `panic!` on a malformed
+        // or unsupported boot protocol, and the panic handler prints through this
+        // console. A console that has not been initialised yet *drops* those
+        // bytes (see `ConsoleImpl::send_byte`), so running it afterwards turns a
+        // precise diagnostic into a silent `EXIT_PANIC` with an empty log.
         arch::console_init();
-    }
 
-    // Diagnostics: dump the GDT and IDT now that the console exists.
+        // Move off the bootloader's stack, and from here on never unwind through
+        // the frame this function has already built on it.
+        //
+        // This ordering is load-bearing for two independent reasons, and both
+        // have produced faults whose symptoms pointed elsewhere entirely.
+        //
+        // First, `arch::init` builds a 4 KiB IDT, fills a TSS, and reloads `CS`,
+        // and until the IDT is installed a fault inside that work lands on the
+        // bootloader's stack — the stack the faulting code had already pushed
+        // past its end. The `#PF` handler then reports a frame with an `RIP`
+        // inside the bootloader and an `RSP` in the direct map, which reads as
+        // a stack-overflow in unrelated code.
+        //
+        // Second, and far less obviously, `_start` itself must not return
+        // through the frame it has already opened. The switch below is `-> !`
+        // precisely so that LLVM emits no epilogue for it; see
+        // `arch::switch_to_kernel_stack_and_continue`, whose comment records the
+        // `#PF` that came from getting this wrong — a faulting address inside the
+        // stack buffer, blamed on a callee that returned perfectly.
+        //
+        // Nothing is lost by switching before the tables exist: `KERNEL_STACK`
+        // is a `.bss` static, and the bootloader has already mapped the kernel
+        // image's zero-filled pages, so it is writable before any table is
+        // built. Loading `CS` is still the last thing `gdt::init` does.
+        // SAFETY: interrupts are still masked. The function abandons this frame,
+        // so nothing that lives on the bootloader's stack may be read afterwards.
+        arch::switch_to_kernel_stack_and_continue();
+    }
+}
+
+/// Continue the boot sequence on the kernel's own stack.
+///
+/// Split out of [`_start`] for one reason that is easy to miss: `_start` has
+/// already built a frame on the bootloader's stack, and moving `rsp` abandons
+/// it. If the rest of boot lived in `_start`, its epilogue would eventually run
+/// and read that abandoned frame back through the *new* stack pointer. Here
+/// there is no such epilogue — this function is called fresh, with the stack
+/// already switched, and never returns.
+///
+/// # Safety
+///
+/// Must run after the console is up and on the kernel's own stack, with
+/// interrupts still masked and the exception table installed.
+pub unsafe fn boot_after_stack_switch() -> ! {
+    // Order matters within the backend: the exception table must exist before
+    // anything that can fault.
+    unsafe { arch::init() };
+
+    // Diagnostics: dump the GDT and IDT now that the console exists and the
+    // kernel owns the stack the dump runs on.
     arch::dump_tables();
-
-    // Move off the bootloader's stack and onto the kernel's own.
-    //
-    // This must happen after the tables are installed and before anything that
-    // can fault, so that the exception frame the CPU pushes lands on a stack
-    // this kernel owns — see the long note on the function.
-    //
-    // SAFETY: interrupts are still masked. The function abandons this frame,
-    // so nothing that lives on the bootloader's stack may be read afterwards;
-    // `_start` only reads its own locals, which are re-read after the switch.
-    unsafe {
-        arch::switch_to_kernel_stack();
-    }
 
     logger::init();
 
@@ -126,8 +147,8 @@ pub unsafe extern "C" fn _start() -> ! {
     // exception table installed.
     unsafe {
         // Reject an unsupported bootloader before touching hardware, so a
-        // mismatch is a clean diagnostic rather than a machine that dies before it
-        // can print anything.
+        // mismatch is a clean diagnostic rather than a machine that dies before
+        // it can print anything.
         boot::check_protocol_revision();
 
         // Validates and copies the bootloader responses into kernel-owned
@@ -177,6 +198,10 @@ pub unsafe extern "C" fn _start() -> ! {
         nova_abi::nr::ALL.len()
     );
 
+    // `run_all` is `-> !`: it terminates the machine via `arch::exit`, so there is
+    // deliberately no epilogue here. An `arch::exit` fallback would be dead code
+    // that the compiler correctly rejects to write, which is the better outcome —
+    // it forces the harness's exit path to stay the single terminating branch.
     test::harness::run_all();
 }
 

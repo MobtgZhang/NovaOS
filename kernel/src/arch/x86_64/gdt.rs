@@ -52,6 +52,35 @@ pub const USER_CODE_SELECTOR: u16 = 0x20 | 0x03;
 /// Ring 3 data selector.
 pub const USER_DATA_SELECTOR: u16 = 0x28 | 0x03;
 
+/// The two selectors [`reload_code_segment_and_return`] pushes as immediates.
+///
+/// `naked_asm!` takes no operands, so the far return's `CS` and `SS` have to be
+/// written as literals. That makes them the one place in the kernel where a
+/// segment selector is a magic number that the compiler will not catch if the
+/// slot layout changes, so it is pinned against the constants instead: if
+/// `KERNEL_CODE_SELECTOR` moves, this stops compiling.
+const FAR_RETURN_CODE_SELECTOR: u64 = KERNEL_CODE_SELECTOR as u64;
+const FAR_RETURN_DATA_SELECTOR: u64 = KERNEL_DATA_SELECTOR as u64;
+
+const _: () = {
+    // These are the literals written into the naked trampoline's body. Asserting
+    // them against the named selectors is what keeps the two from drifting: the
+    // trampoline cannot reference the constants, so this assertion is the only
+    // thing connecting them.
+    assert!(
+        FAR_RETURN_CODE_SELECTOR == 0x08,
+        "the trampoline pushes 0x08 as CS"
+    );
+    assert!(
+        FAR_RETURN_DATA_SELECTOR == 0x10,
+        "the trampoline pushes 0x10 as SS"
+    );
+    // A far return's `CS` must name a code segment and its `SS` a data segment;
+    // loading either the other kind raises `#GP` at the return itself.
+    assert!(FAR_RETURN_CODE_SELECTOR == KERNEL_CODE_INDEX as u64 * 8);
+    assert!(FAR_RETURN_DATA_SELECTOR == KERNEL_DATA_INDEX as u64 * 8);
+};
+
 /// Ring 0 privilege level.
 const DPL_RING0: u8 = 0;
 /// Ring 3 privilege level.
@@ -230,12 +259,56 @@ struct SegmentDescriptor {
 }
 
 /// The legacy pseudo-descriptor (limit + base) used by `lgdt`.
+///
+/// The ten bytes are a 16-bit limit followed immediately by a 64-bit base at
+/// offset **2** — there is no padding between them, which is why the payload is a
+/// byte array rather than two fields.
+///
+/// An earlier version used two fields with `repr(C, align(8))` to get the
+/// alignment `lgdt` requires. That silently inserted six bytes of padding and
+/// moved the base to offset 8, so the CPU read six bytes of the limit as the top
+/// of the base address and loaded a GDT from `0x002f_0000_0000_0000`. The kernel
+/// then took `#GP` on the very next instruction that touched the table. The
+/// alignment requirement is real and must be satisfied; adding it to the *fields*
+/// satisfies it by breaking the format.
+///
+/// Hence: byte payload for the layout, an aligned wrapper for the address.
+type PseudoDescriptor = AlignedPseudoDescriptor;
+
+/// A ten-byte pseudo-descriptor placed at an address `lgdt`/`lidt` will accept.
+///
+/// `align(8)` on the wrapper, not on the payload: the wrapper's own alignment is
+/// what the linker honours, and the payload stays a flat ten bytes so the two
+/// fields keep their specified offsets.
 #[derive(Clone, Copy)]
-#[repr(C, packed)]
-struct PseudoDescriptor {
-    limit: u16,
-    base: u64,
+#[repr(C, align(8))]
+struct AlignedPseudoDescriptor([u8; 10]);
+
+impl AlignedPseudoDescriptor {
+    /// Build a descriptor from a GDT's limit and base.
+    fn new(limit: u16, base: u64) -> Self {
+        let mut bytes = [0u8; 10];
+        bytes[0..2].copy_from_slice(&limit.to_le_bytes());
+        bytes[2..10].copy_from_slice(&base.to_le_bytes());
+        Self(bytes)
+    }
 }
+
+const _: () = {
+    assert!(
+        size_of::<AlignedPseudoDescriptor>() >= 10,
+        "the pseudo-descriptor payload is ten bytes"
+    );
+    assert!(
+        align_of::<AlignedPseudoDescriptor>() >= 8,
+        "lgdt reads an unaligned pseudo-descriptor operand; the CPU rejects it"
+    );
+    // The payload must still start at offset 0, or `base` is no longer at 2.
+    assert!(
+        core::mem::offset_of!(AlignedPseudoDescriptor, 0) == 0,
+        "the payload must start at offset 0 or the limit/base offsets shift"
+    );
+};
 
 /// Task State Segment for ring 0.
 ///
@@ -474,10 +547,10 @@ static KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack::new();
 ///
 /// # Safety
 ///
-/// Must be called with interrupts masked. The caller must not hold any local
-/// whose address escapes into the new stack frame; in practice this is called
-/// once from `_start`, whose remaining locals are all re-read after the switch.
-#[inline]
+/// Must be called with interrupts masked, and **only** from a frame that will
+/// never be unwound — see [`switch_to_kernel_stack_and_continue`], which is the
+/// function actually used. Kept separate so the architecture facade has one
+/// name for the operation regardless of how the target implements it.
 pub unsafe fn switch_to_kernel_stack() {
     let top = KERNEL_STACK.top();
     debug_assert!(
@@ -492,6 +565,71 @@ pub unsafe fn switch_to_kernel_stack() {
         // `nostack` would be a lie: the instruction *does* change `rsp`, so the
         // compiler must not assume it is unchanged across this block.
         asm!("mov rsp, {top}", top = in(reg) top, options(nomem));
+    }
+}
+
+/// Move the CPU onto the kernel's own stack and continue boot, never returning.
+///
+/// This exists because the plain `switch_to_kernel_stack` above is unsound at
+/// `_start`, and the reason is worth recording in full because nothing in the
+/// symptom points at it.
+///
+/// `_start` has already run `push %r14; push %rbx; sub $0x58,%rsp`. That
+/// prologue lives on the **bootloader's** stack. Assigning `rsp` abandons it
+/// mid-frame: the epilogue — `pop %rbx; pop %r14; add $0x58,%rsp; ret` — still
+/// runs eventually, and by then every one of those reads lands on the *kernel*
+/// stack instead. It found whatever the intervening callees had left there,
+/// which at the stack's top was the stack's own address, so the final `ret`
+/// transferred control to a stack address and the CPU raised `#PF` on an
+/// instruction fetch against a non-executable page — error code `0x11`, with a
+/// faulting address *inside the stack buffer*.
+///
+/// The symptom pointed at everything except this. Every segment register was
+/// correct, the GDT, TSS and IDT were each verified correct field by field, and
+/// the fault appeared to originate in `arch::init`'s return — but `arch::init`
+/// returned correctly; it was `_start`, one frame further out, that faulted.
+/// Nothing in the printed frame distinguishes "bad return address" from "bad
+/// callee", and the faulting address being a stack address is the only clue
+/// that says "not a code bug" at all.
+///
+/// Declaring this `-> !` is what fixes it. LLVM then treats every path after
+/// the switch as unreachable *in this frame*, emits no epilogue for it, and
+/// the boot sequence continues on the kernel stack without ever unwinding
+/// through the bootloader frame. `switch_to_kernel_stack` remains for the
+/// architecture-neutral facade, where the same guarantee is documented.
+///
+/// # Safety
+///
+/// Must be called exactly once, from the boot entry point, with interrupts
+/// masked. The calling frame is abandoned and must never be unwound.
+pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
+    let top = KERNEL_STACK.top();
+    assert!(
+        top % 16 == 0,
+        "the kernel stack top is not 16-byte aligned; the CPU faults on use"
+    );
+
+    // SAFETY: delegated to this function's contract. `top` is one past the last
+    // byte of a kernel-owned, 16-byte-aligned buffer, which is where a
+    // downward-growing stack starts.
+    //
+    // `noreturn` is required for correctness, not just for honesty about the
+    // signature: it is what tells LLVM this frame has no epilogue. Without it
+    // the compiler is free to keep the `call`'s frame live and later read it
+    // through the *new* stack pointer, which is the fault described above.
+    //
+    // The `jmp` rather than a `call` is deliberate for the same reason. A `call`
+    // would push a return address onto the new stack and leave LLVM expecting to
+    // consume it; there is nothing to consume, because this function never
+    // returns and its caller has no live frame to unwind to.
+    unsafe {
+        asm!(
+            "mov rsp, {top}",
+            "jmp {continuation}",
+            top = in(reg) top,
+            continuation = sym crate::boot_after_stack_switch,
+            options(nomem, noreturn),
+        )
     }
 }
 
@@ -638,10 +776,22 @@ pub unsafe fn init() {
         assert!(size_of::<TaskStateSegment>() <= 0x10000);
         write_tss_descriptor(gdt_base, TSS_SLOT, tss_base, tss_limit);
 
-        let descriptor = PseudoDescriptor {
-            limit: (size_of::<Gdt>() - 1) as u16,
-            base: addr_of!(GDT) as u64,
-        };
+        // The pseudo-descriptor `lgdt` reads must live somewhere with a *pinned*
+        // alignment, for the same reason the IDT's does: `lgdt` faults on an
+        // unaligned operand, and a stack local's address is only as aligned as
+        // the compiler's current frame layout happens to make it. That alignment
+        // is not part of the type, so a later refactor that changes the frame
+        // can silently un-align it.
+        //
+        // A `static` with the declared `align(8)` is aligned by construction, and
+        // it also removes the "nothing may run between building the descriptor
+        // and the instruction that reads it" hazard a stack local carries.
+        static mut GDT_DESCRIPTOR: AlignedPseudoDescriptor = AlignedPseudoDescriptor([0; 10]);
+        // SAFETY: `init` is the sole writer, called once from `_start`, and the
+        // write happens-before the `lgdt` that reads it in the same block.
+        let descriptor = &mut *addr_of_mut!(GDT_DESCRIPTOR);
+        *descriptor =
+            AlignedPseudoDescriptor::new((size_of::<Gdt>() - 1) as u16, addr_of!(GDT) as u64);
 
         // `lgdt` reads the pseudo-descriptor directly out of memory, so
         // nothing may run between building it and the instruction — not even
@@ -671,11 +821,195 @@ pub unsafe fn init() {
         reload_data_segments();
         load_tss(KERNEL_TSS_SELECTOR);
 
+        // Reload `CS` *last*, after every other instruction that still refers to
+        // the bootloader's segment table. Until this point the CPU is running in
+        // Limine's `CS = 0x28`, which no IDT gate names.
+        //
+        // The trampoline has no frame of its own: it reads the caller's return
+        // address off the stack and returns to it with `CS` reloaded, popping
+        // exactly what it pushed. So this call is self-balancing — `init`
+        // continues normally afterwards, with `RSP` identical on both sides.
+        //
+        // SAFETY: `lgdt`, `ltr` and the data-segment reloads have all run, so the
+        // selector the trampoline pushes resolves in the installed table.
+        // Interrupts are still masked, so nothing can land in the window where
+        // the stack holds a partially-built return frame.
+        reload_code_segment_and_return();
+
+        // Reached with the kernel's own `CS` installed.
         klog!(
             Level::Debug,
-            "gdt: loaded 6 slots, tss rsp0={kernel_top:#x} ist{FAULT_IST_INDEX}={fault_top:#x}"
+            "gdt: loaded {GDT_SLOTS} slots, tss rsp0={:#x} ist{FAULT_IST_INDEX}={:#x}",
+            KERNEL_STACK.top(),
+            FAULT_STACK.top(),
         );
     }
+}
+
+/// Reload `CS`, then return to the caller's continuation.
+///
+/// The Rust signature is `-> ()`, **not** `-> !`, and that is load-bearing. The
+/// body never executes an ordinary `ret`; it ends in `iretq`, which transfers
+/// control to the address the caller pushed. But declaring it `-> !` tells LLVM
+/// the call never comes back, and it then deletes everything after the call —
+/// including the epilogue that would have balanced `init`'s frame — and pads the
+/// gap with `int3`. `int3` is a breakpoint, so the instruction right after the
+/// return raised `#BP`, and with the IDT not yet installed that became `#GP` and
+/// a triple fault.
+///
+/// The symptom was a kernel whose every segment was correct and which still
+/// could not run one instruction past the reload: QEMU reported `#GP(0x1a)` at
+/// the `int3` immediately following the call.
+///
+/// # Why the resume address is read from the stack
+///
+/// The trampoline has no frame, so `[rsp]` on entry is exactly the return
+/// address the `call` pushed — the caller's continuation, which is what the
+/// return must transfer control to.
+///
+/// An earlier version pushed a *label* instead. That is where two expensive
+/// failures came from, and both are worth recording because neither looked like
+/// a segment bug:
+///
+/// * Placing the label *before* the return pushed the return instruction's own
+///   address, so control jumped back into the middle of this sequence and the
+///   second return popped more words out of the caller's frame. Symptom:
+///   `RIP = 0x48ffffff40e8cb48` — this function's own opcode bytes, read as an
+///   address.
+/// * Placing the label *after* it, with the trampoline reached one call deeper
+///   than intended, resumed one word into `init`'s frame. Symptom:
+///   `RIP = 0xcccccccccccccccc` — an uninitialised `.bss` slot.
+///
+/// In both cases `CS` was already correct, which is precisely what made them
+/// hard: the fault pointed away from the segment code that had just run.
+///
+/// # Why five words
+///
+/// `iretq` pops five words whenever it returns to the same privilege level:
+/// `RIP`, `CS`, `RFLAGS`, `RSP`, `SS`. All five must be present even though the
+/// privilege does not change, and the `RSP` word is the caller's post-`call`
+/// stack pointer verbatim — see the note in the body.
+///
+/// # Safety
+///
+/// Must be called with `GDT` loaded and `DS`/`ES`/`SS` already pointing at the
+/// kernel data selector, with interrupts masked. Transfers control to the
+/// caller's continuation with `CS` reloaded, leaving the caller's stack pointer
+/// exactly as it was before the call that got here.
+#[unsafe(naked)]
+unsafe extern "C" fn reload_code_segment_and_return() {
+    core::arch::naked_asm!(
+        // `r11` is call-clobbered by the SysV ABI and is what `naked_asm!` uses
+        // for its own label fixups, so it is the one register this may borrow.
+        //
+        // On entry `[rsp]` is exactly the return address the `call` pushed, which
+        // is the caller's continuation and becomes the new `RIP`. There is no
+        // prologue here to reason about and no frame of our own: that is the
+        // whole design, and it is what makes the arithmetic below checkable.
+        //
+        // `iretq` here is returning to the *same* privilege, so the CPU pops the
+        // full five-word frame it always pushes: `RIP`, `CS`, `RFLAGS`, `RSP`,
+        // `SS`. Three words leaves it reading past the frame into whatever the
+        // caller happened to have there — which is why a three-word version
+        // raised `#GP` with `CS` already correct.
+        //
+        // Reverse push order so `RIP` ends up at the lowest address:
+        // `SS`, `RSP`, `RFLAGS`, `CS`, then `RIP`.
+        //
+        // # The stack pointer, and why it is `r11 + 8`
+        //
+        // This is the part that was wrong for a long time, and the wrong version
+        // was *documented as an invariant*, which is why it survived so many
+        // rebuilds. Measuring it at the trampoline's own entry settles it:
+        //
+        //     rsp = 0xffffffff80125c30   ->  [rsp] = 0xffffffff80101e11 (return addr)
+        //
+        // The `call` pushed that return address and left `rsp` pointing *at* it.
+        // The caller's `rsp`, as it was before the call pushed anything — the
+        // value the caller's own `ret` will eventually read its return address
+        // from — is therefore `rsp + 8`, not `rsp`.
+        //
+        // `iretq` restores `RSP` to exactly the word in its frame; it neither
+        // derives one nor adds anything. So putting `r11` (= entry `rsp`) in that
+        // slot restores a stack pointer that is still pointing at the `call`'s
+        // return address. The `iretq` itself succeeds — `RIP` and `CS` are right,
+        // so nothing looks wrong — but every frame the caller builds from there on
+        // is eight bytes lower than it should be, and the deficit is invisible
+        // until a function returns.
+        //
+        // The symptom was a `#PF` with error code `0x11` (present, instruction
+        // fetch, non-executable page) whose faulting address was a *stack*
+        // address. The `ret` at the end of `arch::init` popped
+        // `[0xffffffff80125c38]`, which by then held `KERNEL_STACK.top()`
+        // (`0xffffffff80125cb0`) rather than a return address, so the CPU tried to
+        // execute the top of the stack buffer. Every printed register was
+        // plausible and every segment was correct, which is what made it look
+        // like a segment or paging bug rather than an eight-byte bookkeeping
+        // error in the frame this function builds.
+        //
+        // So: `r11 + 8` is the caller's pre-call `rsp`, and that is what the
+        // `RSP` slot must carry.
+        //
+        // Reverse push order so `RIP` ends up at the lowest address:
+        // `SS`, `RSP`, `RFLAGS`, `CS`, then `RIP`.
+        //
+        // The two failed variants, each verified by stepping to the `iretq`
+        // under the debugger:
+        //
+        // * No `RSP` word at all (three pushes) — the CPU read two words past the
+        //   frame and reported `#GP`, with `CS` correct and `RFLAGS` holding
+        //   `0x5cb0`, which is the low half of `r11`. That error code is the
+        //   giveaway: a frame word mistaken for a segment selector.
+        // * Pushing `r11` unchanged — the `iretq` succeeded and landed on the
+        //   right instruction with the right `CS`, so this looked correct for a
+        //   long time. It is the eight-byte deficit described above, and it is
+        //   what produced the `#PF` at a stack address.
+        // * Pushing `r11 - 8` on the opposite theory — the same `#PF`, shifted
+        //   down, which at least proved the value mattered.
+        //
+        // # Why `iretq` and not a far return
+        //
+        // `retfq` was tried first, on the reasonable reading that its frame is
+        // five words and the CPU takes `RSP` from the frame. Its frame is five
+        // words, but it is a *different* five: `RIP`, `CS`, `RFLAGS`, then two
+        // slots that are only meaningful on a privilege change, and the CPU does
+        // not restore `RSP` from it on a same-privilege return — it derives the
+        // stack pointer from the frame's own extent instead. Every correction
+        // term tried in that slot produced the same final `rsp`, which is the
+        // signature of a value the CPU never reads.
+        //
+        // `iretq` has no such ambiguity: it restores `RSP` from the word that
+        // sits fourth in the frame, so the slot can be given the caller's
+        // pre-call stack pointer directly and mean exactly that.
+        //
+        // # The other failures, for the same underlying reason
+        //
+        // Every earlier shape of this reasoned about what the stack held rather
+        // than about what the CPU consumes. Two pushed a *label* instead of
+        // reading the caller's return address: one returned into the middle of
+        // this sequence (`RIP = 0x48ffffff40e8cb48`, this function's own opcode
+        // bytes read as an address), the other one word into `init`'s frame
+        // (`RIP = 0xcccccccccccccccc`, an uninitialised `.bss` slot). In both
+        // `CS` was already correct, so the fault pointed away from the segment
+        // code that had just run successfully.
+        //
+        // The selectors are immediates, not register operands. That is the point:
+        // a `CS` value that came from a register was, in an early version,
+        // silently coalesced with a stack value and ended up holding a code
+        // address. See [`FAR_RETURN_CODE_SELECTOR`].
+        // `r11` is adjusted *before* the first push, so the `SS`, `RSP` and `RFLAGS`
+        // words are laid out below the caller's frame rather than overwriting it.
+        // Adding 8 here is the whole fix; see the note above for why.
+        "mov r11, rsp",
+        "add r11, 8",
+        "mov r10, qword ptr [r11 - 8]",
+        "push 0x10",
+        "push r11",
+        "pushfq",
+        "push 0x08",
+        "push r10",
+        "iretq",
+    )
 }
 
 /// Print the raw GDT and IDT bytes to the console.
@@ -1035,20 +1369,40 @@ unsafe fn load_gdt(descriptor: &PseudoDescriptor) {
     }
 }
 
-/// Load the null selector into every data segment register.
+/// Load the kernel data selector into every data segment register.
 ///
 /// # Safety
 ///
-/// Must follow `lgdt`. Loading selector 0 is architecturally always valid; it
-/// faults only when *used*.
+/// Must follow `lgdt`. Reloading `SS` is architecturally always legal once a
+/// present data descriptor is installed; loading the null selector instead is
+/// also accepted by the CPU and is the trap this function's comment describes.
 unsafe fn reload_data_segments() {
+    // `KERNEL_DATA_SELECTOR`, not zero.
+    //
+    // Loading selector 0 into a data segment is architecturally *legal* — it is
+    // what a freshly-entered kernel should avoid, but the CPU accepts it and the
+    // segment only faults on use. That is precisely what makes it a trap: it
+    // looks correct, `ds`/`es`/`ss` all read back as zero, and nothing faults
+    // until something uses `ss`.
+    //
+    // The CPU *does* use `SS` on every interrupt: entering ring 0 loads `SS` from
+    // the current `SS` selector so it can push `SS` onto the new frame. A null
+    // `SS` there is a `#GP` with the selector's present bit clear — before the
+    // handler gets a chance to run, so no fault report is ever printed. The
+    // `#DF` and then the triple fault that follow both report the *original*
+    // faulting instruction and the original `RSP`, which makes it read as "the
+    // handler re-faulted at the same place" rather than "the stack selector was
+    // null".
+    //
+    // A real data descriptor costs nothing and removes the trap.
+    //
     // SAFETY: delegated to this function's contract.
     unsafe {
         asm!(
             "mov ds, ax",
             "mov es, ax",
             "mov ss, ax",
-            in("ax") 0u16,
+            in("ax") KERNEL_DATA_SELECTOR,
             options(nostack, preserves_flags)
         );
     }

@@ -7,6 +7,12 @@ resolver = "3"
 members = [
     "kernel",
     "crates/nova-abi",
+    "crates/nova-cap",
+    "crates/nova-core",
+    "crates/nova-elf",
+    "crates/nova-fs",
+    "crates/nova-ipc",
+    "crates/nova-protocols",
     "tools/xtask",
 ]
 
@@ -19,6 +25,12 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 limine = "0.6.5"
 nova-abi = { path = "crates/nova-abi" }
+nova-cap = { path = "crates/nova-cap" }
+nova-core = { path = "crates/nova-core" }
+nova-elf = { path = "crates/nova-elf" }
+nova-fs = { path = "crates/nova-fs" }
+nova-ipc = { path = "crates/nova-ipc" }
+nova-protocols = { path = "crates/nova-protocols" }
 
 # Bare-metal kernel profile.
 #
