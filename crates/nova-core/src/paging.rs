@@ -308,6 +308,17 @@ impl PageFlags {
     pub const fn intersection(self, other: PageFlags) -> PageFlags {
         PageFlags(self.0 & other.0)
     }
+
+    /// The set with every flag in `other` removed.
+    ///
+    /// The kernel needs this to *narrow* a mapping -- to turn a writable page
+    /// into a read-only one, which is how the W^X rule is applied to a page
+    /// that was first mapped writable. Narrowing must be expressible without
+    /// reaching for the raw bit pattern, because the raw bits are private for
+    /// exactly the reason that a caller should not be assembling them by hand.
+    pub const fn without(self, other: PageFlags) -> PageFlags {
+        PageFlags(self.0 & !other.0)
+    }
 }
 
 impl core::ops::BitOr for PageFlags {

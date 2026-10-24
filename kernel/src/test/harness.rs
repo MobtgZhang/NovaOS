@@ -68,28 +68,35 @@ fn report(args: core::fmt::Arguments<'_>) {
 pub fn run_all() -> ! {
     let mut totals = Totals::default();
 
-    for suite in ALL_SUITES {
-        totals.suites += 1;
-        report(format_args!("SUITE {}", suite.name));
+    // The suites are grouped by milestone, and each group lives in its own
+    // module so that concurrent milestones do not have to edit the same
+    // region of this file. The groups run in milestone order, so a serial log
+    // reads as the plan reads: boot, then paging, then capability, then
+    // services.
+    for group in SUITE_GROUPS {
+        for suite in *group {
+            totals.suites += 1;
+            report(format_args!("SUITE {}", suite.name));
 
-        for (case_name, case) in suite.cases {
-            totals.cases += 1;
+            for (case_name, case) in suite.cases {
+                totals.cases += 1;
 
-            // A panicking case unwinds into the panic handler, so a failure here
-            // is always a returned `Err`, never a hang.
-            match case() {
-                Ok(()) => {
-                    totals.passed += 1;
-                    report(format_args!("  case {case_name} ... ok"));
-                }
-                Err(reason) => {
-                    totals.failed += 1;
-                    report(format_args!("  case {case_name} ... FAIL: {reason}"));
+                // A panicking case unwinds into the panic handler, so a failure
+                // here is always a returned `Err`, never a hang.
+                match case() {
+                    Ok(()) => {
+                        totals.passed += 1;
+                        report(format_args!("  case {case_name} ... ok"));
+                    }
+                    Err(reason) => {
+                        totals.failed += 1;
+                        report(format_args!("  case {case_name} ... FAIL: {reason}"));
+                    }
                 }
             }
-        }
 
-        report(format_args!("END   {}", suite.name));
+            report(format_args!("END   {}", suite.name));
+        }
     }
 
     report(format_args!(
@@ -109,7 +116,26 @@ pub fn run_all() -> ! {
     }
 }
 
-/// Every suite the kernel runs at boot.
+/// Every suite the kernel runs at boot, grouped by milestone.
+///
+/// The suite names are the milestone's exit gate: M1 declares
+/// `boot_smoke`, `memory_map_sanity`, `divide_by_zero_fault`,
+/// `invalid_opcode_fault` and `serial_log_format`, and `scripts/qemu.sh`
+/// asserts on exactly those names. Renaming one silently drops a milestone
+/// criterion, so the names are part of the contract rather than labels.
+///
+/// The grouping exists so each milestone's cases live in their own module.
+/// Editing one shared list would mean two milestones working at once had to
+/// edit the same lines, and the merge of those edits is a silent way to drop a
+/// suite.
+static SUITE_GROUPS: &[&[TestSuite]] = &[
+    ALL_SUITES,
+    crate::test::m2::M2_SUITES,
+    crate::test::m34::M3_SUITES,
+    crate::test::m34::M4_SUITES,
+];
+
+/// The M1 suites: the boot, memory, fault, and console gates.
 ///
 /// The suite names are the milestone's exit gate: M1 declares
 /// `boot_smoke`, `memory_map_sanity`, `divide_by_zero_fault`,
@@ -599,7 +625,7 @@ fn entry_encoding_round_trips() -> Result<(), &'static str> {
     let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::GLOBAL;
 
     // SAFETY: `physical` is page aligned, which is what the encoding requires.
-    let entry = unsafe { encode_entry(physical, flags) };
+    let entry = encode_entry(physical, flags);
 
     if decode_entry(entry) != physical {
         return Err("decoding an entry did not recover its frame address");

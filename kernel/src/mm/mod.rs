@@ -13,8 +13,10 @@
 //! host-testable [`frame::Bitmap`]: a third architecture would reuse the bitmap
 //! unchanged.
 
+pub mod address_space;
 pub mod direct_map;
 pub mod frame;
+pub mod page_table;
 
 use core::cell::UnsafeCell;
 

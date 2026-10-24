@@ -1,4 +1,4 @@
-//! In-kernel test harness for M0 boot verification.
+//! In-kernel test harness for boot verification.
 //!
 //! Each suite prints a machine-greppable line so `scripts/qemu.sh` can assert on
 //! the serial output without parsing free-form prose:
@@ -20,8 +20,19 @@
 //! `invalid_opcode_fault`, `serial_log_format`), and `scripts/qemu.sh` asserts on
 //! exactly those strings. A renamed suite silently drops a gate, so the names
 //! live here as a list the shell script and the kernel both check.
+//!
+//! # Milestones live in separate modules
+//!
+//! Each milestone's cases are in their own file -- [`m2`] for paging and user
+//! mode, [`m34`] for capability, IPC, and services -- and this module only
+//! lists them. The harness runs the groups in milestone order. The split
+//! exists so milestones can be developed at the same time without two of them
+//! editing the same lines of the same file, which is how a suite gets silently
+//! dropped.
 
 pub mod harness;
+pub mod m2;
+pub mod m34;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -36,6 +47,28 @@ pub const SUITE_NAMES: &[&str] = &[
     "serial_log_format",
     "page_tables",
     "console",
+    // M2: paging, user mode, and scheduling.
+    "user_hello",
+    "round_robin_threads",
+    "preempt_busy_loop",
+    "user_cannot_write_kernel",
+    "task_a_cannot_read_task_b",
+    "invalid_elf_rejected",
+    // M3: capability and IPC.
+    "cap_rights_enforced",
+    "cap_send_only_denies_recv",
+    "cap_transfer_via_message",
+    "ipc_echo_64",
+    "server_exit_wakes_client",
+    "cap_revoke_takes_effect",
+    "no_cap_no_priv",
+    // M4: services, filesystem, and console.
+    "file_read_without_cap_denied",
+    "file_cap_scope_allows_descendant",
+    "file_cap_scope_denies_sibling",
+    "ramfs_write_read",
+    "protocol_version_mismatch",
+    "service_restart_after_crash",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

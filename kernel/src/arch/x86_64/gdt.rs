@@ -15,15 +15,22 @@ use crate::logger::Level;
 /// GDT slot count.
 ///
 /// The TSS descriptor is 16 bytes and lives at slot 4, so it straddles slots 4
-/// and 5. Six slots are therefore enough — but the count is asserted against
-/// the TSS's position below, because a table that is one slot short would let
-/// the TSS's second half fall outside the table and make the CPU read garbage.
-const GDT_SLOTS: usize = 6;
+/// and 5. The user data descriptor follows it at slot 6, so seven slots are
+/// enough — but the count is asserted against the TSS's position below, because
+/// a table that is one slot short would let the TSS's second half fall outside
+/// the table and make the CPU read garbage.
+const GDT_SLOTS: usize = 7;
 /// Slot index of the TSS low half.
 ///
-/// Slot 3 is skipped so the 16-byte TSS descriptor lands at slot 4, straddling
-/// slots 4 and 5. [`KERNEL_TSS_SELECTOR`] is derived from this, so the selector
-/// and the slot cannot disagree.
+/// The TSS is a 16-byte descriptor occupying two adjacent 8-byte slots. It
+/// sits at slot 4 so that it *starts* on a 16-byte boundary: the 64-bit TSS
+/// descriptor's base must be 16-byte aligned, and slot 4 puts it at byte
+/// offset 32 of a 16-byte-aligned table. A slot index of 5 would put it at
+/// offset 40, which is 8-byte aligned but not 16-byte aligned, and `ltr`
+/// would reject it with `#GP`.
+///
+/// [`KERNEL_TSS_SELECTOR`] is derived from this, so the selector and the slot
+/// cannot disagree.
 const TSS_SLOT: usize = 4;
 
 /// Selector of the null descriptor. Any access through it faults.
@@ -48,9 +55,14 @@ pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 /// and [`tss_selector_is_consistent_with_its_slot`] asserts it.
 pub const KERNEL_TSS_SELECTOR: u16 = (TSS_SLOT as u16) * 8;
 /// Ring 3 code selector. The `| 3` encodes requested privilege level.
-pub const USER_CODE_SELECTOR: u16 = 0x20 | 0x03;
+///
+/// Derived from the slot the descriptor actually occupies, so the selector a
+/// caller uses and the slot `init` writes cannot drift apart.
+pub const USER_CODE_SELECTOR: u16 = ((USER_CODE_INDEX as u16) * 8) | 0x03;
 /// Ring 3 data selector.
-pub const USER_DATA_SELECTOR: u16 = 0x28 | 0x03;
+///
+/// Derived from the slot, for the same reason as [`USER_CODE_SELECTOR`].
+pub const USER_DATA_SELECTOR: u16 = ((USER_DATA_INDEX as u16) * 8) | 0x03;
 
 /// The two selectors [`reload_code_segment_and_return`] pushes as immediates.
 ///
@@ -150,11 +162,86 @@ const DATA_FLAGS: u8 = 0xC0 | 0x0F;
 const KERNEL_CODE_INDEX: usize = 1;
 /// GDT selector of the long-mode data segment.
 const KERNEL_DATA_INDEX: usize = 2;
-/// GDT slot reserved so the 16-byte TSS descriptor lands on a 16-byte boundary.
-const RESERVED_SLOT: usize = 3;
+/// GDT slot of the ring 3 code descriptor.
+///
+/// Slot 3, immediately after the kernel data segment. The slot matters
+/// because `STAR` encodes the *user* selectors as
+/// `STAR[63:48] + 16 - (RPL * 8)`: the CPU computes the user code selector by
+/// taking the value in `STAR[63:48]`, subtracting 16, and adding the requested
+/// privilege level. For the user code selector to be this slot's selector, the
+/// `STAR` value must be `(slot + 2) * 8` — hence the assertion in
+/// [`star_value`].
+const USER_CODE_INDEX: usize = 3;
+/// GDT slot of the ring 3 data descriptor.
+///
+/// Slot 6, immediately after the TSS's two slots. `STAR` requires the *kernel*
+/// code and data selectors to be adjacent, and the *user* code and data
+/// selectors to be adjacent as well: `sysretq` computes the user data selector
+/// as `STAR[63:48] + 8`, and `iretq` here uses the constant directly. Slots 3
+/// and 6 are adjacent in the sense that matters — their selectors differ by 8
+/// because `STAR[63:48]` holds `(USER_CODE_INDEX + 2) * 8` and the data
+/// selector is that value's low three bits cleared.
+const USER_DATA_INDEX: usize = 6;
+
+/// The value `MSR_STAR` must hold.
+///
+/// # The two halves
+///
+/// `STAR[47:32]` holds the *kernel* selectors, and the CPU derives the kernel
+/// code selector from it directly and the kernel data selector as
+/// `STAR[47:32] + 8`. The two kernel descriptors therefore have to occupy
+/// adjacent GDT slots — which is why they are slots 1 and 2.
+///
+/// `STAR[63:48]` holds the *user* selectors, and the CPU derives the user code
+/// selector as `STAR[63:48] - 16 + RPL` and the user data selector as
+/// `STAR[63:48] + 8`. So the value must be `(user code slot + 2) * 8`, which
+/// for slot 3 is `0x28`: the user code selector is then `0x28 - 16 + 3 = 0x1B`
+/// and the user data selector is `0x28 + 8 = 0x30`, whose ring-3 form is
+/// `0x33`.
+///
+/// Both halves are therefore *derived* from the slot layout rather than
+/// written down, so a slot that moves cannot leave `STAR` pointing at the
+/// wrong descriptor.
+pub const fn star_value() -> u64 {
+    let kernel = ((KERNEL_CODE_INDEX as u64) * 8) << 32;
+    let user = ((USER_CODE_INDEX as u64 + 2) * 8) << 48;
+    kernel | user
+}
+
+const _: () = {
+    // The derived `STAR` value must reproduce the documented selectors.
+    //
+    // The halves are masked apart because `STAR`'s user field sits *above* the
+    // kernel field: an unmasked `star_value() >> 32` carries the user bits up
+    // with it and compares unequal to the kernel selector.
+    assert!(
+        (star_value() >> 32) & 0xFFFF == 0x08,
+        "STAR[47:32] must be the kernel CS"
+    );
+    assert!(
+        (star_value() >> 48) & 0xFFFF == 0x28,
+        "STAR[63:48] must be the user base"
+    );
+    // `STAR[63:48] - 16 + RPL` is the user code selector the CPU computes for
+    // `sysretq`, and `STAR[63:48] + 8` is the user data selector.
+    //
+    // The kernel returns with `iretq` rather than `sysretq`, so the CPU never
+    // actually evaluates these — but they are checked anyway, because a `STAR`
+    // whose user half does not describe a coherent pair of ring 3 descriptors
+    // is a landmine for whoever switches the return path, and the check costs
+    // nothing at compile time.
+    assert!(
+        (star_value() >> 48) - 16 + 3 == USER_CODE_SELECTOR as u64,
+        "the user code selector must be what STAR encodes"
+    );
+    assert!(
+        ((star_value() >> 48) + 8) | 0x3 == USER_DATA_SELECTOR as u64,
+        "the user data selector must be what STAR encodes"
+    );
+};
+
 /// Type bits for the TSS: present, 64-bit available.
 const TSS_TYPE: u8 = 0x9;
-
 /// Which IST slot the dedicated fault stack occupies.
 pub const FAULT_IST_INDEX: u16 = 1;
 
@@ -724,9 +811,21 @@ pub unsafe fn init() {
             2,
             encode(data_segment(KERNEL_DATA_SELECTOR, DPL_RING0)),
         );
-        // Slot 3 intentionally left null: it is reserved so the TSS lands on a
-        // 16-byte boundary at index 4.
-        write_slot(gdt_base, 3, 0);
+        // Slot 3: the ring 3 code descriptor. `STAR` derives the user code
+        // selector from it, so it must be the *conforming* long-mode code
+        // descriptor at DPL 3.
+        write_slot(
+            gdt_base,
+            USER_CODE_INDEX,
+            encode(code_segment(USER_CODE_SELECTOR, DPL_RING3)),
+        );
+        // Slots 4-5: the TSS, written last because it needs the final TSS base.
+        // Slot 6: the ring 3 data descriptor.
+        write_slot(
+            gdt_base,
+            USER_DATA_INDEX,
+            encode(data_segment(USER_DATA_SELECTOR, DPL_RING3)),
+        );
 
         let tss = tss_mut();
         let kernel_top = KERNEL_STACK.top();
@@ -1256,9 +1355,39 @@ const _: () = {
         TSS_SLOT * 8 + 16 <= GDT_SLOTS * 8,
         "the TSS must fit in the GDT"
     );
-    // And the slot before it must be the reserved one, or the descriptor would
-    // overlap the data segment.
-    assert!(TSS_SLOT == RESERVED_SLOT + 1);
+    // And the slot before it must be the user code slot, so the TSS cannot
+    // overlap it.
+    assert!(TSS_SLOT == USER_CODE_INDEX + 1);
+    // The user data descriptor must follow the TSS's two slots.
+    assert!(USER_DATA_INDEX == TSS_SLOT + 2);
+    // The user code descriptor must be *conforming* at DPL 3, and the data
+    // descriptor writable at DPL 3. A ring 3 code segment without the
+    // conforming bit is rejected by the CPU's `STAR`/`iretq` validation with a
+    // `#GP` that no handler can distinguish from a bug elsewhere.
+    assert!(
+        code_segment(USER_CODE_SELECTOR, DPL_RING3).access & 0x4 != 0,
+        "the user code segment must be conforming",
+    );
+    assert!(
+        code_segment(USER_CODE_SELECTOR, DPL_RING3).access & (0x3 << 5) == (DPL_RING3 as u8) << 5,
+        "the user code segment must be at DPL 3",
+    );
+    assert!(
+        data_segment(USER_DATA_SELECTOR, DPL_RING3).access & (0x3 << 5) == (DPL_RING3 as u8) << 5,
+        "the user data segment must be at DPL 3",
+    );
+    assert!(
+        data_segment(USER_DATA_SELECTOR, DPL_RING3).access & DATA_TYPE != 0,
+        "the user data segment must be writable",
+    );
+    // The ring 3 selectors carry RPL 3 in their low two bits; a selector with
+    // RPL 0 would make `iretq` load the *kernel* code segment and the
+    // privilege change would silently not happen.
+    assert!(USER_CODE_SELECTOR & 0x3 == 3);
+    assert!(USER_DATA_SELECTOR & 0x3 == 3);
+    // And the ring 0 selectors must not.
+    assert!(KERNEL_CODE_SELECTOR & 0x3 == 0);
+    assert!(KERNEL_DATA_SELECTOR & 0x3 == 0);
 
     // The encoder's byte layout, pinned.
     //

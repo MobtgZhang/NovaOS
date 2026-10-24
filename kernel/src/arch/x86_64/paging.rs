@@ -29,76 +29,14 @@ pub const VIRTUAL_ADDRESS_BITS: u64 = 48;
 /// Bits 0-8 are architectural; bits 9-11 are the OS-available bits, which NovaOS
 /// uses as: bit 9 = "global" (TLB entry survives a CR3 reload, needed for the
 /// higher-half kernel mapping), bit 10 = "accessed", bit 11 = "dirty".
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PageFlags(u64);
-
-impl PageFlags {
-    /// No flags.
-    pub const NONE: PageFlags = PageFlags(0);
-    /// Entry is valid.
-    pub const PRESENT: PageFlags = PageFlags(1 << 0);
-    /// Entry is writable.
-    pub const WRITABLE: PageFlags = PageFlags(1 << 1);
-    /// Entry is accessible from ring 3.
-    pub const USER: PageFlags = PageFlags(1 << 2);
-    /// Write-through / cache-disable.
-    pub const WRITE_THROUGH: PageFlags = PageFlags(1 << 3);
-    /// Disable caching.
-    pub const CACHE_DISABLED: PageFlags = PageFlags(1 << 4);
-    /// Accessed (set by hardware).
-    pub const ACCESSED: PageFlags = PageFlags(1 << 5);
-    /// Dirty (set by hardware).
-    pub const DIRTY: PageFlags = PageFlags(1 << 6);
-    /// Page is global; survives a CR3 write.
-    pub const GLOBAL: PageFlags = PageFlags(1 << 8);
-    /// Entry points at a huge page rather than a 4 KiB frame.
-    pub const HUGE: PageFlags = PageFlags(1 << 7);
-
-    /// Every architecturally defined flag, used to validate external bits.
-    pub const RESERVED_MASK: PageFlags =
-        PageFlags(0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100);
-
-    /// Raw bit pattern.
-    pub const fn bits(self) -> u64 {
-        self.0
-    }
-
-    /// Build from raw bits, rejecting anything outside [`PageFlags::RESERVED_MASK`].
-    ///
-    /// Returning `None` for unknown bits is what keeps a corrupted entry from
-    /// being written back with the OS-available bits silently cleared.
-    pub const fn from_bits(bits: u64) -> Option<Self> {
-        if bits & !Self::RESERVED_MASK.0 == 0 {
-            Some(PageFlags(bits))
-        } else {
-            None
-        }
-    }
-
-    /// Whether every flag in `other` is set.
-    pub const fn contains(self, other: PageFlags) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    /// Union of two flag sets.
-    pub const fn union(self, other: PageFlags) -> PageFlags {
-        PageFlags(self.0 | other.0)
-    }
-}
-
-impl core::ops::BitOr for PageFlags {
-    type Output = PageFlags;
-
-    fn bitor(self, rhs: PageFlags) -> PageFlags {
-        PageFlags(self.0 | rhs.0)
-    }
-}
-
-impl core::ops::BitOrAssign for PageFlags {
-    fn bitor_assign(&mut self, rhs: PageFlags) {
-        self.0 |= rhs.0;
-    }
-}
+///
+/// This is the *same* type as [`nova_core::paging::PageFlags`], re-exported
+/// rather than redefined. The flag bits are a property of the architecture, but
+/// the policy layer (`nova_core::address_space`) has to speak about them too,
+/// and two structs with the same name and the same bits are two types that
+/// cannot be passed to each other. Re-exporting makes that duplication
+/// impossible rather than merely discouraged.
+pub use nova_core::paging::PageFlags;
 
 /// The four page table levels of a 4-level x86-64 address split.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -289,11 +227,21 @@ pub fn is_5level_enabled() -> bool {
 
 /// Encode a page table entry from a physical address and flags.
 ///
-/// # Safety
+/// The physical address is masked to the frame bits, so a caller that passes
+/// an address with a page offset cannot smuggle those bits into the entry's
+/// reserved region. That masking is what makes this function safe: it touches
+/// no memory, and the value it returns is a well-formed entry whatever
+/// physical address it is handed.
 ///
-/// `physical` must be page aligned and point at a real frame.
-pub const unsafe fn encode_entry(physical: u64, flags: PageFlags) -> u64 {
-    physical | flags.bits()
+/// The *validity* of the physical address -- is it page aligned, does it point
+/// at a real frame -- is not something this function can check, and it is not
+/// what `unsafe` would buy a caller anyway. A bad frame address produces a
+/// page table entry that points nowhere, which the hardware reports as a
+/// fault at the point of use. Marking the function `unsafe` would have
+/// promised a guarantee it cannot keep, and every call site would have carried
+/// a `SAFETY:` comment that could only restate the caller's own care.
+pub const fn encode_entry(physical: u64, flags: PageFlags) -> u64 {
+    (physical & 0x000F_FFFF_FFFF_F000) | flags.bits()
 }
 
 /// Decode the physical frame address from a page table entry.
@@ -305,15 +253,25 @@ pub const fn decode_entry(entry: u64) -> u64 {
 }
 
 /// Decode the flags from a page table entry.
+///
+/// The entry's bits are masked to the architecturally defined ones *before*
+/// they are handed to [`PageFlags::from_bits`], so a reserved bit set by
+/// hardware cannot make the decode fail. `from_bits` rejects unknown bits
+/// precisely so that a corrupted entry is not silently reinterpreted, and the
+/// mask is what keeps that rejection from firing on every entry the CPU has
+/// touched.
 #[inline]
 pub const fn entry_flags(entry: u64) -> PageFlags {
-    PageFlags(entry & PageFlags::RESERVED_MASK.0)
+    match PageFlags::from_bits(entry & PageFlags::RESERVED_MASK.bits()) {
+        Some(flags) => flags,
+        None => PageFlags::NONE,
+    }
 }
 
 /// Whether an entry has its present bit set.
 #[inline]
 pub const fn entry_is_present(entry: u64) -> bool {
-    entry & PageFlags::PRESENT.0 != 0
+    entry & PageFlags::PRESENT.bits() != 0
 }
 
 /// Store an entry into a page table at `index`.
