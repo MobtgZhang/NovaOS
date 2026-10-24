@@ -62,15 +62,52 @@ pub const MAX_SERVER_FILES: usize = 32;
 /// The pool is the kernel's half of the capability↔scope bridge: it remembers
 /// which handle stands for which scope, so a handle can be resolved back to a
 /// path.
+/// # Why the entries are not `Option<ScopeEntry>`
+///
+/// A nested `Option` here would put a niche inside the entry's `Rights`
+/// field -- `Rights` is a `u32` whose only valid values are the ten defined
+/// bits, so an invalid bit pattern is a spare encoding for `None`. That niche
+/// then propagates outward: `TaskState` contains a `ScopePool`, so
+/// `Option<TaskState>` looks for its own niche in the *same* field, and a
+/// task whose scope pool is empty becomes indistinguishable from no task at
+/// all. The kernel then reads back a task it has just created as `None`.
+///
+/// The count already says which entries are live, so the entries themselves
+/// need no discriminant. Storing them plainly removes the nesting that the
+/// collision needs.
 #[derive(Clone, Copy, Debug)]
 pub struct ScopePool {
-    entries: [Option<ScopeEntry>; MAX_SCOPES_PER_TASK],
+    entries: [ScopeEntry; MAX_SCOPES_PER_TASK],
     len: usize,
 }
 
 /// One remembered grant.
+///
+/// An unused slot holds the invalid handle, which is what an empty pool
+/// starts with.
+///
+/// # Why there is an explicit `in_use` flag
+///
+/// `FileScope` ends in a `Rights`, and `Rights` is a `u32` whose only valid
+/// values are the ten defined bits. That leaves bits 10..31 unused, which
+/// Rust uses as a niche: an `Option<FileScope>` is encoded by setting one of
+/// those bits, and costs no extra space.
+///
+/// The niche is convenient and it is also a trap. `TaskState` contains a
+/// scope pool, so `Option<TaskState>` looks for a niche of its own and finds
+/// the *same* `Rights` field -- meaning a task whose scope pool is empty
+/// encodes identically to no task at all, and the kernel reads back a task
+/// it has just created as absent. The failure then surfaces far from its
+/// cause: a null pointer where a task was expected, or a task that never
+/// appears in a lookup.
+///
+/// The `in_use` flag gives the entry a discriminant of its own, so no niche
+/// propagates outward and every `Option` in the kernel has an ordinary
+/// tag.
 #[derive(Clone, Copy, Debug)]
 pub struct ScopeEntry {
+    /// Whether this slot holds a remembered grant.
+    pub in_use: bool,
     /// The capability handle that names the grant.
     pub handle: CapHandle,
     /// The granted subtree and the rights it carries.
@@ -87,7 +124,11 @@ impl ScopePool {
     /// An empty pool, which grants nothing.
     pub const fn new() -> Self {
         Self {
-            entries: [None; MAX_SCOPES_PER_TASK],
+            entries: [ScopeEntry {
+                in_use: false,
+                handle: CapHandle::INVALID,
+                scope: FileScope::new(CanonicalPath::ROOT, Rights::EMPTY),
+            }; MAX_SCOPES_PER_TASK],
             len: 0,
         }
     }
@@ -104,12 +145,15 @@ impl ScopePool {
         }
         if self.entries[..self.len]
             .iter()
-            .flatten()
-            .any(|entry| entry.handle == handle)
+            .any(|entry| entry.in_use && entry.handle == handle)
         {
             return false;
         }
-        self.entries[self.len] = Some(ScopeEntry { handle, scope });
+        self.entries[self.len] = ScopeEntry {
+            in_use: true,
+            handle,
+            scope,
+        };
         self.len = self.len.saturating_add(1);
         true
     }
@@ -118,20 +162,21 @@ impl ScopePool {
     pub fn scope_for(&self, handle: CapHandle) -> Option<FileScope> {
         self.entries[..self.len]
             .iter()
-            .flatten()
-            .find(|entry| entry.handle == handle)
+            .find(|entry| entry.in_use && entry.handle == handle)
             .map(|entry| entry.scope)
     }
 
     /// Forget a grant.
     pub fn remove(&mut self, handle: CapHandle) -> bool {
         for index in 0..self.len {
-            if let Some(entry) = self.entries[index]
-                && entry.handle == handle
-            {
+            if self.entries[index].in_use && self.entries[index].handle == handle {
                 let last = self.len.saturating_sub(1);
                 self.entries[index] = self.entries[last];
-                self.entries[last] = None;
+                self.entries[last] = ScopeEntry {
+                    in_use: false,
+                    handle: CapHandle::INVALID,
+                    scope: FileScope::new(CanonicalPath::ROOT, Rights::EMPTY),
+                };
                 self.len = last;
                 return true;
             }
@@ -141,7 +186,7 @@ impl ScopePool {
 
     /// The remembered grants, in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = &ScopeEntry> {
-        self.entries[..self.len].iter().flatten()
+        self.entries[..self.len].iter()
     }
 
     /// How many grants are remembered.
@@ -156,7 +201,11 @@ impl ScopePool {
 
     /// Forget every grant.
     pub fn clear(&mut self) {
-        self.entries = [None; MAX_SCOPES_PER_TASK];
+        self.entries = [ScopeEntry {
+            in_use: false,
+            handle: CapHandle::INVALID,
+            scope: FileScope::new(CanonicalPath::ROOT, Rights::EMPTY),
+        }; MAX_SCOPES_PER_TASK];
         self.len = 0;
     }
 }
@@ -191,7 +240,12 @@ impl Default for FileServer {
 
 impl FileServer {
     /// A server with an empty filesystem.
-    pub fn new() -> Self {
+    ///
+    /// A `const fn` so the server can be built as part of a static
+    /// initialiser. The server holds a whole [`RamFs`], which is about 71 KiB,
+    /// and the kernel's stack is 64 KiB -- building one on the stack overflows
+    /// it, and the overflow is reported somewhere else entirely.
+    pub const fn new() -> Self {
         Self {
             fs: RamFs::new(),
             open_files: [None; MAX_SERVER_FILES],
@@ -210,7 +264,10 @@ impl FileServer {
 
     /// Forget every open file and empty the filesystem.
     pub fn reset(&mut self) {
-        self.fs = RamFs::new();
+        // `clear` rather than a fresh `RamFs`: the filesystem is about 71 KiB
+        // and the kernel's stack is 64 KiB, so assigning a new one would
+        // overflow the stack.
+        self.fs.clear();
         self.open_files = [None; MAX_SERVER_FILES];
     }
 
@@ -303,11 +360,7 @@ impl FileServer {
     }
 
     /// The `open` operation.
-    fn handle_open(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_open(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         // The header is the fixed layout `nova-protocols` defines; the path
         // follows it in the same payload.
         let Some((version, flags, path_len)) = read_open_header(payload) else {
@@ -355,11 +408,7 @@ impl FileServer {
     }
 
     /// The `read` operation.
-    fn handle_read(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_read(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, _flags, wire, _offset, length)) = read_read_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -382,11 +431,7 @@ impl FileServer {
     }
 
     /// The `write` operation.
-    fn handle_write(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_write(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, _flags, wire, _offset, length)) = read_write_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -410,11 +455,7 @@ impl FileServer {
     }
 
     /// The `close` operation.
-    fn handle_close(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_close(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, wire)) = read_close_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -433,11 +474,7 @@ impl FileServer {
     }
 
     /// The `list` operation.
-    fn handle_list(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_list(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, path_len)) = read_path_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -504,11 +541,7 @@ impl FileServer {
     }
 
     /// The `stat` operation.
-    fn handle_stat(
-        &mut self,
-        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
-        payload: &[u8],
-    ) -> Message {
+    fn handle_stat(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, path_len)) = read_path_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -547,11 +580,7 @@ impl FileServer {
         let wire = ((handle.generation() as u64) << 32) | (handle.slot() as u64);
         for slot in self.open_files.iter_mut() {
             if slot.is_none() {
-                *slot = Some(ServerFile {
-                    wire,
-                    handle,
-                    path,
-                });
+                *slot = Some(ServerFile { wire, handle, path });
                 return wire;
             }
         }

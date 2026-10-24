@@ -38,13 +38,17 @@ mod arch;
 mod boot;
 mod logger;
 mod mm;
-// The service layer (M3 and M4) is not yet wired into the boot sequence.
+// The service layer (M3 and M4): the capability tables, the object registry,
+// the IPC plumbing, the file server, the supervisor, and the syscall
+// dispatch. It is wired into the boot sequence below — `services::init` runs
+// before the test suites, so the suites can create tasks and dispatch
+// syscalls against real kernel state.
 //
-// It is compiled as a module but not declared here, because the milestone's
-// mechanism is still being built and a half-built module that the kernel
-// links against is a liability rather than a partial win. The `services`
-// directory is owned by the M3/M4 work; enabling it is a one-line change
-// once its suites exist.
+// The service layer lives outside `kernel/src/syscall/` on purpose: M2 owns
+// that directory for the trap entry and the `iretq` trampoline, and two
+// agents editing one `mod.rs` is a merge conflict waiting to happen. The
+// integration point is `services::dispatch::syscall_dispatch`.
+mod services;
 mod test;
 
 use crate::arch::capabilities::Console as _;
@@ -166,6 +170,16 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     }
 
     logger::print_banner();
+
+    // The service layer's state is installed here, before anything can
+    // dispatch a syscall. It is a fixed-size structure in a static, so this
+    // is a placement rather than an allocation, and it must happen before the
+    // test suites run — the suites create tasks and dispatch syscalls against
+    // this state.
+    //
+    // SAFETY: this runs once, from the boot path, with interrupts masked and
+    // before any reader of the state exists. See `services::init`.
+    unsafe { services::init() };
 
     // SAFETY: `boot::capture` ran above, so the snapshot is published and
     // immutable from here on.

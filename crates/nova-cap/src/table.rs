@@ -161,12 +161,13 @@ enum Slot {
 /// minted by the receiving table (see `nova-ipc`'s transfer support), never
 /// as the same slot.
 ///
-/// `Clone` is derived because the kernel keeps a table per task in a
+/// `Copy` is derived because the kernel keeps a table per task in a
 /// fixed-size pool and needs to reset a slot to empty. A table is entirely
 /// value data -- slots, a free stack, and counters -- with no interior
-/// identity, so a clone is a distinct table with the same contents, which is
-/// exactly what an empty slot wants.
-#[derive(Clone)]
+/// identity, so a copy is a distinct table with the same contents, which is
+/// exactly what an empty slot wants. The `Copy` bound is also what lets the
+/// pool's array be built by a repeat expression rather than a loop.
+#[derive(Clone, Copy)]
 pub struct CapabilityTable {
     slots: [Slot; MAX_CAPS],
     /// Free-slot stack.
@@ -206,6 +207,28 @@ impl CapabilityTable {
             live: 0,
             epoch: 0,
         }
+    }
+
+    /// Empty the table, in place.
+    ///
+    /// A table holds a thousand slots and a thousand-entry free stack, so it
+    /// is tens of kilobytes. Assigning a fresh table to it builds that whole
+    /// value on the stack first, and the kernel's stack is 64 KiB. Clearing
+    /// in place avoids the temporary entirely.
+    pub fn clear(&mut self) {
+        // Assigned field by field rather than `*self = Self::new()`: the
+        // whole-table assignment builds a fresh table on the stack first,
+        // and a table is tens of kilobytes.
+        self.slots = [Slot::Free { next_generation: 1 }; MAX_CAPS];
+        self.free_len = 0;
+        let mut slot = MAX_CAPS - 1;
+        while slot >= RESERVED_SLOTS {
+            self.free_stack[slot] = slot as u32;
+            self.free_len += 1;
+            slot -= 1;
+        }
+        self.live = 0;
+        self.epoch = 0;
     }
 
     /// Total number of slots, including the reserved one.

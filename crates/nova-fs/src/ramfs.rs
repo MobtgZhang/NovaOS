@@ -241,7 +241,14 @@ impl Default for RamFs {
 
 impl RamFs {
     /// A filesystem containing only the root directory.
-    pub fn new() -> Self {
+    ///
+    /// This is a `const fn` so the filesystem can be built as part of a static
+    /// initialiser rather than on the stack. A `RamFs` is about 71 KiB -- one
+    /// 1 KiB data buffer per inode, times sixty-four inodes -- and the
+    /// kernel's stack is 64 KiB. Building one on the stack overflows it, and
+    /// the overflow happens silently: the kernel dies somewhere later, with
+    /// a fault report that points at the wrong code entirely.
+    pub const fn new() -> Self {
         let mut fs = RamFs {
             inodes: [blank_inode(); MAX_INODES],
             open: [blank_open(); MAX_OPEN_FILES],
@@ -262,6 +269,34 @@ impl RamFs {
         };
         fs.inode_count = 1;
         fs
+    }
+
+    /// Empty the filesystem, in place.
+    ///
+    /// A `RamFs` is about 71 KiB -- a 1 KiB data buffer per inode, times
+    /// sixty-four inodes -- and the kernel's stack is 64 KiB. Assigning a
+    /// fresh `RamFs` therefore builds a 71 KiB temporary on the stack, which
+    /// overflows it, and the overflow is reported as a fault somewhere else
+    /// entirely.
+    ///
+    /// Clearing in place avoids the temporary. The root inode is restored,
+    /// because a filesystem with no root has no path to resolve against.
+    pub fn clear(&mut self) {
+        self.inodes = [blank_inode(); MAX_INODES];
+        self.open = [blank_open(); MAX_OPEN_FILES];
+        self.inodes[0] = Inode {
+            kind: FileKind::Directory,
+            name: [0; MAX_NAME_BYTES],
+            name_len: 0,
+            parent: NO_PARENT,
+            data: [0; MAX_FILE_BYTES],
+            data_len: 0,
+            children: [0; MAX_CHILDREN],
+            child_count: 0,
+            in_use: true,
+        };
+        self.inode_count = 1;
+        self.total_bytes = 0;
     }
 
     /// The number of inodes in use, including the root.

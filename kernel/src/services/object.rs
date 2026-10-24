@@ -129,7 +129,9 @@ pub struct ObjectRegistry {
 impl ObjectRegistry {
     /// An empty registry.
     pub const fn new() -> Self {
-        Self { slots: [None; MAX_OBJECTS] }
+        Self {
+            slots: [None; MAX_OBJECTS],
+        }
     }
 
     /// Create an object, returning the reference that names it.
@@ -186,7 +188,9 @@ impl ObjectRegistry {
     /// they name.
     pub fn objects(&self) -> impl Iterator<Item = ObjectRef> + '_ {
         self.slots.iter().enumerate().filter_map(|(slot, entry)| {
-            entry.as_ref().map(|kind| ObjectRef::new(kind.abi_type(), slot as u32))
+            entry
+                .as_ref()
+                .map(|kind| ObjectRef::new(kind.abi_type(), slot as u32))
         })
     }
 

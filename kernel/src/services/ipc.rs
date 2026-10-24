@@ -9,12 +9,27 @@
 //!
 //! This module is the *mechanism* around that state machine:
 //!
-//! - [`IpcRegistry`] holds the channels, in a bounded pool.
+//! - [`IpcRegistry`] holds the channels, in a bounded pool, together with the
+//!   mapping from a channel's sides to the tasks holding them;
 //! - [`TableTransfer`] implements `nova_ipc::CapabilityTransfer` over two
 //!   tasks' capability tables, so a message's capabilities move atomically
-//!   between them.
+//!   between them;
 //! - [`IpcRegistry::drain_completions`] collects the completions every channel
 //!   recorded and hands them to the kernel, which wakes the threads.
+//!
+//! # Why the registry tracks the sides
+//!
+//! The channel state machine knows two sides and nothing else. The kernel,
+//! however, has to answer a question the state machine cannot: *which task
+//! holds the other side of this channel?* The answer is what makes a
+//! capability transfer possible — a message's capabilities are minted in the
+//! *recipient's* table, not in the sender's — and it is what makes peer death
+//! possible, because a task's death must kill the sides that task holds.
+//!
+//! The mapping is therefore part of the registry rather than of the channel:
+//! the channel is the state machine's, and the registry is the kernel's table
+//! of channels. Mixing them would put kernel bookkeeping inside a crate that
+//! deliberately knows nothing about tasks.
 //!
 //! # How peer death is triggered
 //!
@@ -42,7 +57,7 @@ use nova_ipc::endpoint::{ChannelId, Completion, Endpoint, ReplyToken, Side};
 use nova_ipc::message::Message;
 use nova_ipc::transfer::CapabilityTransfer;
 
-use crate::services::MAX_CHANNELS;
+use crate::services::{MAX_CHANNELS, MAX_TASKS};
 
 /// The maximum number of completions one drain can return.
 ///
@@ -57,8 +72,14 @@ pub const MAX_DRAINED_COMPLETIONS: usize = 64;
 /// created, and its identifier is what a capability's object reference names.
 pub struct IpcRegistry {
     channels: [Option<Channel>; MAX_CHANNELS],
+    /// The task slot that holds each side of each channel.
+    ///
+    /// `holders[channel][side]` is the slot in the kernel's task table of the
+    /// task that holds that side. A side that nobody holds is `None`, which is
+    /// a channel that has been created but not yet connected — the kernel
+    /// refuses to send on it rather than dropping the message.
+    holders: [[Option<usize>; 2]; MAX_CHANNELS],
 }
-
 impl Default for IpcRegistry {
     fn default() -> Self {
         Self::new()
@@ -70,6 +91,7 @@ impl IpcRegistry {
     pub const fn new() -> Self {
         Self {
             channels: [None; MAX_CHANNELS],
+            holders: [[None; 2]; MAX_CHANNELS],
         }
     }
 
@@ -81,7 +103,84 @@ impl IpcRegistry {
         let slot = self.channels.iter().position(|entry| entry.is_none())?;
         let id = ChannelId::new(slot as u32);
         self.channels[slot] = Some(Channel::new(id));
+        self.holders[slot] = [None; 2];
         Some(id)
+    }
+
+    /// Record that the task at `task_slot` holds `side` of `channel`.
+    ///
+    /// Returns `false` when the channel does not exist or when the side is
+    /// already held by another task. The second case matters: two tasks
+    /// holding the same side would make "the peer" ambiguous, and the
+    /// capability transfer would have two possible destinations.
+    pub fn bind(&mut self, channel: ChannelId, side: Side, task_slot: usize) -> bool {
+        let slot = channel.number() as usize;
+        if slot >= MAX_CHANNELS {
+            return false;
+        }
+        if self.channels[slot].is_none() {
+            return false;
+        }
+        let entry = &mut self.holders[slot][side.index()];
+        if entry.is_some() {
+            return false;
+        }
+        *entry = Some(task_slot);
+        true
+    }
+
+    /// The task slot that holds `side` of `channel`.
+    pub fn holder(&self, channel: ChannelId, side: Side) -> Option<usize> {
+        let slot = channel.number() as usize;
+        self.holders
+            .get(slot)
+            .and_then(|entry| entry.get(side.index()))
+            .copied()
+            .flatten()
+    }
+
+    /// The task slot that holds the *other* side of `channel`.
+    ///
+    /// This is the peer of a side: the task a message sent on `side` is
+    /// delivered to, and the task whose capability table a transferred
+    /// capability is minted in.
+    ///
+    /// Returns `None` when nobody holds the other side — a channel that has
+    /// been created but not connected. The caller refuses the operation rather
+    /// than dropping the message, because a message that goes nowhere is a
+    /// message the sender believes was delivered.
+    pub fn peer_task(&self, channel: ChannelId, side: Side) -> Option<usize> {
+        self.holder(channel, side.opposite())
+    }
+
+    /// Connect two tasks to the two sides of a channel.
+    ///
+    /// A channel exists before either side is held: the creator makes the
+    /// channel, and the peer is *connected* to it. That is why the kernel
+    /// tracks the sides separately from the channel — a channel with one side
+    /// held is a half-open endpoint, and the message that arrives on it is
+    /// delivered when the peer connects.
+    ///
+    /// Returns `false` when the channel does not exist or when a side is
+    /// already held. A side is never taken away from a task that holds it:
+    /// reconnecting would be a way to steal an endpoint.
+    pub fn connect(&mut self, channel: ChannelId, first: usize, second: usize) -> bool {
+        let slot = channel.number() as usize;
+        if slot >= MAX_CHANNELS {
+            return false;
+        }
+        if self.channels[slot].is_none() {
+            return false;
+        }
+        if first >= MAX_TASKS || second >= MAX_TASKS || first == second {
+            return false;
+        }
+        if self.holders[slot][0].is_some() || self.holders[slot][1].is_some() {
+            return false;
+        }
+        self.holders[slot][0] = Some(first);
+        self.holders[slot][1] = Some(second);
+        true
     }
 
     /// Borrow a channel, if it exists.
@@ -103,7 +202,8 @@ impl IpcRegistry {
 
     /// Drop every channel.
     pub fn reset(&mut self) {
-        self.channels = core::array::from_fn(|_| None);
+        self.channels = [None; MAX_CHANNELS];
+        self.holders = [[None; 2]; MAX_CHANNELS];
     }
 
     /// Kill one side of every channel a task is a party to.
@@ -116,13 +216,22 @@ impl IpcRegistry {
     /// The task's side is the side whose channel slot matches the task's
     /// recorded side. A task may hold several endpoints, so the mapping from a
     /// task to its (channel, side) pairs is what the kernel tracks.
-    pub fn kill_task(&mut self, task: u32, sides: &[(ChannelId, Side)]) {
+    pub fn kill_task(&mut self, task_slot: usize, sides: &[(ChannelId, Side)]) {
         for (channel, side) in sides {
             if let Some(channel) = self.channel_mut(*channel) {
                 channel.kill_side(*side);
             }
         }
-        let _ = task;
+        // The dead task no longer holds any side: the mapping is cleared so
+        // that a later send on that side cannot pick the dead task as the
+        // destination for a capability transfer.
+        for slot in 0..MAX_CHANNELS {
+            for side in 0..2 {
+                if self.holders[slot][side] == Some(task_slot) {
+                    self.holders[slot][side] = None;
+                }
+            }
+        }
     }
 
     /// Collect every completion recorded since the last drain.
@@ -205,6 +314,46 @@ impl CapabilityTransfer for TableTransfer<'_> {
     }
 }
 
+/// A capability transfer within a single table.
+///
+/// The ordinary case — a message travelling between two tasks — moves a
+/// capability from one table to another, and the destination handle is minted
+/// in the recipient's table. A task that talks to *itself* through its own
+/// endpoint is the one case where the source and the destination are the same
+/// table, and it needs its own implementation: the same table cannot be
+/// borrowed mutably twice at once, but the stages are sequential.
+///
+/// The atomicity property is unchanged: every handle is staged first, and
+/// only then are the sources dropped. A failure halfway through aborts the
+/// staged handles and leaves the source's set exactly as it was.
+pub struct SelfTransfer<'a> {
+    table: &'a mut CapabilityTable,
+}
+
+impl<'a> SelfTransfer<'a> {
+    /// Bind the table the capability moves within.
+    pub fn new(table: &'a mut CapabilityTable) -> Self {
+        Self { table }
+    }
+}
+
+impl CapabilityTransfer for SelfTransfer<'_> {
+    fn prepare(&mut self, source: CapHandle) -> Result<CapHandle, ErrorCode> {
+        let entry = self.table.resolve(source)?;
+        let object_ref = entry.object_ref;
+        let rights = entry.rights;
+        self.table.create(object_ref, rights)
+    }
+
+    fn commit(&mut self, _prepared: CapHandle, source: CapHandle) {
+        let _ = self.table.destroy(source);
+    }
+
+    fn abort(&mut self, prepared: CapHandle) {
+        let _ = self.table.destroy(prepared);
+    }
+}
+
 /// Transfer a batch of capabilities between two tables, atomically.
 ///
 /// The convenience the kernel's IPC path uses; the atomicity property is
@@ -215,6 +364,17 @@ pub fn transfer_between_tables(
     caps: &[CapHandle],
 ) -> Result<nova_ipc::transfer::TransferredCaps, ErrorCode> {
     let mut transfer = TableTransfer::new(source, destination);
+    nova_ipc::transfer::transfer_atomic(&mut transfer, caps)
+}
+
+/// Transfer a batch of capabilities within one table, atomically.
+///
+/// See [`SelfTransfer`] for why the self-send case needs its own path.
+pub fn transfer_within_table(
+    table: &mut CapabilityTable,
+    caps: &[CapHandle],
+) -> Result<nova_ipc::transfer::TransferredCaps, ErrorCode> {
+    let mut transfer = SelfTransfer::new(table);
     nova_ipc::transfer::transfer_atomic(&mut transfer, caps)
 }
 
@@ -256,7 +416,7 @@ impl IpcOutcome {
 
 /// Send a message on an endpoint.
 ///
-/// `rights` is the rights the *caller's capability* carries; the endpoint
+/// `rights` are the rights the *caller's capability* carries; the endpoint
 /// mirrors them so the IPC layer can refuse a `recv` on a send-only
 /// capability without the kernel having to re-check the table on the fast
 /// path. The kernel resolves the real rights from the capability table before
@@ -276,7 +436,11 @@ pub fn send(
 }
 
 /// Receive a message from an endpoint.
-pub fn recv(channel: &mut Channel, endpoint: &Endpoint, thread: u32) -> (IpcOutcome, Option<ReplyToken>) {
+pub fn recv(
+    channel: &mut Channel,
+    endpoint: &Endpoint,
+    thread: u32,
+) -> (IpcOutcome, Option<ReplyToken>) {
     match channel.recv(endpoint, thread) {
         nova_ipc::OpResult::Ready(received) => {
             let token = received.reply_token;
