@@ -37,13 +37,16 @@ pub mod paging;
 pub mod scheduler;
 pub mod syscall;
 
+#[cfg(test)]
+mod tests;
+
 pub use address_space::{
     AddressSpace, GuardPage, MAX_MAPPINGS, Mapping, Protection, UserWindow, VmmError,
 };
 pub use paging::{
     AddressParts, ENTRIES_PER_TABLE, INDEX_MASK, Level, PAGE_SIZE, PageFlags, VIRTUAL_ADDRESS_BITS,
     WalkIndices, decode_entry, encode_entry, entry_flags, entry_is_huge, entry_is_present,
-    is_canonical, page_base, page_offset, split_address,
+    is_canonical, is_canonical_in, page_base, page_offset, split_address,
 };
 pub use scheduler::{MAX_THREADS, SchedError, Scheduler, ThreadRecord, ThreadState};
 pub use syscall::{Dispatch, SyscallArgs, SyscallResult, ThreadEffect};

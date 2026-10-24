@@ -577,37 +577,46 @@ fn page_flags_round_trips() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Canonical-address checking must reject the non-canonical hole in the middle.
+/// Canonical-address checking must reject the non-canonical holes.
 fn canonical_address_check() -> Result<(), &'static str> {
     use crate::arch::x86_64::paging::is_canonical;
 
-    if !is_canonical(0xFFFF_8000_0000_0000) {
-        return Err("rejected a canonical kernel address");
+    // The four corners of the two canonical ranges. A canonical address has
+    // bits 63:48 *replicating* bit 47: all-zero when bit 47 is clear,
+    // all-one when bit 47 is set.
+    if !is_canonical(0x0000_0000_0000_0000) {
+        return Err("rejected the null address");
     }
     if !is_canonical(0x0000_7FFF_FFFF_FFFF) {
         return Err("rejected a canonical user address");
     }
-
-    // Bit 47 is the last addressable bit, so an address with bit 47 set and a
-    // zero sign extension is canonical: it is the top of user space. Treating
-    // `0x0000_8000_0000_0000` as non-canonical would mean rejecting the last
-    // 128 TiB of the user range, which the hardware does allow.
-    if !is_canonical(0x0000_8000_0000_0000) {
-        return Err("rejected the last canonical user address");
+    if !is_canonical(0xFFFF_8000_0000_0000) {
+        return Err("rejected a canonical kernel address");
+    }
+    if !is_canonical(0xFFFF_FFFF_FFFF_FFFF) {
+        return Err("rejected the last canonical address");
     }
 
-    // A non-canonical address is one whose sign extension disagrees with bit 47,
-    // so bits 63:48 must be neither all-zero nor all-one while bit 47 is set.
-    // `0x0001_8000_0000_0000` has bit 47 set and a sign of `0x0001`: the
-    // smallest such address, and the first gap above the user range.
+    // The first address above the user half: bit 47 is set but the sign is
+    // all-zero, so the sign does not replicate bit 47. The hardware raises
+    // `#GP` for it, and it is the address whose page-table walk is the
+    // *kernel's* — PML4 entry 256 — so accepting it would let a user
+    // mapping land in the kernel half.
+    if is_canonical(0x0000_8000_0000_0000) {
+        return Err("accepted a non-canonical address above the user half");
+    }
+
+    // The last address below the kernel half: bit 47 is clear but the sign is
+    // all-one, so again the sign does not replicate bit 47.
+    if is_canonical(0xFFFF_7FFF_FFFF_F000) {
+        return Err("accepted a non-canonical address below the kernel half");
+    }
+
+    // The narrowest possible disagreement in each direction: a sign of
+    // `0x0001` with bit 47 set, and a sign of `0xFFFE` with bit 47 clear.
     if is_canonical(0x0001_8000_0000_0000) {
         return Err("accepted a non-canonical address above user space");
     }
-
-    // Symmetrically, `0xFFFE_7FFF_FFFF_FFFF` has an all-ones sign while bit 47
-    // is clear, putting it in the hole *below* the kernel. Note that a genuine
-    // kernel address is `0xFFFF_8000_…`, with the sign and bit 47 both set, so
-    // dropping bit 47 from one is the quickest way to produce a hole address.
     if is_canonical(0xFFFE_7FFF_FFFF_FFFF) {
         return Err("accepted a non-canonical address below the kernel");
     }

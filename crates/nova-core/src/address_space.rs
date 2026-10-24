@@ -197,18 +197,79 @@ impl UserWindow {
     /// `kernel_half_start` is the first address of the kernel half. Both come
     /// from the architecture, so a 57-bit LA57 target would get a proportionally
     /// larger window without a change here.
+    ///
+    /// # The upper bound comes from the width, not from the kernel half
+    ///
+    /// The upper bound is the last canonical *user* address, one page below
+    /// `2^(virtual_bits - 1)`. It is **not** "the page below the kernel
+    /// half": the kernel half begins at `0xFFFF_8000_0000_0000` on a 48-bit
+    /// space, so one page below it is `0xFFFF_7FFF_FFFF_F000` — an address
+    /// whose sign extension disagrees with bit 47, which the hardware does
+    /// not address at all, and which is larger than every canonical address
+    /// in the space. A window bounded that way excludes nothing.
+    ///
+    /// That bound is also not merely too large: `0x0000_8000_0000_0000` and
+    /// `0xFFFF_8000_0000_0000` have the *same* page-table walk (PML4 entry
+    /// 256, the kernel's own entry), so a user mapping at the former would
+    /// land in the kernel half's tables.
+    ///
+    /// # Why `kernel_half_start` is still a parameter
+    ///
+    /// It is not the quantity the bound is derived from, but it *is* a
+    /// quantity that must agree with `virtual_bits`: the kernel half starts
+    /// at `2^64 - 2^(virtual_bits - 1)`. Passing it in turns a silent
+    /// disagreement between the two halves of the geometry into a loud
+    /// failure here, rather than a window that is derived from one number
+    /// and checked against another.
+    ///
+    /// # Panics
+    ///
+    /// If `kernel_half_start` is not the canonical higher-half start implied
+    /// by `virtual_bits`, or if `virtual_bits` is outside the range x86-64
+    /// supports (4..=57), the two halves of the geometry disagree and there is
+    /// no window that is correct for both. [`UserWindow::try_derive`] is the
+    /// non-panicking form.
     pub const fn derive(virtual_bits: u32, kernel_half_start: u64) -> Self {
+        match Self::try_derive(virtual_bits, kernel_half_start) {
+            Some(window) => window,
+            None => panic!("the address-space geometry is inconsistent"),
+        }
+    }
+
+    /// Derive the user window, or report that the geometry is inconsistent.
+    ///
+    /// The non-panicking form of [`UserWindow::derive`], for a caller that
+    /// wants to *report* the disagreement rather than abort on it.
+    pub const fn try_derive(virtual_bits: u32, kernel_half_start: u64) -> Option<Self> {
+        // x86-64 supports 48-bit (four-level) and 57-bit (LA57) virtual
+        // addresses, and anything narrower is not a width this derivation
+        // has been reasoned about.
+        if virtual_bits < 4 || virtual_bits > 57 {
+            return None;
+        }
+
+        // The half of the address space the user half occupies: bit
+        // `virtual_bits - 1` is the last addressable bit, so the user half is
+        // everything below `2^(virtual_bits - 1)`. The window's upper bound is
+        // the page below that, so the highest byte a user mapping may occupy
+        // is `2^(virtual_bits - 1) - 1`.
+        let user_half = 1u64 << (virtual_bits - 1);
+        let end = user_half - crate::paging::PAGE_SIZE;
+
+        // The kernel half begins at the top of the address space, mirrored
+        // around bit `virtual_bits - 1`. On a 48-bit space that is
+        // `0xFFFF_8000_0000_0000`.
+        let expected_kernel_half = !(user_half - 1);
+        if kernel_half_start != expected_kernel_half {
+            return None;
+        }
+
         // The null page is never mappable: a user pointer of zero must fault
         // rather than resolve to page zero of the process.
-        let start = crate::paging::PAGE_SIZE;
-
-        // The last canonical user address is the one immediately below the
-        // kernel half. The window is exclusive of that page so a user mapping
-        // can never share a page with the kernel's own.
-        let end = kernel_half_start - crate::paging::PAGE_SIZE;
-
-        let _ = virtual_bits;
-        Self { start, end }
+        Some(Self {
+            start: crate::paging::PAGE_SIZE,
+            end,
+        })
     }
 
     /// Whether `address` lies inside the window.
@@ -295,11 +356,11 @@ impl AddressSpace {
     /// *before* it allocates anything — otherwise a rejected request would
     /// have already consumed a frame.
     pub fn check_map(&self, virt: u64, phys: u64, protection: Protection) -> Result<(), VmmError> {
-        if virt % crate::paging::PAGE_SIZE != 0 {
+        if !virt.is_multiple_of(crate::paging::PAGE_SIZE) {
             return Err(VmmError::UnalignedVirtual);
         }
 
-        if phys % crate::paging::PAGE_SIZE != 0 {
+        if !phys.is_multiple_of(crate::paging::PAGE_SIZE) {
             return Err(VmmError::UnalignedPhysical);
         }
 
@@ -344,10 +405,10 @@ impl AddressSpace {
         // reference count, and doing that silently would hide a caller that
         // forgot to unmap. Mapping the same frame at a *different* address is
         // legitimate and increments the shared count.
-        if let Some(existing) = self.find(virt) {
-            if existing.phys == phys {
-                return Err(VmmError::AlreadyMapped);
-            }
+        if let Some(existing) = self.find(virt)
+            && existing.phys == phys
+        {
+            return Err(VmmError::AlreadyMapped);
         }
 
         // The reference count of the *frame*, which may be shared with a

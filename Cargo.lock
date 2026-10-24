@@ -29,6 +29,9 @@ dependencies = [
 [[package]]
 name = "nova-elf"
 version = "0.1.0"
+dependencies = [
+ "nova-core",
+]
 
 [[package]]
 name = "nova-fs"
@@ -61,6 +64,13 @@ dependencies = [
 
 [[package]]
 name = "nova-protocols"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+]
+
+[[package]]
+name = "nova-rt"
 version = "0.1.0"
 dependencies = [
  "nova-abi",

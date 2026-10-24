@@ -267,8 +267,13 @@ fn map_hhdm(pml4: &PageTable, boot_info: &'static BootInfo) -> Result<(), VmmErr
 /// The user window this kernel permits.
 ///
 /// Derived from the address-space geometry, not written down: the lower bound
-/// is the page after the null page and the upper bound is one page below the
-/// kernel half.
+/// is the page after the null page and the upper bound is the last canonical
+/// *user* page — one page below `2^(virtual_bits - 1)`, not one page below
+/// the kernel half, which would be a non-canonical address above every
+/// address the hardware can reach.
+///
+/// The kernel half's start is passed alongside the width because the two must
+/// agree; `UserWindow::derive` refuses a geometry in which they do not.
 pub fn user_window() -> UserWindow {
     UserWindow::derive(
         ADDRESS_SPACE.virtual_bits.unwrap_or(48),

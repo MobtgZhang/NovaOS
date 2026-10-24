@@ -130,13 +130,29 @@ pub const fn page_offset(address: u64) -> usize {
 /// all-zero or all-one, which is the single most important check before ever
 /// dereferencing a pointer.
 ///
+/// # The rule is *replication*, not "all-zero or all-one"
+///
+/// Bits 63:48 must **replicate bit 47**. That is what the hardware does with
+/// the bits above the addressable range, and it is stricter than "the sign is
+/// all-zero or all-one":
+///
+/// - `0x0000_8000_0000_0000` has an all-zero sign and bit 47 **set**: the
+///   sign does not replicate bit 47, so the address is **not** canonical and
+///   the hardware raises `#GP` for it.
+/// - `0xFFFF_0000_0000_0000` has an all-one sign and bit 47 **clear**: again
+///   the sign does not replicate bit 47, so it is **not** canonical either.
+///
+/// The first non-canonical address above the user half is
+/// `0x0000_8000_0000_0000`, and the last one below the kernel half is
+/// `0xFFFF_7FFF_FFFF_FFFF`.
+///
 /// # Why the mask, and not `address >> 47`
 ///
-/// Comparing `address >> 47` against `0xFFFF` looks equivalent and is not. That
-/// shift yields a value in `0..=0xFFFF_FFFF`, and any kernel address whose bits
-/// 63:48 are all-one compares unequal to `0xFFFF` -- so `0xFFFF_8000_0000_0000`,
-/// the canonical form of every higher-half address including the kernel's own,
-/// is reported as *non*-canonical.
+/// Comparing `address >> 47` against `0xFFFF` looks equivalent and is not.
+/// That shift yields a value in `0..=0xFFFF_FFFF`, and any kernel address
+/// whose bits 63:48 are all-one compares unequal to `0xFFFF` -- so
+/// `0xFFFF_8000_0000_0000`, the canonical form of every higher-half address
+/// including the kernel's own, is reported as *non*-canonical.
 ///
 /// That is the worst possible way for this function to fail: it rejects the
 /// kernel's entire address range while accepting nothing exotic, so a caller
@@ -144,18 +160,15 @@ pub const fn page_offset(address: u64) -> usize {
 /// boot. Extracting exactly bits 63:48 first is what makes the comparison
 /// meaningful.
 ///
-/// # Where the boundary actually is
+/// # One rule, one owner
 ///
-/// Bit 47 is the last addressable bit, so `0x0000_8000_0000_0000` — bit 47 set
-/// with a zero sign extension — **is** canonical. The first non-canonical
-/// address is `0x0000_FFFF_8000_0000`, where the sign extension disagrees with
-/// bit 47. Any test that treats `0x8000_0000_0000` as non-canonical is asserting
-/// that the *top of user space* is unaddressable, which is not what the
-/// hardware does.
+/// This is [`nova_core::paging::is_canonical`] rather than a copy of it. The
+/// kernel's mapping path, the ELF validator, and the host test suite must all
+/// agree about which addresses the hardware can address; three copies of the
+/// rule are three chances to disagree.
 #[inline]
 pub const fn is_canonical(address: u64) -> bool {
-    let sign = (address >> VIRTUAL_ADDRESS_BITS) & 0xFFFF;
-    sign == 0 || sign == 0xFFFF
+    nova_core::paging::is_canonical(address)
 }
 
 /// A physical address is canonical as an identity mapping only in the first

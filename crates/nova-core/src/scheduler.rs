@@ -171,7 +171,13 @@ impl Default for Scheduler {
 
 impl Scheduler {
     /// A scheduler with a given timeslice, in ticks.
-    pub fn new(timeslice: u64) -> Self {
+    ///
+    /// `const` so the kernel can hold one in a `static mut` without an
+    /// initialiser function — the kernel has no allocator and no lazy
+    /// statics, so a scheduler that cannot be built at compile time would
+    /// have to be built at boot, which is more machinery than the type
+    /// deserves.
+    pub const fn new(timeslice: u64) -> Self {
         Self {
             threads: [None; MAX_THREADS],
             count: 0,
@@ -416,10 +422,10 @@ impl Scheduler {
     /// "idle" condition: the kernel halts the CPU until an interrupt arrives.
     pub fn schedule(&mut self) -> Option<u32> {
         if let Some(current) = self.current {
-            if let Some(record) = self.thread_mut(current) {
-                if record.state == ThreadState::Running {
-                    record.state = ThreadState::Runnable;
-                }
+            if let Some(record) = self.thread_mut(current)
+                && record.state == ThreadState::Running
+            {
+                record.state = ThreadState::Runnable;
             }
             // The current thread goes back to the queue *unless* it exited or
             // blocked, in which case it is no longer in it.
@@ -475,9 +481,7 @@ impl Scheduler {
     /// The thread goes to the back of the queue and the next one is chosen
     /// immediately.
     pub fn yield_current(&mut self) -> Option<u32> {
-        if self.current.is_none() {
-            return None;
-        }
+        self.current?;
 
         self.current_ticks = 0;
         self.schedule()

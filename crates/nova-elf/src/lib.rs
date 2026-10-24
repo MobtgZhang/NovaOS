@@ -554,11 +554,10 @@ fn validate_segment(
 /// The pairs are held in a fixed-size array rather than a sorted copy: the
 /// segment count is bounded by [`MAX_PROGRAM_HEADERS`], and sorting would need
 /// an allocator the kernel does not have.
-fn check_overlap(mut segments: impl Iterator<Item = ProgramHeader>) -> Result<(), ElfError> {
+fn check_overlap(segments: impl Iterator<Item = ProgramHeader>) -> Result<(), ElfError> {
     let mut ranges: [(u64, u64); MAX_PROGRAM_HEADERS] = [(0, 0); MAX_PROGRAM_HEADERS];
-    let mut count = 0usize;
 
-    while let Some(segment) = segments.next() {
+    for (count, segment) in segments.enumerate() {
         if count >= MAX_PROGRAM_HEADERS {
             // Unreachable: `parse` already refuses an image with more than
             // `MAX_PROGRAM_HEADERS` program headers, so the iterator cannot
@@ -575,7 +574,6 @@ fn check_overlap(mut segments: impl Iterator<Item = ProgramHeader>) -> Result<()
         }
 
         ranges[count] = range;
-        count += 1;
     }
 
     Ok(())
@@ -583,11 +581,113 @@ fn check_overlap(mut segments: impl Iterator<Item = ProgramHeader>) -> Result<()
 
 /// Whether `address` is canonical on a 48-bit virtual address space.
 ///
-/// Bit 47 is the last addressable bit, so the upper sixteen bits must either
-/// all replicate it or all be zero. A segment whose address is not canonical
-/// would fault the moment it was mapped, so this is checked before anything is
-/// mapped at all.
+/// Bit 47 is the last addressable bit, so the bits above it must **replicate**
+/// it: all-zero when bit 47 is clear, all-one when bit 47 is set. A segment
+/// whose address is not canonical would fault the moment it was mapped, so
+/// this is checked before anything is mapped at all.
+///
+/// The rule is [`nova_core::paging::is_canonical`] rather than a copy of it:
+/// the ELF validator and the mapping API must agree about which addresses the
+/// hardware can address, and two copies of the rule are two chances to
+/// disagree.
 pub const fn is_canonical(address: u64) -> bool {
-    let sign = (address >> 48) & 0xFFFF;
-    sign == 0 || sign == 0xFFFF
+    nova_core::paging::is_canonical(address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::builder::{ElfBuilder, Segment};
+    use super::{Elf, ElfError, is_canonical};
+
+    /// The kernel half's start on a 48-bit address space.
+    const KERNEL_HALF_START: u64 = 0xFFFF_8000_0000_0000;
+
+    /// Build a one-segment image at `vaddr`.
+    ///
+    /// The bytes live in a fixed buffer rather than a `Vec`: the crate is
+    /// `no_std` and is compiled into the kernel, where no allocator exists.
+    fn image_at(vaddr: u64) -> [u8; crate::builder::MAX_IMAGE_BYTES] {
+        ElfBuilder::new()
+            .entry(vaddr)
+            .segment(Segment::ro(vaddr, &[0x90; 16]))
+            .build()
+            .bytes
+    }
+
+    /// The meaningful length of a built image.
+    fn image_len(vaddr: u64) -> usize {
+        ElfBuilder::new()
+            .entry(vaddr)
+            .segment(Segment::ro(vaddr, &[0x90; 16]))
+            .build()
+            .len
+    }
+
+    #[test]
+    fn the_canonical_rule_is_the_shared_one() {
+        // The ELF validator and the mapping API must agree about which
+        // addresses the hardware can address.
+        for address in [
+            0x0000_0000_0000_0000u64,
+            0x0000_7FFF_FFFF_FFFF,
+            0xFFFF_8000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ] {
+            assert!(is_canonical(address));
+            assert_eq!(
+                is_canonical(address),
+                nova_core::paging::is_canonical(address)
+            );
+        }
+
+        for address in [
+            0x0000_8000_0000_0000u64,
+            0xFFFF_7FFF_FFFF_FFFF,
+            0x0001_8000_0000_0000,
+            0xFFFE_7FFF_FFFF_FFFF,
+        ] {
+            assert!(!is_canonical(address));
+            assert_eq!(
+                is_canonical(address),
+                nova_core::paging::is_canonical(address)
+            );
+        }
+    }
+
+    #[test]
+    fn a_segment_above_the_user_half_is_refused() {
+        // `0x0000_8000_0000_0000` is the first address above the user half.
+        // It is *not* canonical — its sign extension disagrees with bit 47 —
+        // and its page-table walk is the kernel's own PML4 entry.
+        let image = image_at(0x0000_8000_0000_0000);
+        let elf = Elf::parse(&image[..image_len(0x0000_8000_0000_0000)]).expect("the image parses");
+        assert_eq!(
+            elf.validate(KERNEL_HALF_START),
+            Err(ElfError::NonCanonicalAddress),
+            "a segment above the user half must be refused",
+        );
+    }
+
+    #[test]
+    fn a_segment_in_the_kernel_half_is_refused() {
+        let vaddr = 0xFFFF_8000_0000_0000;
+        let image = image_at(vaddr);
+        let elf = Elf::parse(&image[..image_len(vaddr)]).expect("the image parses");
+        assert_eq!(
+            elf.validate(KERNEL_HALF_START),
+            Err(ElfError::SegmentInKernelSpace),
+            "a segment in the kernel half must be refused",
+        );
+    }
+
+    #[test]
+    fn a_segment_in_the_user_half_is_accepted() {
+        let vaddr = 0x0000_0000_0000_1000;
+        let image = image_at(vaddr);
+        let elf = Elf::parse(&image[..image_len(vaddr)]).expect("the image parses");
+        assert!(
+            elf.validate(KERNEL_HALF_START).is_ok(),
+            "a segment in the user half must be accepted",
+        );
+    }
 }

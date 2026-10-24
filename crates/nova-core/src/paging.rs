@@ -136,6 +136,24 @@ pub const PAGE_SIZE: u64 = 0x1000;
 /// all-zero or all-one, which is the single most important check before ever
 /// dereferencing a pointer.
 ///
+/// # The rule is *replication*, not "all-zero or all-one"
+///
+/// Bits 63:48 must **replicate bit 47**. That is what the hardware does with
+/// the bits above the addressable range, and it is a stricter rule than
+/// "bits 63:48 are all-zero or all-one":
+///
+/// - `0x0000_8000_0000_0000` has an all-zero sign and bit 47 **set**, so the
+///   sign does not replicate bit 47. It is **not** canonical — the hardware
+///   raises `#GP` for it.
+/// - `0xFFFF_0000_0000_0000` has an all-one sign and bit 47 **clear**, so
+///   again the sign does not replicate bit 47. It is **not** canonical either.
+///
+/// The weaker rule — "the sign is all-zero or all-one, whatever bit 47 says" —
+/// accepts both of those, and both are unaddressable. It is also *not* merely
+/// too permissive: it is wrong in both directions, and the address
+/// `0xFFFF_8000_0000_0000` — the canonical form of every higher-half address,
+/// including the kernel's own — happens to satisfy it only by accident.
+///
 /// # Why the mask, and not `address >> 47`
 ///
 /// Comparing `address >> 47` against `0xFFFF` looks equivalent and is not.
@@ -151,8 +169,28 @@ pub const PAGE_SIZE: u64 = 0x1000;
 /// meaningful.
 #[inline]
 pub const fn is_canonical(address: u64) -> bool {
-    let sign = (address >> VIRTUAL_ADDRESS_BITS) & 0xFFFF;
-    sign == 0 || sign == 0xFFFF
+    is_canonical_in(VIRTUAL_ADDRESS_BITS, address)
+}
+
+/// Whether an address is canonical on a `virtual_bits`-wide address space.
+///
+/// The general form of [`is_canonical`]: the bits above the addressable range
+/// must replicate bit `virtual_bits - 1`. A 48-bit space therefore has sixteen
+/// sign bits and a 57-bit LA57 space has seven, and both follow from the same
+/// expression.
+#[inline]
+pub const fn is_canonical_in(virtual_bits: u64, address: u64) -> bool {
+    let sign_bit = 1u64 << (virtual_bits - 1);
+    let sign = address >> virtual_bits;
+
+    if address & sign_bit == 0 {
+        // Bit 47 is clear, so the sign must be all-zero.
+        sign == 0
+    } else {
+        // Bit 47 is set, so the sign must be all-one. `u64::MAX >> virtual_bits`
+        // is exactly the mask of the sign bits.
+        sign == u64::MAX >> virtual_bits
+    }
 }
 
 /// The level of a page-table walk, counted from the top.

@@ -10,6 +10,10 @@ description = "ELF64 little-endian executable parser and validator for NovaOS"
 # the host test suite compiles it under `std` to prove the validator rejects
 # exactly what it claims to reject.
 [dependencies]
+# The canonical-address rule is shared with the kernel's `nova-core`, because
+# two copies of it that disagree are two answers to the same question. The
+# dependency does not cycle: `nova-core` depends only on `nova-abi`.
+nova-core = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
