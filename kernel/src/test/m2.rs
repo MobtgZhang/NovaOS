@@ -15,15 +15,10 @@
 //! case here names the specific failure it is designed to catch, and the
 //! comment above each case says what that failure looks like from the outside.
 
-use super::harness::TestCase;
+use super::harness::TestSuite;
 
 /// The M2 suites, in registration order.
 ///
 /// The names are the milestone's exit gate and must not be renamed: the shell
 /// harness asserts on exactly these strings.
-pub static M2_SUITES: &[super::harness::TestSuite] = &[];
-
-/// The unused-import guard: `TestCase` is referenced by the case functions
-/// once they exist.
-#[allow(dead_code)]
-type UnusedCaseType = TestCase;
+pub static M2_SUITES: &[TestSuite] = &[];

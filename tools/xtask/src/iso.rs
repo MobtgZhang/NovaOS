@@ -1087,7 +1087,7 @@ impl Layout {
     /// the two fixed markers a reader recognises by their exact byte value. Writing
     /// them as UCS-2 (`0x00 0x00` and `0x00 0x01`) makes them unrecognisable: the
     /// reader treats the first record of every directory as an ordinary entry
-    /// named " ", descends into the directory it points at, and finds a tree
+    /// named ".", descends into the directory it points at, and finds a tree
     /// with a cycle in it.
     fn dot_record(&self, extent: u32, is_parent: bool, system_use: &[u8]) -> Vec<u8> {
         let mut record = Vec::with_capacity(34 + system_use.len());

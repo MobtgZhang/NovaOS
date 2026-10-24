@@ -44,7 +44,6 @@ use crate::arch::x86_64::paging::{
 use crate::boot::BootInfo;
 use crate::klog;
 use crate::logger::Level;
-use crate::mm::direct_map;
 use crate::mm::page_table::{self, NO_EXECUTE, PageTable};
 
 use nova_core::address_space::{Protection, UserWindow, VmmError};

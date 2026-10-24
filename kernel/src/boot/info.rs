@@ -291,19 +291,14 @@ fn trimmed(bytes: &[u8; NAME_LEN]) -> &str {
 /// Derived from the compiled-in address space rather than declared per
 /// architecture, so a new target cannot forget to bound its inputs.
 pub const MAX_PHYSICAL_ADDRESS: u64 = {
-    // `ADDRESS_SPACE` is a const, but computing this by hand keeps the bound
-    // visible in one place regardless of which backend is compiled.
-    let bits = if cfg!(target_arch = "x86_64") {
-        52
-    } else if cfg!(target_arch = "aarch64") {
-        48
-    } else {
-        52
-    };
-    if bits >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
+    // The bound comes from the architecture layer, which is the one place
+    // that knows how wide a physical address can be on this target. Naming
+    // the architecture here instead would mean a new backend had to be
+    // remembered in two places, and the second place is the one that fails
+    // quietly -- it accepts an address the architecture cannot represent.
+    match crate::arch::ADDRESS_SPACE.physical_bits {
+        Some(bits) if bits < 64 => (1u64 << bits) - 1,
+        _ => u64::MAX,
     }
 };
 
