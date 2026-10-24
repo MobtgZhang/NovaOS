@@ -38,6 +38,13 @@ mod arch;
 mod boot;
 mod logger;
 mod mm;
+// The service layer (M3 and M4) is not yet wired into the boot sequence.
+//
+// It is compiled as a module but not declared here, because the milestone's
+// mechanism is still being built and a half-built module that the kernel
+// links against is a liability rather than a partial win. The `services`
+// directory is owned by the M3/M4 work; enabling it is a one-line change
+// once its suites exist.
 mod test;
 
 use crate::arch::capabilities::Console as _;

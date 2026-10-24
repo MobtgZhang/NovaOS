@@ -51,8 +51,12 @@ version = "0.1.0"
 dependencies = [
  "limine",
  "nova-abi",
+ "nova-cap",
  "nova-core",
  "nova-elf",
+ "nova-fs",
+ "nova-ipc",
+ "nova-protocols",
 ]
 
 [[package]]

@@ -186,6 +186,17 @@ impl SideState {
 }
 
 /// A channel: two sides, a rendezvous, and a table of outstanding calls.
+///
+/// `Copy` is derived because the channel is entirely value data: two side
+/// states, a reply-slot table, a nonce counter, and a completion sink. None
+/// of those has an identity that survives a copy, and the kernel keeps
+/// channels in a fixed-size pool where expressing "no channel here" as
+/// `None` requires the element type to be `Copy` for the repeat expression
+/// that builds the array.
+///
+/// A copy is a distinct channel with the same contents, so two copies never
+/// alias: there is no interior mutability to share.
+#[derive(Clone, Copy)]
 pub struct Channel {
     id: ChannelId,
     sides: [SideState; 2],

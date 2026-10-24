@@ -160,6 +160,13 @@ enum Slot {
 /// capability that travels to another process arrives there as a *new* entry
 /// minted by the receiving table (see `nova-ipc`'s transfer support), never
 /// as the same slot.
+///
+/// `Clone` is derived because the kernel keeps a table per task in a
+/// fixed-size pool and needs to reset a slot to empty. A table is entirely
+/// value data -- slots, a free stack, and counters -- with no interior
+/// identity, so a clone is a distinct table with the same contents, which is
+/// exactly what an empty slot wants.
+#[derive(Clone)]
 pub struct CapabilityTable {
     slots: [Slot; MAX_CAPS],
     /// Free-slot stack.

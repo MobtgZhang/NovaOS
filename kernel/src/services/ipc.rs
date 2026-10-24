@@ -103,7 +103,7 @@ impl IpcRegistry {
 
     /// Drop every channel.
     pub fn reset(&mut self) {
-        self.channels = [None; MAX_CHANNELS];
+        self.channels = core::array::from_fn(|_| None);
     }
 
     /// Kill one side of every channel a task is a party to.

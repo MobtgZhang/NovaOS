@@ -53,7 +53,7 @@ use crate::services::object::{ObjectKind, ObjectRegistry};
 /// It is deliberately narrow: it is the authority `init` delegates *from*, and
 /// a root that carried every right would be the "superuser = bypass all"
 /// back door the report forbids.
-pub const ROOT_RIGHTS: Rights = Rights::SPAWN | Rights::GRANT;
+pub const ROOT_RIGHTS: Rights = Rights::SPAWN.union(Rights::GRANT);
 
 /// A resolved capability: what the handle names and what the holder may do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

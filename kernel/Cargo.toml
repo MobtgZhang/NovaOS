@@ -41,6 +41,20 @@ nova-core = { workspace = true }
 # uses, so a rejected image is rejected for the same reason in both places.
 nova-elf = { workspace = true }
 
+# The capability table, the IPC rendezvous, the RAM filesystem, and the
+# versioned service protocols. These are the pure-logic halves of M3 and M4:
+# the host test suite exercises them directly, and the kernel supplies only the
+# mechanism -- where the tables live, which task owns which channel, and how a
+# syscall handler reaches them.
+#
+# They are listed here rather than being reached through a facade crate so
+# that the kernel's dependency on each is visible in one place, in the same
+# way the architecture's dependency on `nova-core` is.
+nova-cap = { workspace = true }
+nova-ipc = { workspace = true }
+nova-fs = { workspace = true }
+nova-protocols = { workspace = true }
+
 [lints.rust]
 # An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`
 # block, so every one of them carries an explicit SAFETY comment. The kernel's

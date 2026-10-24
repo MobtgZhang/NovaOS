@@ -55,7 +55,7 @@ use nova_ipc::message::Message;
 
 use crate::services::fs::FileServer;
 use crate::services::ipc::IpcRegistry;
-use crate::services::object::ObjectRegistry;
+use crate::services::object::{ObjectKind, ObjectRegistry};
 use crate::services::supervisor::Supervisor;
 
 /// Maximum number of tasks the kernel tracks.
@@ -101,7 +101,7 @@ pub struct TaskState {
     /// guess them.
     pub root: nova_abi::cap::CapHandle,
     /// The IPC channels this task is a party to, and which side it holds.
-    pub channels: [(nova_ipc::ChannelId, nova_ipc::Side); crate::services::ipc::MAX_TASK_CHANNELS],
+    pub channels: [(nova_ipc::ChannelId, nova_ipc::Side); crate::services::MAX_CHANNELS],
     /// How many entries of `channels` are meaningful.
     pub channel_count: usize,
 }
@@ -119,7 +119,7 @@ impl TaskState {
             scopes: crate::services::fs::ScopePool::new(),
             root: nova_abi::cap::CapHandle::INVALID,
             channels: [(nova_ipc::ChannelId::new(0), nova_ipc::Side::First);
-                crate::services::ipc::MAX_TASK_CHANNELS],
+                crate::services::MAX_CHANNELS],
             channel_count: 0,
         }
     }
@@ -311,12 +311,12 @@ impl KernelState {
 
         // Kill the task's side of every channel it was party to, which is
         // what wakes a blocked peer with `E_PEER_DIED`.
-        let sides: [(nova_ipc::ChannelId, nova_ipc::Side); crate::services::ipc::MAX_TASK_CHANNELS] =
+        let sides: [(nova_ipc::ChannelId, nova_ipc::Side); crate::services::MAX_CHANNELS] =
             self.tasks[slot]
                 .as_ref()
                 .map(|task| task.channels)
                 .unwrap_or([(nova_ipc::ChannelId::new(0), nova_ipc::Side::First);
-                    crate::services::ipc::MAX_TASK_CHANNELS]);
+                    crate::services::MAX_CHANNELS]);
         let side_count = self.tasks[slot]
             .as_ref()
             .map(|task| task.channel_count)
