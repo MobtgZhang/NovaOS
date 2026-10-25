@@ -93,6 +93,9 @@ pub const MAX_THREADS: usize = 64;
 /// bound on how much kernel memory the IPC machinery may use.
 pub const MAX_CHANNELS: usize = 16;
 
+/// Maximum bytes in the initramfs service name recorded for a task.
+pub const MAX_SERVICE_NAME: usize = 32;
+
 /// One task's kernel metadata.
 ///
 /// The *authority* of a task is its capability table, which lives in
@@ -127,6 +130,14 @@ pub struct TaskState {
     pub channels: [(ChannelId, Side); MAX_CHANNELS],
     /// How many entries of `channels` are meaningful.
     pub channel_count: usize,
+    /// The initramfs image name that started this task, if any.
+    ///
+    /// A supervisor needs to ask "is this service alive?" without holding a
+    /// capability into every child. The kernel records the launch name as
+    /// plain data; it does not confer authority or make a process privileged.
+    pub service_name: [u8; MAX_SERVICE_NAME],
+    /// How many bytes of `service_name` are meaningful.
+    pub service_name_len: usize,
 }
 
 impl TaskState {
@@ -144,6 +155,8 @@ impl TaskState {
             scopes: crate::services::fs::ScopePool::new(),
             channels: [(ChannelId::new(0), Side::First); MAX_CHANNELS],
             channel_count: 0,
+            service_name: [0; MAX_SERVICE_NAME],
+            service_name_len: 0,
         }
     }
 
@@ -582,6 +595,31 @@ impl KernelState {
         // wakes a blocked peer with `E_PEER_DIED`.
         self.ipc.kill_task(slot, &sides[..side_count]);
         true
+    }
+
+    /// Remove one dead task and release its slot.
+    ///
+    /// Authority is withdrawn first, because a caller might observe the slot
+    /// disappearing while a stale capability still resolves. Only after
+    /// revocation and peer wake-up does the metadata leave the table.
+    pub fn retire_task(&mut self, slot: usize) -> bool {
+        let Some(id) = self.task_at_slot(slot).map(|task| task.id) else {
+            return false;
+        };
+        if !self.kill_task(id) {
+            return false;
+        }
+        self.tasks[slot] = None;
+        true
+    }
+
+    /// Whether a live task was started from the named initramfs image.
+    pub fn service_is_alive(&self, name: &[u8]) -> bool {
+        self.tasks.iter().flatten().any(|task| {
+            task.alive
+                && task.service_name_len == name.len()
+                && task.service_name[..task.service_name_len] == *name
+        })
     }
 
     /// Collect the completions every channel recorded, and publish what they
