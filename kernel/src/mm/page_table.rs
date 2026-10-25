@@ -344,3 +344,27 @@ pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
     let index = WalkLevel::Pt.index_of(virt);
     table.target(index)
 }
+
+/// Translate a *user* virtual address only if every walk level is user-accessible.
+///
+/// Process spaces share the kernel half with ring 0, so a plain translation can
+/// resolve a supervisor page. User-pointer copies must not use that result.
+pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
+    let mut table = *root;
+
+    for level in [WalkLevel::Pml4, WalkLevel::Pdpt, WalkLevel::Pd] {
+        let index = level.index_of(virt);
+        let entry = table.read(index);
+        if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
+            return None;
+        }
+        table = PageTable::at(decode_entry(entry));
+    }
+
+    let index = WalkLevel::Pt.index_of(virt);
+    let entry = table.read(index);
+    if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
+        return None;
+    }
+    Some(decode_entry(entry))
+}
