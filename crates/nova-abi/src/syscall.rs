@@ -155,6 +155,14 @@ pub mod nr {
     /// Return the number of live kernel tasks, for `ps`.
     pub const PROCESS_COUNT: Syscall = Syscall(20);
 
+    /// Return whether an initramfs service is still alive.
+    ///
+    /// Arguments: `name_ptr`, `name_len`. Returns one when at least one live
+    /// task was started with that name, and zero when none are. This is the
+    /// supervisor's observation primitive: it says what happened, and grants
+    /// no authority.
+    pub const PROCESS_STATUS: Syscall = Syscall(21);
+
     /// Every number currently assigned.
     pub const ALL: &[Syscall] = &[
         GET_VERSION,
@@ -178,6 +186,7 @@ pub mod nr {
         ENDPOINT_PEER_CREATE,
         ENDPOINT_SELF,
         PROCESS_COUNT,
+        PROCESS_STATUS,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -204,6 +213,7 @@ pub mod nr {
             ENDPOINT_PEER_CREATE => "endpoint_peer_create",
             ENDPOINT_SELF => "endpoint_self",
             PROCESS_COUNT => "process_count",
+            PROCESS_STATUS => "process_status",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so
