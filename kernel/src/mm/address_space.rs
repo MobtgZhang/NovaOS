@@ -349,6 +349,11 @@ pub fn translate(space: &AddressSpace, virt: u64) -> Option<u64> {
     page_table::translate(&space.pml4(), virt)
 }
 
+/// Translate a user-owned page, refusing the shared kernel half.
+pub fn translate_user(space: &AddressSpace, virt: u64) -> Option<u64> {
+    page_table::translate_user(&space.pml4(), virt)
+}
+
 pub fn map_kernel_mmio(virt: u64, phys: u64) -> Result<(), VmmError> {
     let space = kernel_space();
     let flags = PageFlags::PRESENT
