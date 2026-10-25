@@ -34,11 +34,13 @@
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
 use nova_abi::syscall::{ObjectType, Syscall, nr};
+use nova_cap::ObjectRef;
 use nova_fs::ramfs::FsError;
 use nova_ipc::endpoint::Side;
 use nova_ipc::message::Message;
 use nova_protocols::file::{FILE_OP_OPEN, FILE_VERSION};
 use nova_protocols::manifest::{Dependency, RestartDecision, ServiceManifest, ServiceState};
+use nova_protocols::shell::{ShellCommand, parse};
 
 use super::harness::{TestCase, TestSuite};
 use crate::services::dispatch::{SyscallContext, SyscallOutcome, dispatch_syscall_in};
@@ -50,6 +52,34 @@ use crate::services::{KernelState, MAX_TASKS};
 /// The names are the milestone's exit gate and must not be renamed: the shell
 /// harness asserts on exactly these strings.
 pub static M3_SUITES: &[TestSuite] = &[
+    TestSuite {
+        name: "ipc_4caps_atomic",
+        cases: &[(
+            "four_capabilities_transfer_together_or_not_at_all",
+            four_capabilities_transfer_together,
+        )],
+    },
+    TestSuite {
+        name: "reply_once",
+        cases: &[(
+            "a_reply_token_is_spent_after_one_reply",
+            reply_token_is_spent_after_one_reply,
+        )],
+    },
+    TestSuite {
+        name: "old_handle_invalid",
+        cases: &[(
+            "a_reused_object_slot_does_not_revive_a_stale_handle",
+            a_reused_object_slot_does_not_revive_a_stale_handle,
+        )],
+    },
+    TestSuite {
+        name: "memory_leak_create_drop_10000",
+        cases: &[(
+            "ten_thousand_create_destroy_cycles_do_not_leak",
+            ten_thousand_create_destroy_cycles_do_not_leak,
+        )],
+    },
     TestSuite {
         name: "cap_rights_enforced",
         cases: &[
@@ -167,6 +197,16 @@ pub static M3_SUITES: &[TestSuite] = &[
 /// The M4 suites, in registration order.
 pub static M4_SUITES: &[TestSuite] = &[
     TestSuite {
+        name: "shell_ls",
+        cases: &[
+            ("the_shell_parses_ls", shell_parses_ls),
+            (
+                "the_shell_refuses_unknown_commands",
+                shell_refuses_unknown_commands,
+            ),
+        ],
+    },
+    TestSuite {
         name: "file_read_without_cap_denied",
         cases: &[
             (
@@ -205,6 +245,19 @@ pub static M4_SUITES: &[TestSuite] = &[
         ],
     },
     TestSuite {
+        name: "file_read_write_ramfs",
+        cases: &[
+            (
+                "a_written_file_can_be_read_back",
+                a_written_file_can_be_read_back,
+            ),
+            (
+                "a_reopened_handle_reads_from_the_start",
+                a_reopened_handle_reads_from_the_start,
+            ),
+        ],
+    },
+    TestSuite {
         name: "ramfs_write_read",
         cases: &[
             ("written_bytes_come_back", written_bytes_come_back),
@@ -214,6 +267,34 @@ pub static M4_SUITES: &[TestSuite] = &[
                 protocol_round_trips_a_file,
             ),
         ],
+    },
+    TestSuite {
+        name: "file_server_restart",
+        cases: &[(
+            "a_crashed_file_server_is_restarted",
+            crashed_service_is_restarted,
+        )],
+    },
+    TestSuite {
+        name: "ipc_queue_backpressure",
+        cases: &[(
+            "a_full_queue_refuses_and_then_recovers",
+            a_full_queue_refuses_and_then_recovers,
+        )],
+    },
+    TestSuite {
+        name: "open_close_10000",
+        cases: &[(
+            "ten_thousand_open_close_cycles_do_not_leak",
+            ten_thousand_open_close_cycles_do_not_leak,
+        )],
+    },
+    TestSuite {
+        name: "app_crash_does_not_kill_shell",
+        cases: &[(
+            "a_dead_child_leaves_the_shell_alive",
+            a_dead_child_leaves_the_shell_alive,
+        )],
     },
     TestSuite {
         name: "protocol_version_mismatch",
@@ -257,9 +338,525 @@ pub static M4_SUITES: &[TestSuite] = &[
             ),
         ],
     },
+    TestSuite {
+        name: "initramfs_boot",
+        cases: &[
+            (
+                "the_boot_archive_is_valid_and_contains_init",
+                the_boot_archive_is_valid_and_contains_init,
+            ),
+            ("init_was_started", init_was_started),
+        ],
+    },
 ];
 
 // --- helpers ----------------------------------------------------------------
+
+fn the_boot_archive_is_valid_and_contains_init() -> Result<(), &'static str> {
+    let Some(archive_bytes) = crate::boot::initramfs() else {
+        return Err("the boot image did not carry an initramfs");
+    };
+    let archive = crate::initramfs::Archive::parse(archive_bytes)
+        .map_err(|_| "the boot archive failed validation")?;
+    if archive.get(b"init").is_none() {
+        return Err("the boot archive did not contain the init image");
+    }
+    if archive.len() < 5 {
+        return Err("the boot archive is missing packaged services");
+    }
+    Ok(())
+}
+
+fn init_was_started() -> Result<(), &'static str> {
+    // SAFETY: service state was installed during boot and the test harness
+    // runs serialised on the kernel's own stack.
+    let kernel = unsafe { crate::services::state() };
+    if kernel
+        .tasks
+        .iter()
+        .flatten()
+        .filter(|task| task.alive)
+        .count()
+        < 2
+    {
+        return Err("init and the shell did not start from the boot archive");
+    }
+    Ok(())
+}
+
+fn shell_parses_ls() -> Result<(), &'static str> {
+    let Some(ShellCommand::Ls { path }) = parse("ls /docs") else {
+        return Err("ls was not parsed as the ls command");
+    };
+    if path != Some("/docs") {
+        return Err("the ls path was not preserved");
+    }
+    Ok(())
+}
+
+fn shell_refuses_unknown_commands() -> Result<(), &'static str> {
+    if parse("rm /").is_some() {
+        return Err("an unknown command was accepted");
+    }
+    Ok(())
+}
+
+fn a_written_file_can_be_read_back() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the task has no slot")?;
+    state
+        .grant_file_scope(slot, b"/", Rights::READ | Rights::WRITE)
+        .map_err(|_| "the write grant was refused")?;
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/loop.txt")
+        .map_err(|_| "cannot create /loop.txt")?;
+    let scopes = state.scope_set_for(slot);
+
+    let (wire, _) = state
+        .files
+        .open_scoped(&scopes, b"/loop.txt", Rights::WRITE)
+        .map_err(|_| "the write open was refused")?;
+    let written = state
+        .files
+        .write(&scopes, wire, b"ramfs works")
+        .map_err(|_| "the write failed")?;
+    if written != 11 {
+        return Err("the write was truncated");
+    }
+    state
+        .files
+        .close(&scopes, wire)
+        .map_err(|_| "the write close failed")?;
+
+    let (wire, _) = state
+        .files
+        .open_scoped(&scopes, b"/loop.txt", Rights::READ)
+        .map_err(|_| "the read open was refused")?;
+    let mut buffer = [0u8; 32];
+    let read = state
+        .files
+        .read(&scopes, wire, &mut buffer)
+        .map_err(|_| "the read failed")?;
+    if read != written || &buffer[..read] != b"ramfs works" {
+        return Err("the file did not read back intact");
+    }
+    state
+        .files
+        .close(&scopes, wire)
+        .map_err(|_| "the read close failed")?;
+    Ok(())
+}
+
+fn a_reopened_handle_reads_from_the_start() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the task has no slot")?;
+    state
+        .grant_file_scope(slot, b"/", Rights::READ | Rights::WRITE)
+        .map_err(|_| "the grant was refused")?;
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/start.txt")
+        .map_err(|_| "cannot create /start.txt")?;
+    let scopes = state.scope_set_for(slot);
+
+    let (wire, _) = state
+        .files
+        .open_scoped(&scopes, b"/start.txt", Rights::WRITE)
+        .map_err(|_| "the write open was refused")?;
+    state
+        .files
+        .write(&scopes, wire, b"beginning")
+        .map_err(|_| "the write failed")?;
+    state
+        .files
+        .close(&scopes, wire)
+        .map_err(|_| "the write close failed")?;
+
+    let (wire, _) = state
+        .files
+        .open_scoped(&scopes, b"/start.txt", Rights::READ)
+        .map_err(|_| "the read open was refused")?;
+    let mut buffer = [0u8; 8];
+    let read = state
+        .files
+        .read(&scopes, wire, &mut buffer)
+        .map_err(|_| "the read failed")?;
+    if read != 8 || &buffer[..read] != b"beginnin" {
+        return Err("the reopened handle did not read from the start");
+    }
+    state
+        .files
+        .close(&scopes, wire)
+        .map_err(|_| "the read close failed")?;
+    Ok(())
+}
+
+fn a_full_queue_refuses_and_then_recovers() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let client = state.create_task().ok_or("task pool is empty")?;
+    let server = state.create_task().ok_or("task pool is empty")?;
+    let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
+    let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
+    let (client_end, server_end) = state
+        .create_endpoint_pair(
+            client_slot,
+            server_slot,
+            Rights::SEND,
+            Rights::RECEIVE | Rights::REPLY,
+        )
+        .ok_or("the endpoint pair was refused")?;
+    let client_context = SyscallContext::new(client_slot, 1);
+    let server_context = SyscallContext::new(server_slot, 2);
+
+    for index in 0..8u64 {
+        state.outgoing_message[1] = Some(Message::new(index));
+        let outcome = dispatch(
+            &mut state,
+            &client_context,
+            nr::SEND,
+            [client_end.raw(), index, 0, 0, 0, 0],
+        );
+        if outcome.error().is_some() {
+            return Err("one of the first eight sends was refused");
+        }
+    }
+    state.outgoing_message[1] = Some(Message::new(8));
+    let outcome = dispatch(
+        &mut state,
+        &client_context,
+        nr::SEND,
+        [client_end.raw(), 8, 0, 0, 0, 0],
+    );
+    if error_of(outcome) != Some(ErrorCode::WouldBlock) {
+        return Err("the ninth send did not report backpressure");
+    }
+
+    let outcome = dispatch(
+        &mut state,
+        &server_context,
+        nr::RECV,
+        [server_end.raw(), 0, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the queued message could not be received");
+    }
+    let mut completions = [nova_ipc::endpoint::Completion::Failed {
+        waiter: 0,
+        error: ErrorCode::Invalid,
+    }; 64];
+    state.drain_completions(&mut completions);
+    state.outgoing_message[1] = Some(Message::new(8));
+    let outcome = dispatch(
+        &mut state,
+        &client_context,
+        nr::SEND,
+        [client_end.raw(), 8, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the queue did not recover after a receive");
+    }
+    Ok(())
+}
+
+fn ten_thousand_open_close_cycles_do_not_leak() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the task has no slot")?;
+    state
+        .grant_file_scope(slot, b"/", Rights::READ | Rights::WRITE)
+        .map_err(|_| "the grant was refused")?;
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/stress.txt")
+        .map_err(|_| "cannot create /stress.txt")?;
+    let scopes = state.scope_set_for(slot);
+    let path = b"/stress.txt";
+
+    for _ in 0..10_000usize {
+        let (wire, _) = state
+            .files
+            .open_scoped(&scopes, path, Rights::WRITE)
+            .map_err(|_| "the stress open was refused")?;
+        let written = state
+            .files
+            .write(&scopes, wire, b"x")
+            .map_err(|_| "the stress write failed")?;
+        if written != 1 {
+            return Err("the stress write was truncated");
+        }
+        state
+            .files
+            .close(&scopes, wire)
+            .map_err(|_| "the stress close failed")?;
+    }
+
+    if state.files.fs().open_count() != 0 {
+        return Err("the open-file table leaked");
+    }
+    Ok(())
+}
+
+fn a_dead_child_leaves_the_shell_alive() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let shell = state.create_task().ok_or("the shell slot was refused")?;
+    let child = state.create_task().ok_or("the child slot was refused")?;
+    if !state.kill_task(child) {
+        return Err("the child could not be killed");
+    }
+    let shell_alive = state
+        .task_at_slot(slot_of(&state, shell).ok_or("the shell has no slot")?)
+        .ok_or("the shell disappeared")?
+        .alive;
+    if !shell_alive {
+        return Err("the child's crash killed the shell");
+    }
+    Ok(())
+}
+
+fn four_capabilities_transfer_together() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let client = state.create_task().ok_or("task pool is empty")?;
+    let server = state.create_task().ok_or("task pool is empty")?;
+    let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
+    let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
+    let (client_end, server_end) = state
+        .create_endpoint_pair(
+            client_slot,
+            server_slot,
+            Rights::SEND,
+            Rights::RECEIVE | Rights::REPLY,
+        )
+        .ok_or("the endpoint pair was refused")?;
+    let client_context = SyscallContext::new(client_slot, 1);
+    let server_context = SyscallContext::new(server_slot, 2);
+
+    let mut handles = [CapHandle::INVALID; 4];
+    for (index, handle) in handles.iter_mut().enumerate() {
+        let outcome = dispatch(
+            &mut state,
+            &client_context,
+            nr::OBJECT_CREATE,
+            [
+                ObjectType::Notification as u64,
+                Rights::ALL.bits() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if outcome.error().is_some() {
+            return Err("one of the four objects could not be created");
+        }
+        *handle = CapHandle::from_raw(outcome.to_raw() as u64);
+        let _ = index;
+    }
+
+    let message =
+        Message::with_caps(7, &handles).map_err(|_| "the four-cap message was refused")?;
+    state.outgoing_message[1] = Some(message);
+    let outcome = dispatch(
+        &mut state,
+        &client_context,
+        nr::SEND,
+        [client_end.raw(), 7, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the four-cap send was refused");
+    }
+    let outcome = dispatch(
+        &mut state,
+        &server_context,
+        nr::RECV,
+        [server_end.raw(), 0, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the four-cap receive was refused");
+    }
+    let received = state.last_message[2].ok_or("the received message was not published")?;
+    if received.caps().len() != 4 {
+        return Err("the four capabilities did not arrive together");
+    }
+
+    let client_table = state
+        .caps_at(client_slot)
+        .ok_or("the client has no table")?;
+    for handle in handles {
+        if client_table.entry(handle).is_some() {
+            return Err("the sender kept one of the transferred capabilities");
+        }
+    }
+    Ok(())
+}
+
+fn reply_token_is_spent_after_one_reply() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let client = state.create_task().ok_or("task pool is empty")?;
+    let server = state.create_task().ok_or("task pool is empty")?;
+    let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
+    let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
+    let (client_end, server_end) = state
+        .create_endpoint_pair(
+            client_slot,
+            server_slot,
+            Rights::SEND,
+            Rights::RECEIVE | Rights::REPLY,
+        )
+        .ok_or("the endpoint pair was refused")?;
+    let client_context = SyscallContext::new(client_slot, 1);
+    let server_context = SyscallContext::new(server_slot, 2);
+
+    state.outgoing_message[1] = Some(Message::new(42));
+    let outcome = dispatch(
+        &mut state,
+        &client_context,
+        nr::CALL,
+        [client_end.raw(), 42, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the call was refused");
+    }
+    let outcome = dispatch(
+        &mut state,
+        &server_context,
+        nr::RECV,
+        [server_end.raw(), 0, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the call was not received");
+    }
+    let token = state.last_token[2].ok_or("no reply token was delivered")?;
+
+    state.outgoing_message[2] = Some(Message::new(7));
+    let outcome = dispatch(
+        &mut state,
+        &server_context,
+        nr::REPLY,
+        [server_end.raw(), token.to_raw(), 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the first reply was refused");
+    }
+    let outcome = dispatch(
+        &mut state,
+        &server_context,
+        nr::REPLY,
+        [server_end.raw(), token.to_raw(), 0, 0, 0, 0],
+    );
+    if error_of(outcome).is_none() {
+        return Err("the spent reply token was accepted again");
+    }
+    Ok(())
+}
+
+fn a_reused_object_slot_does_not_revive_a_stale_handle() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the task has no slot")?;
+    let context = SyscallContext::new(slot, 1);
+
+    let outcome = dispatch(
+        &mut state,
+        &context,
+        nr::OBJECT_CREATE,
+        [
+            ObjectType::Notification as u64,
+            Rights::ALL.bits() as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    if outcome.error().is_some() {
+        return Err("the first object could not be created");
+    }
+    let old = CapHandle::from_raw(outcome.to_raw() as u64);
+    let outcome = dispatch(
+        &mut state,
+        &context,
+        nr::OBJECT_DESTROY,
+        [old.raw(), 0, 0, 0, 0, 0],
+    );
+    if outcome.error().is_some() {
+        return Err("the first object could not be destroyed");
+    }
+
+    let outcome = dispatch(
+        &mut state,
+        &context,
+        nr::OBJECT_CREATE,
+        [
+            ObjectType::Notification as u64,
+            Rights::ALL.bits() as u64,
+            0,
+            0,
+            0,
+            0,
+        ],
+    );
+    if outcome.error().is_some() {
+        return Err("the replacement object could not be created");
+    }
+    let new = CapHandle::from_raw(outcome.to_raw() as u64);
+    let table = state
+        .caps_at(slot)
+        .ok_or("the task has no capability table")?;
+    if table.resolve(old).is_ok() {
+        return Err("the destroyed handle was still usable");
+    }
+    if table.entry(new).is_none() {
+        return Err("the replacement handle was not valid");
+    }
+    Ok(())
+}
+
+fn ten_thousand_create_destroy_cycles_do_not_leak() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the task has no slot")?;
+    let context = SyscallContext::new(slot, 1);
+    let baseline = state.objects.count();
+
+    for _ in 0..10_000usize {
+        let outcome = dispatch(
+            &mut state,
+            &context,
+            nr::OBJECT_CREATE,
+            [
+                ObjectType::Notification as u64,
+                Rights::ALL.bits() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+        );
+        if outcome.error().is_some() {
+            return Err("a create in the stress loop was refused");
+        }
+        let handle = CapHandle::from_raw(outcome.to_raw() as u64);
+        let outcome = dispatch(
+            &mut state,
+            &context,
+            nr::OBJECT_DESTROY,
+            [handle.raw(), 0, 0, 0, 0, 0],
+        );
+        if outcome.error().is_some() {
+            return Err("a destroy in the stress loop was refused");
+        }
+        if state.objects.count() != baseline {
+            return Err("the object registry leaked a slot");
+        }
+    }
+    Ok(())
+}
 
 /// A fresh kernel service state, with a task that holds a root capability.
 ///
@@ -497,7 +1094,7 @@ fn send_only_refuses_receive() -> Result<(), &'static str> {
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
     // The client gets SEND only; the server gets RECEIVE and REPLY.
-    let (client_end, _server_end) = state
+    let (client_end, server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
@@ -570,7 +1167,7 @@ fn send_on_receive_only_is_denied() -> Result<(), &'static str> {
     let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
-    let (client_end, _server_end) = state
+    let (client_end, server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
@@ -612,7 +1209,8 @@ fn send_on_receive_only_is_denied() -> Result<(), &'static str> {
 /// than a move, the receiver would hold a handle that names the sender's
 /// slot, and the two tables would be aliasing one entry.
 fn transfer_lands_in_receiver() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, server_slot, handle, received) = transfer_setup()?;
+    let (state, _client, _server, client_slot, server_slot, handle, original, received) =
+        transfer_setup()?;
     let _ = &state;
 
     // The message the receiver collected must carry a capability.
@@ -639,6 +1237,12 @@ fn transfer_lands_in_receiver() -> Result<(), &'static str> {
     // And it must be a *different* handle from the sender's: the sender's
     // slot number is a property of the sender's table.
     if transferred.slot() == handle.slot() && transferred.generation() == handle.generation() {
+        crate::klog!(
+            crate::logger::Level::Info,
+            "DBG handle={:?} transferred={:?}",
+            handle,
+            transferred
+        );
         return Err("the receiver was handed the sender's handle");
     }
     let _ = client_slot;
@@ -651,7 +1255,8 @@ fn transfer_lands_in_receiver() -> Result<(), &'static str> {
 /// authority could be handed to a second recipient, and both would believe
 /// they held the only copy of it.
 fn sender_loses_the_capability() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, _server_slot, handle, _received) = transfer_setup()?;
+    let (state, _client, _server, client_slot, _server_slot, handle, _original, _received) =
+        transfer_setup()?;
     let client_table = state
         .caps_at(client_slot)
         .ok_or("the client has no table")?;
@@ -667,14 +1272,8 @@ fn sender_loses_the_capability() -> Result<(), &'static str> {
 /// the object would leave the receiver holding authority over nothing, which
 /// looks like success and is not.
 fn transfer_names_same_object() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, server_slot, handle, received) = transfer_setup()?;
-    let client_table = state
-        .caps_at(client_slot)
-        .ok_or("the client has no table")?;
-    let original = client_table
-        .object_ref(handle)
-        .ok_or("the sender's capability names no object")?;
-
+    let (state, _client, _server, client_slot, server_slot, handle, original, received) =
+        transfer_setup()?;
     let caps = received.caps();
     if caps.is_empty() {
         return Err("the received message carries no capability");
@@ -705,6 +1304,7 @@ fn transfer_setup() -> Result<
         usize,
         usize,
         CapHandle,
+        ObjectRef,
         Message,
     ),
     &'static str,
@@ -715,7 +1315,7 @@ fn transfer_setup() -> Result<
     let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
-    let (client_end, _server_end) = state
+    let (client_end, server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
@@ -744,6 +1344,14 @@ fn transfer_setup() -> Result<
         return Err("the client could not create an object to transfer");
     }
     let handle = CapHandle::from_raw(outcome.to_raw() as u64);
+    let original = {
+        let client_table = state
+            .caps_at(client_slot)
+            .ok_or("the client has no table")?;
+        client_table
+            .object_ref(handle)
+            .ok_or("the sender's capability names no object")?
+    };
 
     // Stage the message carrying the capability, the way the entry path
     // would after copying the caller's bytes into the kernel's buffer.
@@ -769,7 +1377,7 @@ fn transfer_setup() -> Result<
         &mut state,
         &server_context,
         nr::RECV,
-        [_server_end.raw(), 0, 0, 0, 0, 0],
+        [server_end.raw(), 0, 0, 0, 0, 0],
     );
     if outcome.error().is_some() {
         return Err("the receive was refused");
@@ -783,6 +1391,7 @@ fn transfer_setup() -> Result<
         client_slot,
         server_slot,
         handle,
+        original,
         received,
     ))
 }
@@ -918,12 +1527,12 @@ fn dead_peer_wakes_waiter() -> Result<(), &'static str> {
     let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
-    let (_client_end, server_end) = state
+    let (client_end, _server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
-            Rights::SEND,
             Rights::RECEIVE | Rights::REPLY,
+            Rights::SEND,
         )
         .ok_or("the endpoint pair was refused")?;
 
@@ -933,9 +1542,15 @@ fn dead_peer_wakes_waiter() -> Result<(), &'static str> {
         &mut state,
         &client_context,
         nr::RECV,
-        [server_end.raw(), 0, 0, 0, 0, 0],
+        [client_end.raw(), 0, 0, 0, 0, 0],
     );
     if !outcome.is_blocked() {
+        crate::klog!(
+            crate::logger::Level::Info,
+            "DBG recv outcome={:?} error={:?}",
+            outcome,
+            outcome.error()
+        );
         return Err("the client did not park: the receive completed immediately");
     }
 
@@ -971,12 +1586,12 @@ fn woken_waiter_is_not_parked() -> Result<(), &'static str> {
     let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
-    let (_client_end, server_end) = state
+    let (client_end, _server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
-            Rights::SEND,
             Rights::RECEIVE | Rights::REPLY,
+            Rights::SEND,
         )
         .ok_or("the endpoint pair was refused")?;
 
@@ -985,7 +1600,7 @@ fn woken_waiter_is_not_parked() -> Result<(), &'static str> {
         &mut state,
         &client_context,
         nr::RECV,
-        [server_end.raw(), 0, 0, 0, 0, 0],
+        [client_end.raw(), 0, 0, 0, 0, 0],
     );
 
     if !state.kill_task(server) {
@@ -1140,21 +1755,21 @@ fn revoked_endpoint_refuses_receive() -> Result<(), &'static str> {
     let client_slot = slot_of(&state, client).ok_or("the client has no slot")?;
     let server_slot = slot_of(&state, server).ok_or("the server has no slot")?;
 
-    let (_client_end, server_end) = state
+    let (client_end, _server_end) = state
         .create_endpoint_pair(
             client_slot,
             server_slot,
-            Rights::SEND,
             Rights::RECEIVE | Rights::REPLY,
+            Rights::SEND,
         )
         .ok_or("the endpoint pair was refused")?;
 
-    let server_context = SyscallContext::new(server_slot, 2);
+    let client_context = SyscallContext::new(client_slot, 1);
     let outcome = dispatch(
         &mut state,
-        &server_context,
+        &client_context,
         nr::CAP_REVOKE,
-        [server_end.raw(), 0, 0, 0, 0, 0],
+        [client_end.raw(), 0, 0, 0, 0, 0],
     );
     if outcome.error().is_some() {
         return Err("the revocation was refused");
@@ -1162,9 +1777,9 @@ fn revoked_endpoint_refuses_receive() -> Result<(), &'static str> {
 
     let outcome = dispatch(
         &mut state,
-        &server_context,
+        &client_context,
         nr::RECV,
-        [server_end.raw(), 0, 0, 0, 0, 0],
+        [client_end.raw(), 0, 0, 0, 0, 0],
     );
     match error_of(outcome) {
         Some(ErrorCode::Revoked) => Ok(()),
@@ -1200,6 +1815,12 @@ fn no_cap_cannot_create() -> Result<(), &'static str> {
         ],
     );
     if error_of(outcome) != Some(ErrorCode::Denied) {
+        crate::klog!(
+            crate::logger::Level::Info,
+            "DBG object_create outcome={:?} error={:?}",
+            outcome,
+            outcome.error()
+        );
         return Err("a task with no capability created an object");
     }
     Ok(())
@@ -1471,7 +2092,14 @@ fn grant_covers_itself() -> Result<(), &'static str> {
     match state.files.open_scoped(&scopes, b"/docs", Rights::READ) {
         Ok(_) => Ok(()),
         Err(FsError::Denied) => Err("the grant did not cover its own directory"),
-        Err(_) => Err("the open failed for the wrong reason"),
+        Err(other) => {
+            crate::klog!(
+                crate::logger::Level::Info,
+                "DBG open_scoped err={:?}",
+                other
+            );
+            Err("the open failed for the wrong reason")
+        }
     }
 }
 

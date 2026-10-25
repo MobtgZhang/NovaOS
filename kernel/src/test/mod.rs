@@ -69,6 +69,7 @@ pub const SUITE_NAMES: &[&str] = &[
     "ramfs_write_read",
     "protocol_version_mismatch",
     "service_restart_after_crash",
+    "initramfs_boot",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

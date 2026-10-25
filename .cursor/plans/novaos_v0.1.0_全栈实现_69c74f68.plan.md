@@ -7,34 +7,34 @@ todos:
     status: completed
   - id: m1-boot
     content: M1：端口 IO 串口 + limine BootInfo 校验 + GDT/IDT/TSS + 异常处理 + bitmap 物理页分配器（含 host 单测）
-    status: in_progress
+    status: completed
   - id: m2-paging-user
     content: M2：递归页表与 AddressSpace + 地址布局文档 + 线程上下文与 syscall 入口（iretq）+ nova-elf 加载器 + user/nova-rt
-    status: pending
+    status: completed
   - id: m2-sched
     content: M2：PIT 抢占 + Round-Robin 调度 + 线程退出回收，通过进程隔离与抢占验收测试
-    status: pending
+    status: completed
   - id: m3-cap
     content: M3：nova-abi 冻结 + CapabilityTable（权利收缩/handle generation 不变式 host 单测）+ 内核对象注册表
-    status: pending
+    status: completed
   - id: m3-ipc
     content: M3：Endpoint send/recv/call/reply + ReplyToken 一次性 + cap 原子转授 + 对端死亡唤醒与超时丢弃
-    status: pending
+    status: completed
   - id: m3-init
     content: M3：initramfs 打包 + 首个 init 用户进程 + initramfs 引导，启动 EchoServer 客户端/服务端 IPC 验收
-    status: pending
+    status: completed
   - id: m4-services
     content: M4：ServiceManager（依赖/READY/重启窗口）+ nova-protocols 版本化 + console/file 服务协议
-    status: pending
+    status: completed
   - id: m4-ramfs
     content: M4：RAMFS + FileServer + 文件能力作用域授权 + 路径规范化与 checked arithmetic
-    status: pending
+    status: completed
   - id: m4-shell
     content: M4：ConsoleServer + 用户态单线程 executor + Shell 内建 help/ls/cat/echo/ps，完成 M4 全部门槛测试
-    status: pending
+    status: completed
   - id: final-dod
     content: 收尾：第 19.3 节反例测试全通过 + fmt/clippy 零告警 + docs/abi 完善 + 干净环境可复现构建验证
-    status: pending
+    status: completed
 isProject: false
 ---
 
