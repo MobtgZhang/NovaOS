@@ -645,8 +645,22 @@ impl Channel {
             });
         }
 
-        // The dead side's own parked receiver: that thread is gone too.
-        self.sides[side.index()].receiver = None;
+        // The dead side's own parked receiver: it was waiting on a side that
+        // will never produce a message again, so it must be woken rather
+        // than left parked — a parked thread nobody will ever wake is a hung
+        // thread, which is the worst outcome the peer-death path exists to
+        // prevent.
+        //
+        // The waiter is not necessarily the dead task's own thread: a task
+        // may hold a receive view of its peer's endpoint, and that waiter
+        // belongs to a task that is still alive and must be told why its
+        // wait ended.
+        if let Some(receiver) = self.sides[side.index()].receiver.take() {
+            self.completions.push(Completion::Failed {
+                waiter: receiver,
+                error: ErrorCode::PeerDied,
+            });
+        }
 
         // Outstanding calls: a caller whose replier died is woken, and a
         // caller that died itself has its slot cleaned up.

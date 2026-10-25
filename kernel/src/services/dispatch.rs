@@ -78,6 +78,7 @@ use nova_ipc::message::Message;
 use crate::services::cap;
 use crate::services::ipc::{IpcOutcome, SelfTransfer, TableTransfer};
 use crate::services::object::ObjectKind;
+use crate::services::process;
 use crate::services::state;
 use crate::services::two_caps_mut;
 use crate::services::{KernelState, KernelStateParts};
@@ -241,6 +242,19 @@ pub fn dispatch_typed(
         nr::REPLY => reply(kernel, context, args),
         nr::YIELD => SyscallOutcome::Value(0),
         nr::THREAD_EXIT => SyscallOutcome::Value(args[0] as i64),
+        nr::ENDPOINT_CREATE => match process::create_endpoint_pair() {
+            Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
+            Err(code) => SyscallOutcome::Failed(code),
+        },
+        nr::ENDPOINT_PEER_CREATE => match process::take_pending_endpoint() {
+            Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
+            Err(code) => SyscallOutcome::Failed(code),
+        },
+        nr::ENDPOINT_SELF => match process::management_endpoint() {
+            Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
+            Err(code) => SyscallOutcome::Failed(code),
+        },
+        nr::PROCESS_COUNT => SyscallOutcome::Value(process::live_task_count() as i64),
         _ => SyscallOutcome::Failed(ErrorCode::Unsupported),
     }
 }
@@ -259,6 +273,12 @@ const fn version_word() -> i64 {
 /// the caller: the root capability is gone (`E_REVOKED`), the root exists but
 /// does not carry `SPAWN` (`E_DENIED`), and the caller's task does not exist
 /// at all (`E_BAD_HANDLE`).
+///
+/// A task whose root capability was never minted is a fourth case, and it is
+/// `E_DENIED` rather than `E_BAD_HANDLE`: the task exists and can be
+/// dispatched to, it simply holds no authority at all. `E_BAD_HANDLE` would
+/// say the caller named a capability that does not exist, which is a
+/// statement about the *argument* rather than about the caller's authority.
 fn check_spawn_authority(kernel: &KernelState, context: &SyscallContext) -> Result<(), ErrorCode> {
     let Some(task) = kernel.task_at_slot(context.task_slot) else {
         return Err(ErrorCode::BadHandle);
@@ -266,8 +286,8 @@ fn check_spawn_authority(kernel: &KernelState, context: &SyscallContext) -> Resu
     let Some(table) = kernel.caps_at(context.task_slot) else {
         return Err(ErrorCode::BadHandle);
     };
-    let entry = table.resolve(task.root)?;
-    if !entry.rights.contains(Rights::SPAWN) {
+    let rights = table.root_authority(task.root)?;
+    if !rights.contains(Rights::SPAWN) {
         return Err(ErrorCode::Denied);
     }
     Ok(())
@@ -395,6 +415,7 @@ fn object_destroy(
     };
     let revoked = cap::revoke_object(table, objects, object_ref);
     let _ = revoked;
+    let _ = table.destroy(handle);
     SyscallOutcome::Value(0)
 }
 

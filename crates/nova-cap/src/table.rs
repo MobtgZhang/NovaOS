@@ -220,10 +220,15 @@ impl CapabilityTable {
         // whole-table assignment builds a fresh table on the stack first,
         // and a table is tens of kilobytes.
         self.slots = [Slot::Free { next_generation: 1 }; MAX_CAPS];
+        // The free stack is rebuilt in the same order `new` builds it, so a
+        // cleared table allocates exactly as a fresh one does. The order is
+        // part of the contract, not an accident: a table whose first
+        // allocation differs from a fresh table's makes a handle's slot
+        // depend on how the table was reached.
         self.free_len = 0;
         let mut slot = MAX_CAPS - 1;
         while slot >= RESERVED_SLOTS {
-            self.free_stack[slot] = slot as u32;
+            self.free_stack[self.free_len] = slot as u32;
             self.free_len += 1;
             slot -= 1;
         }
@@ -276,7 +281,56 @@ impl CapabilityTable {
         object_ref: ObjectRef,
         rights: Rights,
     ) -> Result<CapHandle, ErrorCode> {
-        self.allocate(object_ref, rights, None)
+        self.allocate(object_ref, rights, None, None)
+    }
+
+    /// Mint a fresh capability for an object, in a slot other than `avoid`.
+    ///
+    /// # Why the avoided slot matters
+    ///
+    /// A handle is only meaningful within the table that issued it, so two
+    /// tables may hold numerically identical handles without any ambiguity
+    /// between them. But a capability that *travels* from one table to
+    /// another arrives as a new entry minted by the receiving table, and that
+    /// entry must not occupy the source's slot: a receiver that was handed
+    /// the sender's own handle value would have a number that says nothing
+    /// about who issued it, and every layer that logs, echoes, or compares
+    /// handles would be comparing two different capabilities as if they were
+    /// one.
+    ///
+    /// The avoided slot is the *source's* slot. The receiving table's
+    /// allocation order is its own business; the only thing that must not
+    /// happen is the source's slot being reused for the transferred entry.
+    ///
+    /// Fails with [`ErrorCode::NoMemory`] when every free slot is the avoided
+    /// one. That is a quota outcome, not a bug: the table has one slot left
+    /// and it may not be used for this entry.
+    pub fn create_excluding(
+        &mut self,
+        object_ref: ObjectRef,
+        rights: Rights,
+        avoid: CapHandle,
+    ) -> Result<CapHandle, ErrorCode> {
+        self.allocate(object_ref, rights, None, Some(avoid.slot()))
+    }
+
+    /// The authority a task's *root* capability confers.
+    ///
+    /// A table with no root capability at all holds no authority, and the
+    /// refusal is [`ErrorCode::Denied`]: the task exists and can be
+    /// dispatched to, it simply has nothing to act with. Reporting
+    /// [`ErrorCode::BadHandle`] instead would claim that the caller named a
+    /// capability that does not exist, which is a different statement — and
+    /// one the caller cannot act on, because it has no handle to fix.
+    ///
+    /// A *revoked* root reports [`ErrorCode::Revoked`] rather than
+    /// [`ErrorCode::Denied`], so a holder learns that it lost authority
+    /// instead of being told it never had it.
+    pub fn root_authority(&self, root: CapHandle) -> Result<Rights, ErrorCode> {
+        if root.is_invalid() {
+            return Err(ErrorCode::Denied);
+        }
+        Ok(self.resolve(root)?.rights)
     }
 
     /// Derive a narrower capability from one already held.
@@ -302,7 +356,7 @@ impl CapabilityTable {
         // the narrowing guarantee: a child can never hold a right its parent
         // lacked, whatever the caller asked for.
         let narrowed = entry.rights.intersect(requested);
-        self.allocate(entry.object_ref, narrowed, Some(parent))
+        self.allocate(entry.object_ref, narrowed, Some(parent), None)
     }
 
     /// Revoke a capability.
@@ -520,11 +574,19 @@ impl CapabilityTable {
     }
 
     /// Take a free slot and put an entry in it.
+    ///
+    /// `avoid_slot` names a slot the entry may not occupy. It exists for the
+    /// capability-transfer path, where the destination table must not hand
+    /// back the very slot number the source used: a handle is only
+    /// meaningful within the table that issued it, so a receiver holding the
+    /// sender's own handle value would hold a number that says nothing about
+    /// who issued it.
     fn allocate(
         &mut self,
         object_ref: ObjectRef,
         rights: Rights,
         derivation_parent: Option<CapHandle>,
+        avoid_slot: Option<u32>,
     ) -> Result<CapHandle, ErrorCode> {
         if self.free_len == 0 {
             // The table is full. This is an object quota, not a transient
@@ -532,8 +594,42 @@ impl CapabilityTable {
             // "busy": the caller must free something, not retry.
             return Err(ErrorCode::NoMemory);
         }
-        self.free_len -= 1;
-        let slot = self.free_stack[self.free_len] as usize;
+        // Pick the slot and pop it off the free stack in one step.
+        //
+        // The stack's top is the next slot to hand out. When a slot is
+        // avoided, the search walks down the stack for the first entry that
+        // is not the avoided one; that entry is then moved into the top and
+        // the top is dropped, so the stack keeps its shape and the avoided
+        // slot stays on it — it is still free, it is simply not this entry's
+        // slot.
+        let slot = match avoid_slot {
+            None => {
+                let slot = self.free_stack[self.free_len - 1] as usize;
+                self.free_len -= 1;
+                slot
+            }
+            Some(avoided) => {
+                let mut chosen = None;
+                let mut index = self.free_len;
+                while index > 0 {
+                    index -= 1;
+                    if self.free_stack[index] == avoided {
+                        continue;
+                    }
+                    chosen = Some(index);
+                    break;
+                }
+                let Some(chosen) = chosen else {
+                    // Every free slot is the avoided one, so there is nowhere
+                    // this entry may go. That is a quota outcome, not a bug.
+                    return Err(ErrorCode::NoMemory);
+                };
+                let value = self.free_stack[chosen] as usize;
+                self.free_stack[chosen] = self.free_stack[self.free_len - 1];
+                self.free_len -= 1;
+                value
+            }
+        };
         let generation = match self.slots[slot] {
             Slot::Free { next_generation } => next_generation,
             // The free stack only ever holds free slots; this arm exists so a

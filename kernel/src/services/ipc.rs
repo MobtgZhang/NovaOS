@@ -172,7 +172,7 @@ impl IpcRegistry {
         if self.channels[slot].is_none() {
             return false;
         }
-        if first >= MAX_TASKS || second >= MAX_TASKS || first == second {
+        if first >= MAX_TASKS || second >= MAX_TASKS {
             return false;
         }
         if self.holders[slot][0].is_some() || self.holders[slot][1].is_some() {
@@ -298,7 +298,13 @@ impl CapabilityTransfer for TableTransfer<'_> {
         // Mint the destination-side handle now, so a failure here is caught
         // before anything is committed. The source entry is untouched: it is
         // only removed at commit time.
-        self.destination.create(object_ref, rights)
+        //
+        // The destination's handle must not carry the source's slot number. A
+        // handle is only meaningful within the table that issued it, so a
+        // receiver holding the sender's own handle value would hold a number
+        // that says nothing about which table minted it.
+        self.destination
+            .create_excluding(object_ref, rights, source)
     }
 
     fn commit(&mut self, _prepared: CapHandle, source: CapHandle) {
