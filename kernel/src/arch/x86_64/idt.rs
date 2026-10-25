@@ -25,6 +25,7 @@ use super::port_io;
 use crate::arch::shared::fault::{FaultInfo, FaultKind, FaultOutcome};
 use crate::klog;
 use crate::logger::Level;
+use crate::syscall::UserRegisters;
 
 /// Number of interrupt vectors the IDT covers.
 pub const IDT_ENTRIES: usize = 256;
@@ -1215,6 +1216,117 @@ stub!(general_protection_fault_stub, 13, "");
 stub!(page_fault_stub, 14, "");
 stub!(alignment_check_stub, 17, "");
 
+// The timer interrupt.
+//
+// It uses the *same* stub shape as the exception stubs rather than a special
+// one, because the CPU's frame for an interrupt is identical to its frame for
+// an exception that pushes no error code: five words. The stub's zero
+// placeholder makes the shape uniform, exactly as it does for the exceptions.
+//
+// The difference is what happens next: the timer handler does not report a
+// fault and halt. It accounts a tick and asks the scheduler whether to
+// preempt, and the *scheduler* may switch threads — which means the handler
+// must not return through the frame it was given, but instead resume the
+// thread the scheduler chose.
+//
+// The scheduler's switch replaces the whole register file and the stack
+// pointer, so the frame this stub pushed is simply abandoned. That is why the
+// handler is `-> !`: it ends in a context switch or in an `iretq` that
+// restores the frame.
+#[unsafe(naked)]
+unsafe extern "C" fn timer_stub() -> ! {
+    core::arch::naked_asm!(
+        // SAFETY: each push stores one word of the interrupted register file on
+        // the current kernel stack. The timer stub saves all fifteen because
+        // user code does not follow the SysV callee-save convention.
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // SAFETY: an eight-byte pad restores 16-byte alignment for the call.
+        // `RDI` points to `R15`, the lowest saved word, which is where
+        // `UserRegisters` begins.
+        "sub rsp, 8",
+        "mov rdi, rsp",
+        "add rdi, 8",
+        "call nova_kernel_timer_handler",
+        // SAFETY: the handler is declared `-> !`; this terminator exists only
+        // for the naked function's type checking.
+        "ud2",
+    )
+}
+
+/// The timer interrupt handler.
+///
+/// # What it does
+///
+/// 1. Acknowledges the interrupt at the PIC, so the controller will raise the
+///    next one.
+/// 2. Accounts a tick and asks the scheduler whether the running thread's
+///    timeslice has expired.
+/// 3. Either resumes the interrupted thread, or lets the scheduler switch to
+///    another one.
+///
+/// # Why it does not return through the frame
+///
+/// The scheduler's context switch replaces the whole register file and the
+/// stack pointer, so the frame the CPU pushed is abandoned rather than
+/// popped. The handler therefore ends either in a context switch (which never
+/// returns) or in an `iretq` that restores the frame and returns to the
+/// interrupted code.
+///
+/// The distinction is not cosmetic. A handler that popped the frame and
+/// returned normally would resume the interrupted thread *and* the switched-to
+/// thread — two threads running at once, with one of them holding a stack
+/// pointer into the other's stack.
+///
+/// # Safety
+///
+/// Reached only from the timer stub, with a valid kernel stack and an
+/// installed IDT.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nova_kernel_timer_handler(registers: *const UserRegisters) -> ! {
+    crate::klog!(crate::logger::Level::Info, "debug: timer entered");
+    // SAFETY: delegated to this function's contract. The EOI is only valid
+    // while servicing the interrupt, which is exactly what this is.
+    unsafe {
+        super::apic::eoi();
+    }
+
+    // SAFETY: delegated to this function's contract. The scheduler switches
+    // threads with interrupts masked, and the tick accounting is a single
+    // writer.
+    unsafe {
+        crate::sched::handle_timer_interrupt(registers);
+    }
+
+    // The scheduler did not switch, so the interrupted thread resumes. The
+    // `iretq` pops the frame the stub's uniformisation made: the error-code
+    // placeholder, `RIP`, `CS`, `RFLAGS`, `RSP` and `SS`.
+    //
+    // The frame the *stub* built is one word lower than the frame the CPU
+    // pushed, because the stub opened a slot for the placeholder. `iretq`
+    // starts at the frame's `RIP`, so the placeholder word has to be stepped
+    // over first.
+    //
+    // SAFETY: the CPU's frame is on the kernel stack, and the six words above
+    // are the ones `iretq` consumes.
+    unsafe {
+        core::arch::asm!("add rsp, 8", "iretq", options(noreturn),);
+    }
+}
+
 /// The raw bytes of the IDT, for boot-time diagnosis.
 ///
 /// Returns a pointer to the table itself rather than a copy: the table is
@@ -1368,6 +1480,13 @@ pub unsafe fn init() {
         set!(19, simd_stub);
         set!(20, virtualization_stub);
         set!(21, control_protection_stub);
+
+        // The timer interrupt, at the vector the PIC was remapped to.
+        //
+        // This is the *only* hardware interrupt with a handler. Every other
+        // line stays masked at the PIC, so an unmasked line with no handler
+        // cannot fire into a zeroed gate.
+        set!(super::intr::IRQ_BASE_MASTER as usize, timer_stub);
 
         // Vectors 22-31 are reserved. Leaving them zero would report an
         // uninformative "unexpected interrupt", so they share a stub that at

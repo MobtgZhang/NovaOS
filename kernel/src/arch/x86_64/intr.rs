@@ -72,6 +72,14 @@ pub unsafe fn remap_pic() {
     );
 }
 
+unsafe fn route_pic() {
+    unsafe {
+        outb(0x22, 0x01);
+        outb(0x23, 0x01);
+    }
+    klog!(Level::Debug, "imcr: ISA interrupts routed to the PIC");
+}
+
 /// Mask every hardware IRQ line.
 ///
 /// NovaOS v0.1.0 drives no devices, and the PIT in M2 is the first consumer. An
@@ -127,7 +135,10 @@ pub unsafe fn send_eoi() {
 pub fn init() {
     // SAFETY: called once from `_start` with interrupts masked, so no IRQ can
     // arrive mid-sequence.
-    unsafe { remap_pic() };
+    unsafe {
+        route_pic();
+        remap_pic();
+    };
     mask_all_irqs();
 
     klog!(Level::Debug, "pic: all IRQ lines masked");

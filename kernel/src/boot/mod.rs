@@ -20,7 +20,7 @@ pub mod limine;
 
 pub use info::{BootInfo, MAX_PHYSICAL_ADDRESS, PAGE_SIZE};
 
-pub use limine::{boot_info_is_ready, capture, check_protocol_revision, read_boot_info};
+pub use limine::{boot_info_is_ready, capture, check_protocol_revision, initramfs, read_boot_info};
 
 /// The bootloader name as a NUL-trimmed string, or `"unknown"`.
 pub fn bootloader_name(info: &BootInfo) -> &str {

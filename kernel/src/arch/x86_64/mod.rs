@@ -20,10 +20,13 @@
 //! Interrupts stay masked for the whole sequence. Enabling them before the IDT is
 //! in place is the classic way to get a machine that boots and dies.
 
+pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod intr;
+pub mod msr;
 pub mod paging;
+pub mod pit;
 pub mod port_io;
 
 pub mod console;

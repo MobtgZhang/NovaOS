@@ -536,7 +536,22 @@ static mut GDT: Gdt = Gdt {
 /// `UnsafeCell` would have added a layer of indirection without adding any
 /// synchronisation that the "written exactly once before any reader exists"
 /// contract does not already provide.
-static mut TSS: TaskStateSegment = TaskStateSegment::zeroed();
+/// The TSS, under a name the assembly can reach.
+///
+/// The syscall entry stub reads `RSP0` from the TSS to find the kernel stack
+/// to switch to. `naked_asm!` accepts no operands, so the stub cannot name a
+/// Rust item the ordinary way — the target has to be reachable *by name*.
+///
+/// The name is namespaced to the kernel for the same reason
+/// `nova_kernel_idt_dispatch` is: a bare `tss` is a common symbol name, and
+/// two definitions of it would be resolved by the linker arbitrarily rather
+/// than reported.
+///
+/// This is the kernel's *only* TSS. The CPU reads it on every privilege
+/// transition and the syscall stub reads it on every syscall, so the two must
+/// see the same value — which is why there is exactly one of them.
+#[unsafe(no_mangle)]
+pub static mut nova_kernel_tss: TaskStateSegment = TaskStateSegment::zeroed();
 
 /// A stack buffer the CPU may load as a stack pointer.
 ///
@@ -751,7 +766,7 @@ static FAULT_STACK: AlignedStack<FAULT_STACK_SIZE> = AlignedStack::new();
 pub const unsafe fn tss() -> &'static TaskStateSegment {
     // SAFETY: delegated to this function's contract. `init` is the only writer
     // and it runs exactly once, before any reader exists.
-    unsafe { &*addr_of!(TSS) }
+    unsafe { &*addr_of!(nova_kernel_tss) }
 }
 
 /// Set the ring 0 stack pointer the CPU switches to on a privilege transition.
@@ -768,7 +783,7 @@ pub unsafe fn set_privilege_stack(rsp0: u64) {
     // requires: taking a reference to a packed field is an error even when the
     // field happens to be aligned.
     unsafe {
-        (&raw mut (*addr_of_mut!(TSS)).privilege_stack_table[0]).write(rsp0);
+        (&raw mut (*addr_of_mut!(nova_kernel_tss)).privilege_stack_table[0]).write(rsp0);
     }
 }
 
@@ -783,7 +798,7 @@ unsafe fn tss_mut() -> *mut TaskStateSegment {
     // `addr_of_mut!` yields a raw pointer without forming a reference, so it
     // needs no `unsafe` block of its own; the function's own `unsafe` is what
     // authorises the later writes through this pointer.
-    addr_of_mut!(TSS)
+    addr_of_mut!(nova_kernel_tss)
 }
 
 /// Install the GDT and TSS.

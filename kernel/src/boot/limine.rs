@@ -61,7 +61,9 @@ use core::num::NonZeroU64;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use limine::request::{BootloaderInfoRequest, HhdmRequest, MemmapRequest, StackSizeRequest};
+use limine::request::{
+    BootloaderInfoRequest, HhdmRequest, MemmapRequest, ModulesRequest, StackSizeRequest,
+};
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use crate::arch::shared::exit::EXIT_PANIC;
@@ -102,11 +104,50 @@ pub static LIMINE_DIRECT_MAP: HhdmRequest = HhdmRequest::new();
 #[unsafe(no_mangle)]
 pub static LIMINE_STACK_SIZE: StackSizeRequest = StackSizeRequest::new(64 * 1024);
 
+/// Request the modules the bootloader's `module_path` named.
+///
+/// M2 delivers the user-space image this way: the xtask stages the user ELF
+/// next to the kernel on the ISO and points Limine's `module_path` at it, and
+/// the bootloader hands back the file's bytes.
+///
+/// A module that is absent is not an error. The kernel boots and reports that
+/// there is no user image, which is the right degradation: a machine with no
+/// user program still runs the kernel and its test suites.
+#[unsafe(no_mangle)]
+pub static LIMINE_MODULES: ModulesRequest = ModulesRequest::new();
+
 /// The single kernel-owned copy of the boot snapshot.
 ///
 /// Written once by [`capture`], read-only thereafter. Access goes through
 /// [`read_boot_info`] rather than by naming this directly.
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
+
+/// Kernel-owned bytes of the initramfs, copied from the Limine module.
+///
+/// The bootloader may reclaim its pages after the boot hand-off, so the archive
+/// is copied once before any user process is loaded.
+static mut INITRAMFS_BYTES: [u8; INITRAMFS_CAPACITY] = [0; INITRAMFS_CAPACITY];
+
+/// Number of valid bytes in [`INITRAMFS_BYTES`].
+static mut INITRAMFS_LEN: usize = 0;
+
+/// The largest initramfs this kernel will copy.
+///
+/// Six small ELF binaries fit easily; a larger archive is refused before it can
+/// overwrite kernel-owned storage.
+const INITRAMFS_CAPACITY: usize = 256 * 1024;
+
+/// Borrow the kernel-owned initramfs snapshot.
+pub fn initramfs() -> Option<&'static [u8]> {
+    // SAFETY: this read-only snapshot is published after `capture` and is never
+    // written again; kernel access is serialised.
+    let length = unsafe { INITRAMFS_LEN };
+    if length == 0 {
+        None
+    } else {
+        Some(unsafe { &INITRAMFS_BYTES[..length] })
+    }
+}
 
 /// Flipped by [`capture`] once the snapshot is complete.
 static READY: AtomicBool = AtomicBool::new(false);
@@ -203,6 +244,34 @@ pub unsafe fn capture() -> &'static BootInfo {
                 .actual_revision()
                 .unwrap_or(crate::LIMINE_PROTOCOL_REVISION),
         );
+
+        if let Some(response) = LIMINE_MODULES.response() {
+            for module in response.modules() {
+                if module.path().ends_with("initramfs") {
+                    let bytes = module.data();
+                    if bytes.len() > INITRAMFS_CAPACITY {
+                        panic!(
+                            "limine: initramfs is {} bytes; kernel stores at most {}",
+                            bytes.len(),
+                            INITRAMFS_CAPACITY
+                        );
+                    }
+                    let target_bytes = &raw mut INITRAMFS_BYTES;
+                    (&raw mut INITRAMFS_LEN).write(bytes.len());
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        target_bytes.cast::<u8>(),
+                        bytes.len(),
+                    );
+                    klog!(
+                        Level::Debug,
+                        "limine: copied initramfs {} bytes",
+                        bytes.len()
+                    );
+                    break;
+                }
+            }
+        }
 
         // The direct map is the only route from the kernel's high addresses to
         // physical memory, so its absence is unrecoverable on either target.

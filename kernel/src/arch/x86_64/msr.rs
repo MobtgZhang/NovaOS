@@ -1,100 +1,115 @@
-//! Model-specific registers.
+//! Model-Specific Registers.
 //!
-//! # Why a separate module
+//! # Why the kernel needs three of them
 //!
-//! The `syscall` mechanism is configured entirely through MSRs, and `wrmsr`/
-//! `rdmsr` are privileged instructions that fault outside ring 0. Wrapping them
-//! in one module means the kernel has exactly one place where "read a control
-//! register" happens, and the set of MSRs the kernel touches is a short list
-//! rather than a scattering of magic numbers across the syscall and paging
-//! code.
+//! The `syscall`/`sysretq` mechanism is controlled by three MSRs, and a
+//! kernel that gets any of them wrong fails in a way that is hard to read:
 //!
-//! # The four that matter here
+//! - `EFER.SCE` — the *System Call Extension* bit. Without it the `syscall`
+//!   instruction does not exist, and executing it raises `#UD` — the same
+//!   symptom as a missing entry point, which makes the two mistakes hard to
+//!   tell apart.
+//! - `STAR` — where the kernel and user segment selectors live. The CPU reads
+//!   the user selectors out of it when a `syscall` drops the privilege level.
+//! - `LSTAR` — the entry point the `syscall` instruction jumps to.
+//! - `SFMASK` — the `RFLAGS` bits the CPU clears on entry.
 //!
-//! - `EFER` — enables the `syscall`/`sysret` instructions (`SCE`) and the
-//!   no-execute bit (`NXE`).
-//! - `STAR` — the segment selectors `syscall`/`sysret` use.
-//! - `LSTAR` — the kernel entry point's address.
-//! - `SFMASK` — the `RFLAGS` bits `syscall` clears on entry.
+//! # Why the access is inlined
+//!
+//! `RDMSR` and `WRMSR` are privileged: at ring 3 they raise `#GP`. The kernel
+//! writes them once at boot and the user program never touches them, so the
+//! operations live here as small `unsafe` helpers rather than as a general
+//! MSR API.
 
 use core::arch::asm;
 
-/// `IA32_EFER`: the extended feature-control register.
-pub const MSR_EFER: u64 = 0xC000_0080;
-/// `IA32_STAR`: the segment selectors used by `syscall` and `sysret`.
-pub const MSR_STAR: u64 = 0xC000_0081;
-/// `IA32_LSTAR`: the address of the kernel's `syscall` entry point.
-pub const MSR_LSTAR: u64 = 0xC000_0082;
-/// `IA32_SFMASK`: the `RFLAGS` bits cleared on entry to `syscall`.
-pub const MSR_SFMASK: u64 = 0xC000_0084;
-/// `IA32_FMASK`: an alias of `SFMASK` used by `sysret` on some parts.
-pub const MSR_FMASK: u64 = 0xC000_0084;
+/// `IA32_EFER` — the Extended Feature Enable register.
+pub const MSR_EFER: u32 = 0xC000_0080;
 
-/// `EFER.SCE`: the system-call extension is enabled.
-///
-/// Without it, executing `syscall` raises `#UD`, which is the same symptom as
-/// a missing entry point and makes the two mistakes hard to tell apart.
+/// `IA32_STAR` — the System Test and Architecture register.
+pub const MSR_STAR: u32 = 0xC000_0081;
+
+/// `IA32_LSTAR` — the Long System Call Target address.
+pub const MSR_LSTAR: u32 = 0xC000_0082;
+
+/// `IA32_SFMASK` — the System Call Flag Mask.
+pub const MSR_SFMASK: u32 = 0xC000_0084;
+
+/// `EFER.SCE` — the System Call Extension bit.
 pub const EFER_SCE: u64 = 1 << 0;
-/// `EFER.NXE`: the no-execute bit in page-table entries is honoured.
-///
-/// Required by the W^X rule: x86-64 has no architectural "execute" bit, so a
-/// page that is not writable is still executable until `NXE` is set. The
-/// kernel's user mappings need "readable but not executable" to exist at all.
-pub const EFER_NXE: u64 = 1 << 11;
 
-/// Read a model-specific register.
-pub fn read(msr: u64) -> u64 {
-    let value: u64;
-    // SAFETY: `rdmsr` is privileged but does not fault for any MSR the kernel
-    // reads here; the read/write pair is atomic with respect to the CPU.
+/// Read an MSR.
+///
+/// # Safety
+///
+/// The MSR must exist on this processor. Reading an MSR that does not exist
+/// raises `#GP`.
+#[inline]
+pub unsafe fn read(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+
+    // SAFETY: delegated to this function's contract. `RDMSR` is privileged and
+    // the kernel runs at ring 0. The two halves are read into separate
+    // registers and combined afterwards, because `RDMSR` writes a 64-bit value
+    // across `EDX:EAX` and the assembler cannot express that as one operand.
     unsafe {
         asm!(
             "rdmsr",
-            out("rax") value,
-            out("rdx") _,
-            in("ecx") msr as u32,
-            options(nomem, nostack, preserves_flags),
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
         );
     }
-    value
+
+    ((high as u64) << 32) | (low as u64)
 }
 
-/// Write a model-specific register.
-pub fn write(msr: u64, value: u64) {
-    // SAFETY: `wrmsr` is privileged but does not fault for any MSR the kernel
-    // writes here; the low 32 bits of the value go in `eax` and the high 32 in
-    // `edx`.
+/// Write an MSR.
+///
+/// # Safety
+///
+/// The MSR must exist on this processor, and the value must be one the
+/// processor accepts.
+#[inline]
+pub unsafe fn write(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+
+    // SAFETY: delegated to this function's contract. `WRMSR` is privileged
+    // and the kernel runs at ring 0. The value is split across `EAX:EDX`,
+    // which is the register pair the instruction reads.
     unsafe {
         asm!(
             "wrmsr",
-            in("rax") value,
-            in("rdx") 0u32,
-            in("ecx") msr as u32,
-            options(nomem, nostack, preserves_flags),
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags),
         );
     }
 }
 
-/// The current contents of `EFER`.
-pub fn efer() -> u64 {
-    read(MSR_EFER)
-}
-
-/// Set the given `EFER` bits, leaving the others alone.
+/// Set the `EFER.SCE` bit, which is what makes the `syscall` instruction
+/// exist.
 ///
-/// Read-modify-write rather than a plain store: `EFER` holds the no-execute
-/// enable alongside the system-call enable and several bits the kernel has no
-/// business clearing, and a whole-register store would silently reset them.
-pub fn set_efer(bits: u64) {
-    write(MSR_EFER, efer() | bits);
-}
+/// The other bits of `EFER` are read first and written back unchanged. Writing
+/// a bare `1` would clear every other feature the firmware enabled — and
+/// `EFER` bits include things like `LMA` (long mode active) and `NXE` (no-execute
+/// support), whose clearing would change how the machine behaves in ways that
+/// have nothing to do with the syscall path.
+///
+/// # Safety
+///
+/// Must be called at ring 0. The `EFER` MSR must exist, which it does on every
+/// processor that has long mode.
+pub unsafe fn set_efer(bit: u64) {
+    // SAFETY: reading `EFER` at ring 0 is always safe.
+    let current = unsafe { read(MSR_EFER) };
 
-/// Whether `EFER.SCE` is set.
-pub fn syscall_extension_enabled() -> bool {
-    efer() & EFER_SCE != 0
-}
-
-/// Whether `EFER.NXE` is set.
-pub fn no_execute_enabled() -> bool {
-    efer() & EFER_NXE != 0
+    // SAFETY: delegated to this function's contract. The value written is the
+    // current one with one bit added, so no other feature is disturbed.
+    unsafe {
+        write(MSR_EFER, current | bit);
+    }
 }
