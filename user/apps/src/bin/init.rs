@@ -15,5 +15,14 @@ pub extern "C" fn main() -> i64 {
         yield_now();
     }
 
-    0
+    loop {
+        for name in ["echo-server", "file-server", "console-server", "shell"] {
+            if !process::status(name) {
+                if process::exec(name).is_none() {
+                    let _ = console::write_str("[NOVA] init failed to restart service\r\n");
+                }
+            }
+        }
+        yield_now();
+    }
 }
