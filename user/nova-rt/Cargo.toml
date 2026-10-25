@@ -1,0 +1,36 @@
+[package]
+name = "nova-rt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS user-space runtime: entry point, page allocator, and formatted output"
+
+# The user runtime is a *binary*, not a library: it is the thing the kernel
+# loads and starts in ring 3, and it is the only artefact that links against
+# `user/linker.ld`. A library target would let a host build link it, which
+# cannot work — there is no `std` here and no `_start` outside the kernel's
+# world.
+[[bin]]
+name = "nova-rt"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The ABI crate is `no_std` and architecture-neutral, so it links into a ring 3
+# image unchanged. It is the single source of truth for the syscall numbers the
+# runtime issues and for the ABI version the runtime reports.
+nova-abi = { workspace = true }
+
+[lints.rust]
+# An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`
+# block, so every one of them carries an explicit SAFETY comment. The runtime's
+# unsafe surface is the whole of its privileged surface.
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Every `unsafe` block must be adjacent to a `// SAFETY:` comment.
+undocumented_unsafe_blocks = "warn"
+# An `unsafe fn` must document why it is unsafe.
+missing_safety_doc = "deny"

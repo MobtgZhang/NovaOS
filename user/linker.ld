@@ -24,6 +24,7 @@ ENTRY(_start)
 
 /* The user window's boundaries, mirrored from docs/abi/address-layout.md. */
 USER_IMAGE_BASE = 0x0000000000001000;
+USER_HEAP_BASE = 0x0000000040000000;
 USER_STACK_TOP = 0x000000007FFFF000;
 
 SECTIONS
@@ -66,13 +67,13 @@ SECTIONS
     }
 
     /* The heap. The kernel maps the pages it needs on demand; the region is
-     * reserved here so that two programs cannot have their heaps overlap. */
-    .heap ALIGN(4K) (NOLOAD) :
-    {
-        __heap_start = .;
-        . = . + 0x00100000;
-        __heap_end = .;
-    }
+     * reserved here so that two programs cannot have their heaps overlap.
+     * These are absolute symbols rather than an output section: an emitted
+     * region spanning the hole between `.bss` and the heap would enlarge the
+     * program's `p_memsz`, forcing the loader to pre-map every page. */
+    USER_HEAP_SIZE = 0x00100000;
+    __heap_start = USER_HEAP_BASE;
+    __heap_end = USER_HEAP_BASE + USER_HEAP_SIZE;
 
     /* Discard debug info: it is large, and the kernel copies the whole image
      * into user memory. */

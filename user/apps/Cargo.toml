@@ -1,0 +1,60 @@
+[package]
+name = "nova-apps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS user-space applications"
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "init"
+path = "src/bin/init.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "echo-server"
+path = "src/bin/echo-server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "echo-client"
+path = "src/bin/echo-client.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "file-server"
+path = "src/bin/file-server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "console-server"
+path = "src/bin/console-server.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "shell"
+path = "src/bin/shell.rs"
+test = false
+bench = false
+
+[dependencies]
+nova-abi = { workspace = true }
+nova-ipc = { workspace = true }
+nova-protocols = { workspace = true }
+nova-fs = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"
