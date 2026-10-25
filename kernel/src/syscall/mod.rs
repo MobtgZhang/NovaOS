@@ -423,6 +423,10 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         return process_exec(args);
     }
 
+    if number == nova_abi::nr::PROCESS_STATUS.number() as u64 {
+        return process_status(args);
+    }
+
     stage_outgoing_payload(number, args);
 
     let context = crate::task::current_syscall_context();
@@ -472,10 +476,24 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
 }
 
 /// Copy a bounded byte range out of the calling process's address space.
+/// Validate that `[pointer, pointer + length)` lies in the user address window.
+fn user_range(pointer: u64, length: u64) -> Result<(), ErrorCode> {
+    if length == 0 {
+        return Err(ErrorCode::Invalid);
+    }
+    let window = crate::mm::address_space::user_window();
+    let end = pointer.checked_add(length).ok_or(ErrorCode::Invalid)?;
+    if pointer < window.start || end > window.end {
+        return Err(ErrorCode::Invalid);
+    }
+    Ok(())
+}
+
 fn copy_from_user(buffer: &mut [u8], pointer: u64, length: u64) -> Result<(), ErrorCode> {
     if length as usize > buffer.len() {
         return Err(ErrorCode::Invalid);
     }
+    user_range(pointer, length)?;
     let Some(space) = crate::task::current_thread_space() else {
         return Err(ErrorCode::BadHandle);
     };
@@ -486,7 +504,8 @@ fn copy_from_user(buffer: &mut [u8], pointer: u64, length: u64) -> Result<(), Er
         let address = pointer + copied as u64;
         let offset = address & (page_size - 1);
         let chunk = core::cmp::min(page_size - offset, (length as usize - copied) as u64) as usize;
-        let Some(phys) = crate::mm::address_space::translate(&space, address & !(page_size - 1))
+        let Some(phys) =
+            crate::mm::address_space::translate_user(&space, address & !(page_size - 1))
         else {
             return Err(ErrorCode::Invalid);
         };
@@ -506,6 +525,7 @@ fn copy_from_user(buffer: &mut [u8], pointer: u64, length: u64) -> Result<(), Er
 
 /// Copy bytes into the calling process's address space.
 fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
+    user_range(pointer, bytes.len() as u64)?;
     let Some(space) = crate::task::current_thread_space() else {
         return Err(ErrorCode::BadHandle);
     };
@@ -516,7 +536,8 @@ fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
         let address = pointer + copied as u64;
         let offset = address & (page_size - 1);
         let chunk = core::cmp::min(page_size - offset, (bytes.len() - copied) as u64) as usize;
-        let Some(phys) = crate::mm::address_space::translate(&space, address & !(page_size - 1))
+        let Some(phys) =
+            crate::mm::address_space::translate_user(&space, address & !(page_size - 1))
         else {
             return Err(ErrorCode::Invalid);
         };
@@ -609,6 +630,24 @@ fn process_exec(args: [u64; 6]) -> Outcome {
     }
 }
 
+/// Report whether an initramfs service still has a live task.
+fn process_status(args: [u64; 6]) -> Outcome {
+    const MAX_NAME: usize = 32;
+    let mut name = [0u8; MAX_NAME];
+    if args[1] == 0 || args[1] as usize > MAX_NAME {
+        return failed(ErrorCode::Invalid);
+    }
+    if copy_from_user(&mut name[..args[1] as usize], args[0], args[1]).is_err() {
+        return failed(ErrorCode::Invalid);
+    }
+
+    let alive = crate::services::process::service_is_alive(&name[..args[1] as usize]);
+    Outcome {
+        result: nova_core::syscall::SyscallResult::Value(alive as i64),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    }
+}
+
 /// A dispatch failure with the default `Continue` effect.
 const fn failed(code: ErrorCode) -> Outcome {
     Outcome {
@@ -655,6 +694,14 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
         };
     }
 
+    // Even a short console write must resolve only pages the caller owns.
+    if user_range(pointer, length).is_err() {
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Failed(nova_abi::ErrorCode::Invalid),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
     // The caller's address space is the one the running thread has. The copy
     // is done *through the direct map*, page by page, because the kernel may
     // not have the user's address space loaded in CR3 while it is servicing
@@ -676,7 +723,8 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
         let offset = address & (page_size - 1);
         let chunk = core::cmp::min(page_size - offset, length - copied);
 
-        let Some(phys) = crate::mm::address_space::translate(&space, address & !(page_size - 1))
+        let Some(phys) =
+            crate::mm::address_space::translate_user(&space, address & !(page_size - 1))
         else {
             // The buffer runs off the end of the caller's mapped memory. The
             // bytes written so far are real, so the count is returned — a
