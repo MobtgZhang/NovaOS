@@ -34,6 +34,7 @@
 pub mod cap;
 pub mod error;
 pub mod ipc;
+pub mod layout;
 pub mod syscall;
 
 pub use cap::{CapHandle, Rights};

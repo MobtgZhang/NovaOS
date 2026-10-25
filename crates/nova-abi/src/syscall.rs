@@ -120,6 +120,41 @@ pub mod nr {
     /// and the kernel wakes it on revocation.
     pub const CANCEL_WAIT: Syscall = Syscall(14);
 
+    /// Write to a file descriptor.
+    ///
+    /// Arguments: `fd`, `buffer`, `length`. The buffer is a *user* address; the
+    /// kernel copies out of it. Returns the number of bytes written, or a
+    /// negative error code.
+    ///
+    /// File descriptor `1` is standard output and `2` is standard error. Both
+    /// go to the kernel's serial console, which is the only sink a user process
+    /// has before the console service exists in M4.
+    ///
+    /// The write is *unbuffered* from the caller's point of view: the bytes are
+    /// in the console by the time the call returns. That matters for a
+    /// program that is about to exit -- the last line must not be lost in a
+    /// buffer that is never flushed.
+    pub const WRITE: Syscall = Syscall(15);
+
+    /// Execute an image from the initramfs as a new process.
+    ///
+    /// Arguments: `name_ptr`, `name_len`. The caller must hold `SPAWN`
+    /// authority. On success the parent receives the management endpoint for
+    /// the child; the child retrieves its side with `ENDPOINT_SELF`.
+    pub const PROCESS_EXEC: Syscall = Syscall(16);
+
+    /// Create the first side of an endpoint pair.
+    pub const ENDPOINT_CREATE: Syscall = Syscall(17);
+
+    /// Create the opposite side of an endpoint pair already held by this task.
+    pub const ENDPOINT_PEER_CREATE: Syscall = Syscall(18);
+
+    /// Return the management endpoint the kernel gave this process at spawn.
+    pub const ENDPOINT_SELF: Syscall = Syscall(19);
+
+    /// Return the number of live kernel tasks, for `ps`.
+    pub const PROCESS_COUNT: Syscall = Syscall(20);
+
     /// Every number currently assigned.
     pub const ALL: &[Syscall] = &[
         GET_VERSION,
@@ -137,6 +172,12 @@ pub mod nr {
         YIELD,
         THREAD_EXIT,
         CANCEL_WAIT,
+        WRITE,
+        PROCESS_EXEC,
+        ENDPOINT_CREATE,
+        ENDPOINT_PEER_CREATE,
+        ENDPOINT_SELF,
+        PROCESS_COUNT,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -157,6 +198,12 @@ pub mod nr {
             YIELD => "yield",
             THREAD_EXIT => "thread_exit",
             CANCEL_WAIT => "cancel_wait",
+            WRITE => "write",
+            PROCESS_EXEC => "process_exec",
+            ENDPOINT_CREATE => "endpoint_create",
+            ENDPOINT_PEER_CREATE => "endpoint_peer_create",
+            ENDPOINT_SELF => "endpoint_self",
+            PROCESS_COUNT => "process_count",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so
