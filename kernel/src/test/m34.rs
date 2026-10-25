@@ -192,6 +192,13 @@ pub static M3_SUITES: &[TestSuite] = &[
             ),
         ],
     },
+    TestSuite {
+        name: "process_exec_authority",
+        cases: &[(
+            "a_task_without_spawn_cannot_exec_a_service",
+            without_spawn_cannot_exec_service,
+        )],
+    },
 ];
 
 /// The M4 suites, in registration order.
@@ -348,6 +355,19 @@ pub static M4_SUITES: &[TestSuite] = &[
             ("init_was_started", init_was_started),
         ],
     },
+    TestSuite {
+        name: "service_supervision",
+        cases: &[
+            (
+                "a_live_task_is_reported_by_service_name",
+                live_task_reported_by_service_name,
+            ),
+            (
+                "a_retired_service_releases_its_slot",
+                retired_service_releases_slot,
+            ),
+        ],
+    },
 ];
 
 // --- helpers ----------------------------------------------------------------
@@ -380,6 +400,61 @@ fn init_was_started() -> Result<(), &'static str> {
         < 2
     {
         return Err("init and the shell did not start from the boot archive");
+    }
+    Ok(())
+}
+
+fn live_task_reported_by_service_name() -> Result<(), &'static str> {
+    let state = fresh_state();
+    let id = state.create_task().ok_or("the task pool was empty")?;
+    let slot = slot_of(state, id).ok_or("the task had no slot")?;
+    state
+        .task_at_slot_mut(slot)
+        .ok_or("the task disappeared")?
+        .service_name_len = b"file-server".len();
+    state
+        .task_at_slot_mut(slot)
+        .ok_or("the task disappeared")?
+        .service_name[..b"file-server".len()]
+        .copy_from_slice(b"file-server");
+
+    if !state.service_is_alive(b"file-server") {
+        return Err("a live service was reported dead");
+    }
+    if state.service_is_alive(b"file") || state.service_is_alive(b"echo-server") {
+        return Err("a different service name was accepted");
+    }
+    Ok(())
+}
+
+fn retired_service_releases_slot() -> Result<(), &'static str> {
+    let state = fresh_state();
+    let id = state.create_task().ok_or("the task pool was empty")?;
+    let slot = slot_of(state, id).ok_or("the task had no slot")?;
+    state
+        .task_at_slot_mut(slot)
+        .ok_or("the task disappeared")?
+        .service_name_len = b"file-server".len();
+    state
+        .task_at_slot_mut(slot)
+        .ok_or("the task disappeared")?
+        .service_name[..b"file-server".len()]
+        .copy_from_slice(b"file-server");
+
+    if !state.retire_task(slot) {
+        return Err("retirement was refused");
+    }
+    if state.task_at_slot(slot).is_some() {
+        return Err("retirement left the task in its slot");
+    }
+    if state.service_is_alive(b"file-server") {
+        return Err("retirement left the service alive");
+    }
+    let next = state
+        .create_task()
+        .ok_or("retirement did not free a slot")?;
+    if slot_of(state, next) != Some(slot) {
+        return Err("retirement did not recycle the expected slot");
     }
     Ok(())
 }
@@ -1855,6 +1930,33 @@ fn no_cap_holds_no_handle() -> Result<(), &'static str> {
         Some(_) => Err("a guessed handle reported the wrong error"),
         None => Err("a guessed handle resolved"),
     }
+}
+
+/// A task with no capability must not launch another service.
+///
+/// `PROCESS_EXEC` is an authority-creating operation: it starts a task and
+/// mints its management endpoint. A bare task may be dispatched, but it must
+/// be denied before any child or endpoint is created.
+fn without_spawn_cannot_exec_service() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let task = state.create_bare_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
+    let baseline = crate::services::process::live_task_count();
+    let boot_info = unsafe { crate::boot::read_boot_info() };
+    match crate::services::process::exec_image_in_state(&mut state, b"echo-server", slot, boot_info)
+    {
+        Ok(_) => return Err("a task with no capability started a service"),
+        Err(ErrorCode::Denied) => {}
+        Err(_) => return Err("the unauthorised exec was refused for the wrong reason"),
+    }
+
+    if crate::services::process::live_task_count() != baseline {
+        return Err("the denied exec still changed the task pool");
+    }
+    if state.service_is_alive(b"echo-server") {
+        return Err("the denied exec still started echo-server");
+    }
+    Ok(())
 }
 
 /// A task whose root capability was revoked must not create objects.
