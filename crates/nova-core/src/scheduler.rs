@@ -226,9 +226,11 @@ impl Scheduler {
         }
     }
 
-    /// The runnable queue, in order.
+    /// The current thread followed by the runnable queue, in order.
     pub fn runnable_order(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..self.queue_len).map(|offset| self.queue[(self.head + offset) % MAX_THREADS])
+        core::iter::once(self.current)
+            .flatten()
+            .chain((0..self.queue_len).map(|offset| self.queue[(self.head + offset) % MAX_THREADS]))
     }
 
     /// Create a runnable thread.
@@ -245,6 +247,57 @@ impl Scheduler {
             .iter()
             .position(|entry| entry.is_none())
             .ok_or(SchedError::ThreadLimit)?;
+
+        self.threads[slot] = Some(ThreadRecord::new(id, process, priority));
+        self.count += 1;
+
+        self.enqueue(id)?;
+
+        Ok(id)
+    }
+
+    /// Register a thread under a caller-chosen identifier.
+    ///
+    /// The kernel's thread pool and this scheduler are two records of the same
+    /// thread, joined by its identifier, and the pool is keyed by the
+    /// identifier the *caller* chose. `create_thread` cannot supply that: it
+    /// mints identifiers from its own counter, so a pool thread whose
+    /// identifier was chosen elsewhere would be unreachable from here.
+    ///
+    /// This is the form the kernel uses, because the kernel's pool *is* the
+    /// authority on a thread's identity: the pool slot is what the context
+    /// switch looks up, and the scheduler's queue is what the policy consults.
+    /// Two records with two different identifiers for one thread would make
+    /// the switch unable to find the thread the policy chose.
+    ///
+    /// The counter is advanced past `id`, so a later [`Scheduler::create_thread`]
+    /// cannot mint an identifier that is already in use.
+    ///
+    /// # Errors
+    ///
+    /// [`SchedError::ThreadLimit`] when the thread table is full, and
+    /// [`SchedError::InvalidState`] when `id` already names a thread.
+    pub fn adopt_thread(&mut self, id: u32, process: u32, priority: u8) -> Result<u32, SchedError> {
+        if self.count >= MAX_THREADS {
+            return Err(SchedError::ThreadLimit);
+        }
+
+        if self.thread(id).is_some() {
+            return Err(SchedError::InvalidState);
+        }
+
+        let slot = self
+            .threads
+            .iter()
+            .position(|entry| entry.is_none())
+            .ok_or(SchedError::ThreadLimit)?;
+
+        // Keep the generator ahead of the adopted identifier. Without this the
+        // counter could later mint an identifier that is already in use, and
+        // the two records would collide.
+        if id >= self.next_id {
+            self.next_id = id.wrapping_add(1);
+        }
 
         self.threads[slot] = Some(ThreadRecord::new(id, process, priority));
         self.count += 1;
@@ -481,9 +534,15 @@ impl Scheduler {
     /// The thread goes to the back of the queue and the next one is chosen
     /// immediately.
     pub fn yield_current(&mut self) -> Option<u32> {
-        self.current?;
-
+        let current = self.current?;
         self.current_ticks = 0;
+
+        if let Some(record) = self.thread_mut(current)
+            && record.state == ThreadState::Running
+        {
+            record.state = ThreadState::Runnable;
+        }
+        self.remove_from_queue(current);
         self.schedule()
     }
 

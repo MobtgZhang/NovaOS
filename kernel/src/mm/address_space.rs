@@ -46,6 +46,8 @@ use crate::klog;
 use crate::logger::Level;
 use crate::mm::page_table::{self, NO_EXECUTE, PageTable};
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use nova_core::address_space::{Protection, UserWindow, VmmError};
 
 /// The number of PML4 entries that select the lower (user) half.
@@ -108,7 +110,7 @@ impl AddressSpace {
 /// Built once, at boot, and used as the *source* for every process's kernel
 /// half. The kernel keeps running on this space's tables until it installs a
 /// process's; the scheduler reloads CR3 on every switch.
-static mut KERNEL_SPACE: Option<AddressSpace> = None;
+static KERNEL_SPACE_PML4: AtomicU64 = AtomicU64::new(0);
 
 /// The kernel's address space.
 ///
@@ -116,10 +118,11 @@ static mut KERNEL_SPACE: Option<AddressSpace> = None;
 ///
 /// Must only be called after [`init`] has run.
 pub fn kernel_space() -> AddressSpace {
-    // SAFETY: `init` publishes the space exactly once, before any reader
-    // exists, and nothing replaces it afterwards.
-    let space = unsafe { *core::ptr::addr_of!(KERNEL_SPACE) };
-    space.expect("kernel address space used before mm::address_space::init")
+    let pml4_phys = KERNEL_SPACE_PML4.load(Ordering::Acquire);
+    if pml4_phys == 0 {
+        panic!("kernel address space used before mm::address_space::init (pml4={pml4_phys:#x})");
+    }
+    AddressSpace::at(pml4_phys)
 }
 
 /// Build the kernel's own address space and install it.
@@ -137,11 +140,13 @@ pub fn kernel_space() -> AddressSpace {
 pub unsafe fn init(boot_info: &'static BootInfo) {
     let kernel = build_kernel_space(boot_info);
 
-    // SAFETY: `init` is the sole writer of `KERNEL_SPACE` and runs once,
-    // before any reader exists.
-    unsafe {
-        KERNEL_SPACE = Some(kernel);
-    }
+    let previous = KERNEL_SPACE_PML4.load(Ordering::Acquire);
+    KERNEL_SPACE_PML4.store(kernel.pml4_phys(), Ordering::Release);
+    klog!(
+        Level::Info,
+        "vmm: kernel space publish previous={previous:#x} value={:#x}",
+        KERNEL_SPACE_PML4.load(Ordering::Acquire)
+    );
 
     klog!(
         Level::Info,
@@ -157,8 +162,19 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
 /// [`VmmError::OutOfMemory`] when the frame allocator cannot supply the
 /// tables.
 pub fn create_process_space(boot_info: &'static BootInfo) -> Result<AddressSpace, VmmError> {
+    klog!(
+        Level::Info,
+        "vmm: create process enter global={:#x}",
+        KERNEL_SPACE_PML4.load(Ordering::Acquire)
+    );
     let kernel = kernel_space();
     let pml4 = page_table::allocate_table()?;
+    klog!(
+        Level::Info,
+        "vmm: process pml4 {:#x} global={:#x}",
+        pml4.phys(),
+        KERNEL_SPACE_PML4.load(Ordering::Acquire)
+    );
 
     // Clone the kernel half: the same intermediate tables, reachable from this
     // space's PML4.
@@ -214,9 +230,11 @@ fn build_kernel_space(boot_info: &'static BootInfo) -> AddressSpace {
 fn clone_kernel_half(source: &PageTable, destination: &PageTable) -> Result<(), VmmError> {
     for index in KERNEL_HALF_FIRST_ENTRY..ENTRIES_PER_TABLE {
         if let Some(child) = source.target(index) {
-            // The entry's flags are copied verbatim, including the `GLOBAL`
-            // bit that keeps the kernel's mappings across a CR3 reload.
-            let entry = encode_entry(child, source.flags(index));
+            // The entry's flags are copied, including the `GLOBAL` bit that
+            // keeps the kernel's mappings across a CR3 reload, but any
+            // bootloader-created user bit is removed: the kernel half is
+            // supervisor-only by definition.
+            let entry = encode_entry(child, source.flags(index).without(PageFlags::USER));
             destination.write(index, entry);
         }
     }
@@ -329,6 +347,14 @@ pub fn unmap(space: &AddressSpace, virt: u64) -> Result<(), VmmError> {
 /// The physical frame mapped at `virt` in `space`, if any.
 pub fn translate(space: &AddressSpace, virt: u64) -> Option<u64> {
     page_table::translate(&space.pml4(), virt)
+}
+
+pub fn map_kernel_mmio(virt: u64, phys: u64) -> Result<(), VmmError> {
+    let space = kernel_space();
+    let flags = PageFlags::PRESENT
+        .union(PageFlags::WRITABLE)
+        .union(PageFlags::GLOBAL);
+    page_table::map(&space.pml4(), virt, phys, flags, false)
 }
 
 /// Install `space`'s tables in CR3.

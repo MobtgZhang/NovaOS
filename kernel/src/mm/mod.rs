@@ -60,6 +60,26 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
         ALLOCATOR.init(FrameAllocator::new(boot_info, image_end));
     }
 
+    // The kernel's own address space is built here, after the allocator is
+    // published, because building it allocates page tables.
+    //
+    // This has to happen at boot rather than on first use. A process's address
+    // space is built by *copying* the kernel half of the kernel's, so the
+    // kernel's half must exist before any process does — and `kernel_space()`
+    // is what that copy reads. Without this, the first `create_process_space`
+    // call finds no kernel space to copy from.
+    //
+    // The space is built but *not* installed: CR3 still points at the
+    // bootloader's tables until the scheduler switches to a process. Building
+    // the tables and activating them are separate steps, and only the second
+    // one has to be timed against everything the kernel is currently using.
+    //
+    // SAFETY: delegated to this function's contract. The allocator was just
+    // published, the direct map is live, and the snapshot is immutable.
+    unsafe {
+        address_space::init(boot_info);
+    }
+
     // SAFETY: delegated to this function's contract; the allocator was just
     // published and has no other readers yet.
     let allocator = unsafe { ALLOCATOR.get() };

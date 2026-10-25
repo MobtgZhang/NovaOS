@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Maximum size of a built image, in bytes.
-pub const MAX_IMAGE_BYTES: usize = 64 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024;
 
 /// Maximum number of segments in a built image.
 pub const MAX_SEGMENTS: usize = 16;

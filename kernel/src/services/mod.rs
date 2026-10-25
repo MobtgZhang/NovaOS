@@ -56,6 +56,7 @@ pub mod dispatch;
 pub mod fs;
 pub mod ipc;
 pub mod object;
+pub mod process;
 pub mod supervisor;
 
 use core::cell::UnsafeCell;
@@ -116,6 +117,10 @@ pub struct TaskState {
     /// table assigns the slot and the generation, and the kernel must not
     /// guess them.
     pub root: CapHandle,
+    /// The endpoint that connects this child process to its parent.
+    pub management_endpoint: CapHandle,
+    /// The second side of a pair created by `ENDPOINT_CREATE`.
+    pub pending_endpoint: CapHandle,
     /// The path scopes the task holds.
     pub scopes: crate::services::fs::ScopePool,
     /// The IPC channels this task is a party to, and which side it holds.
@@ -134,6 +139,8 @@ impl TaskState {
             id,
             alive: true,
             root: CapHandle::INVALID,
+            management_endpoint: CapHandle::INVALID,
+            pending_endpoint: CapHandle::INVALID,
             scopes: crate::services::fs::ScopePool::new(),
             channels: [(ChannelId::new(0), Side::First); MAX_CHANNELS],
             channel_count: 0,

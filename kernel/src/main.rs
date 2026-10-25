@@ -36,19 +36,14 @@
 
 mod arch;
 mod boot;
+mod initramfs;
+mod loader;
 mod logger;
 mod mm;
-// The service layer (M3 and M4): the capability tables, the object registry,
-// the IPC plumbing, the file server, the supervisor, and the syscall
-// dispatch. It is wired into the boot sequence below — `services::init` runs
-// before the test suites, so the suites can create tasks and dispatch
-// syscalls against real kernel state.
-//
-// The service layer lives outside `kernel/src/syscall/` on purpose: M2 owns
-// that directory for the trap entry and the `iretq` trampoline, and two
-// agents editing one `mod.rs` is a merge conflict waiting to happen. The
-// integration point is `services::dispatch::syscall_dispatch`.
+mod sched;
 mod services;
+mod syscall;
+mod task;
 mod test;
 
 use crate::arch::capabilities::Console as _;
@@ -180,6 +175,30 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // SAFETY: this runs once, from the boot path, with interrupts masked and
     // before any reader of the state exists. See `services::init`.
     unsafe { services::init() };
+
+    // The M2 machinery: the syscall MSRs, the timer, and the scheduler.
+    //
+    // The order matters. The syscall MSRs need the GDT and TSS, which
+    // `arch::init` installed above. The scheduler needs the thread pool,
+    // which is a static and so needs no initialisation. The timer is armed
+    // last, because a tick that arrives before the scheduler exists would
+    // deliver IRQ0 into a handler that has nowhere to put the tick.
+    //
+    // SAFETY: this runs once, from the boot path, with interrupts masked and
+    // before any reader of the state exists.
+    unsafe {
+        syscall::init();
+        sched::init();
+        arch::x86_64::apic::init(boot::read_boot_info().direct_map_offset);
+    }
+
+    if let Some(archive) = crate::boot::initramfs() {
+        if crate::initramfs::Archive::parse(archive).is_ok() {
+            if let Err(error) = crate::services::process::start_init_image(b"init") {
+                klog!(Level::Error, "init: failed with error {}", error as i64);
+            }
+        }
+    }
 
     // SAFETY: `boot::capture` ran above, so the snapshot is published and
     // immutable from here on.
