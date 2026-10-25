@@ -39,6 +39,7 @@
 pub mod console;
 pub mod file;
 pub mod manifest;
+pub mod shell;
 
 pub use console::{
     CONSOLE_CAPACITY, CONSOLE_OP_READ_LINE, CONSOLE_OP_WRITE, CONSOLE_VERSION, ConsoleBuffer,
@@ -55,6 +56,7 @@ pub use manifest::{
     Clock, Dependency, DependencyStatus, MAX_DEPENDENCIES, ManualClock, ReadyMessage,
     RestartDecision, RestartTracker, ServiceManifest, ServiceState, check_dependencies,
 };
+pub use shell::ShellCommand;
 
 /// The version of a NovaOS protocol.
 ///

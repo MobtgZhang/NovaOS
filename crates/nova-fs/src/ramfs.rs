@@ -422,9 +422,6 @@ impl RamFs {
     pub fn open(&mut self, path: &[u8]) -> Result<FileHandle, FsError> {
         let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
         let inode = self.resolve(&canonical)?;
-        if self.inodes[inode].kind != FileKind::File {
-            return Err(FsError::IsADirectory);
-        }
         self.alloc_handle(inode)
     }
 
@@ -499,6 +496,9 @@ impl RamFs {
     pub fn read(&mut self, handle: FileHandle, buffer: &mut [u8]) -> Result<usize, FsError> {
         let slot = self.slot_of(handle)?;
         let inode = usize::from(self.open[slot].inode);
+        if self.inodes[inode].kind != FileKind::File {
+            return Err(FsError::IsADirectory);
+        }
         let offset =
             usize::try_from(self.open[slot].offset).map_err(|_| FsError::InvalidArgument)?;
         let length =
@@ -524,6 +524,9 @@ impl RamFs {
     pub fn write(&mut self, handle: FileHandle, data: &[u8]) -> Result<usize, FsError> {
         let slot = self.slot_of(handle)?;
         let inode = usize::from(self.open[slot].inode);
+        if self.inodes[inode].kind != FileKind::File {
+            return Err(FsError::IsADirectory);
+        }
         let offset =
             usize::try_from(self.open[slot].offset).map_err(|_| FsError::InvalidArgument)?;
         let current =
@@ -945,10 +948,9 @@ mod tests {
             FsError::NotADirectory,
             "a file used as a directory component"
         );
-        assert_eq!(
-            fs.open(b"/docs").unwrap_err(),
-            FsError::IsADirectory,
-            "a directory opened as a file"
+        assert!(
+            fs.open(b"/docs").is_ok(),
+            "a granted directory is openable for scoping and listing"
         );
         assert_eq!(
             fs.create_file(b"/docs/notes.txt").unwrap_err(),
