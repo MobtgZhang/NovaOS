@@ -290,6 +290,12 @@ find the contract without reading the crate.
 | `THREAD_EXIT` | status | the status |
 | `CANCEL_WAIT` | handle | — |
 | `WRITE` | file descriptor, buffer pointer, length | the number of bytes written |
+| `PROCESS_EXEC` | name pointer, name length | the child's management endpoint |
+| `ENDPOINT_CREATE` | none | the first endpoint side |
+| `ENDPOINT_PEER_CREATE` | none | the peer endpoint side |
+| `ENDPOINT_SELF` | none | the endpoint side received at spawn |
+| `PROCESS_COUNT` | none | the number of live tasks |
+| `PROCESS_STATUS` | name pointer, name length | `1` if a task of that service name is live, otherwise `0` |
 
 A number this kernel does not implement returns `E_UNSUPPORTED`. It never
 falls through to another operation: a number reserved for a later milestone
