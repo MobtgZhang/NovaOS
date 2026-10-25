@@ -25,6 +25,7 @@ use super::port_io;
 use crate::arch::shared::fault::{FaultInfo, FaultKind, FaultOutcome};
 use crate::klog;
 use crate::logger::Level;
+use crate::sched;
 use crate::syscall::UserRegisters;
 
 /// Number of interrupt vectors the IDT covers.
@@ -688,6 +689,16 @@ pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &Exception
 
         // SAFETY: delegated to this trampoline's contract below.
         unsafe { enter_resume(frame_pointer, target) };
+    }
+
+    // A ring-3 fault is process-local: the user thread cannot be trusted to
+    // resume, but the kernel still can. The scheduler kills the owning task,
+    // wakes IPC peers, and switches to another runnable thread.
+    if info.from_user {
+        // SAFETY: we are in the exception path with interrupts masked.
+        unsafe {
+            sched::fault_current_user_and_switch(info.address.unwrap_or(0));
+        }
     }
 
     // Halt rather than resume: an unhandled kernel fault means the register file
