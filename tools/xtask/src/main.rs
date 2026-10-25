@@ -55,7 +55,7 @@ COMMANDS:
     build           Build the kernel and every host-side crate
     image           Package the kernel into a bootable Limine ISO
     run             Build, then boot the image in QEMU with a serial console
-    test            Run host unit tests, then the QEMU boot suite
+    test            Run xtask's tests, the host unit tests, then the QEMU boot suite
     fetch-limine    Download and verify the pinned Limine release
     clean           Remove build artifacts
 
@@ -207,7 +207,7 @@ fn clean() -> Result<(), String> {
 /// first: the ISO is derived from the kernel binary, and making the caller
 /// sequence two commands is how a stale ISO gets booted.
 ///
-/// Builds the kernel only, not the host crates — see
+/// Builds the kernel and the user-space runtime, not the host crates — see
 /// [`build::build_kernel_only`].
 pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
     let profile = build::build_kernel_only(profile)?;
@@ -215,8 +215,13 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
     let kernel = boot::kernel_artifact(Some(&profile))?;
     log(&format!("kernel: {}", kernel.display()));
 
+    let user = boot::user_artifact(Some(&profile))?;
+    log(&format!("user image: {}", user.display()));
+
     limine::require()?;
-    let stage = boot::stage_image(&kernel)?;
+    let apps = boot::application_directory(Some(&profile))?;
+    let initramfs = boot::build_initramfs(&apps)?;
+    let stage = boot::stage_image_with_initramfs(&kernel, Some(&user), Some(&initramfs))?;
 
     boot::build_iso(&stage)?;
     let iso = boot::iso_path();
@@ -226,11 +231,21 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
 
 /// Run the host tests, then the QEMU boot suite.
 ///
-/// Both suites, in that order, stopping at the first failure. The host tests
+/// Three suites, in that order, stopping at the first failure. The cheap ones
 /// come first because they fail in milliseconds with a precise message; a boot
 /// suite that costs seconds of emulation should only run once the cheap checks
 /// have passed.
+///
+/// 1. `xtask`'s own tests — the ISO layout, the QEMU arguments, the verdict
+///    classification. These are the parts of the harness that decide whether
+///    a boot counts as a pass.
+/// 2. The host tests — pure logic compiled under `std`.
+/// 3. The QEMU boot suite — the kernel, booted for real.
+///
+/// The order between the first two is not important; the order of both before
+/// the third is.
 fn test_all(args: &Args) -> Result<(), String> {
+    test::driver()?;
     test::host()?;
     run::run(args)?;
     log("all tests passed");

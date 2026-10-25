@@ -99,13 +99,38 @@ const HEADER_LEN: usize = 32;
 /// Length of the validation entry.
 ///
 /// It is exactly one record: a 32-byte header holding the platform id, the
-/// manufacturer string, the checksum and the 0x55 0xAA key bytes. There is no
-/// LBA after it — the catalog's own location is in the boot record, and
-/// repeating it here as a trailing 4 bytes shifts every record after it by
-/// four. The initial entry then lands where a reader expects the first boot
-/// entry, so firmware reads a plausible-looking boot indicator from the middle
-/// of the previous record and finds nothing bootable on the medium.
+/// manufacturer string, the checksum and the 0x55 0xAA key bytes.
+///
+/// It is *only* the header. The format's validation entry has no trailing
+/// LBA — the catalog's own location is in the boot record — and an earlier
+/// version of this writer appended one anyway. Every record after it was
+/// shifted by four bytes, so the initial entry landed where a reader expects
+/// the first boot entry and firmware read a plausible-looking boot indicator
+/// out of the middle of the previous record.
 const VALIDATION_ENTRY_LEN: usize = HEADER_LEN;
+
+/// Length of the initial/default entry.
+///
+/// It is a bare 32-byte header with no payload: it carries the media type and
+/// the load RBA of the image firmware should start.
+const INITIAL_ENTRY_LEN: usize = HEADER_LEN;
+
+/// Length of the section header.
+///
+/// It is a bare 32-byte header too. It sits between the initial entry and the
+/// boot entries and tells a reader how many of the following entries belong
+/// to this section.
+const SECTION_HEADER_LEN: usize = HEADER_LEN;
+
+/// Offset of the first boot entry, relative to the start of the catalog.
+///
+/// The catalog is a validation entry, an initial/default entry, a section
+/// header, and then the boot entries themselves. The section header is not
+/// optional decoration: a reader walks the catalog from the initial entry and
+/// uses section headers to decide how many entries belong to the section, so
+/// entries with no preceding header are skipped as free-standing.
+const FIRST_BOOT_ENTRY_OFFSET: usize =
+    VALIDATION_ENTRY_LEN + INITIAL_ENTRY_LEN + SECTION_HEADER_LEN;
 
 /// Length of the SUSP `SP` entry, in bytes.
 const SUSP_SP_LEN: usize = 7;
@@ -447,14 +472,14 @@ impl Layout {
             // Every proper prefix of the file's path is a directory.
             for depth in 1..=file.components.len().saturating_sub(1) {
                 let prefix = file.components[..depth].to_vec();
-                if !directories.iter().any(|known| *known == prefix) {
+                if !directories.contains(&prefix) {
                     directories.push(prefix);
                 }
             }
         }
         // Deepest first, so a `..` record can name a parent whose extent is
         // already fixed.
-        directories.sort_by(|a, b| b.len().cmp(&a.len()));
+        directories.sort_by_key(|components| std::cmp::Reverse(components.len()));
 
         // The size of a directory depends on its members, and its members
         // include its subdirectories — which are known as a *set* only once
@@ -948,15 +973,6 @@ impl Layout {
         area
     }
 
-    /// Look up a directory's extent by path.
-    fn directory_extent(&self, components: &[String]) -> (u32, u32) {
-        self.directories
-            .iter()
-            .find(|(path, _, _)| path.as_slice() == components)
-            .map(|(_, first, sectors)| (*first, *sectors))
-            .unwrap_or((0, 0))
-    }
-
     /// Render one directory's records into whole sectors.
     ///
     /// `joliet` selects the supplementary tree: UCS-2BE identifiers and the
@@ -1186,15 +1202,20 @@ impl Layout {
 
         let mut catalog = Vec::new();
         catalog.extend_from_slice(&validation);
+        assert_eq!(
+            catalog.len(),
+            VALIDATION_ENTRY_LEN,
+            "the validation entry is one header and nothing else"
+        );
 
         // --- Initial/default entry header ---
         //
         // It carries no payload of its own; its load RBA points at whichever
         // boot entry firmware should try first. Boot entries are laid out in
-        // the order they were supplied, so the RBA of entry `n` is
-        // `VALIDATION_ENTRY_LEN + HEADER_LEN * (n + 1)`: the validation entry
-        // occupies the first slot, the initial/default header the second, and
-        // the boot entries follow.
+        // the order they were supplied, so the RBA of boot entry `n` is
+        // `FIRST_BOOT_ENTRY_OFFSET + HEADER_LEN * n`: the validation entry
+        // occupies the first slot, the initial/default header the second, the
+        // section header the third, and the boot entries follow.
         //
         // Which entry is the default is the caller's decision — the BIOS and
         // UEFI images are different files for different firmware, and only the
@@ -1246,6 +1267,11 @@ impl Layout {
         };
         initial[8..12].copy_from_slice(&default_lba.to_le_bytes());
         catalog.extend_from_slice(&initial);
+        assert_eq!(
+            catalog.len(),
+            VALIDATION_ENTRY_LEN + INITIAL_ENTRY_LEN,
+            "the initial entry is one header and nothing else"
+        );
 
         // --- Section header ---
         //
@@ -1282,10 +1308,15 @@ impl Layout {
         // 5 0x91 marks the final section, 0x90 says another follows.
         header[5] = SECTION_HEADER_FINAL;
         catalog.extend_from_slice(&header);
+        assert_eq!(
+            catalog.len(),
+            FIRST_BOOT_ENTRY_OFFSET,
+            "the boot entries start after the validation, initial and section headers"
+        );
 
         // --- Boot entries ---
         for (position, &index) in self.boot_sectors.iter().enumerate() {
-            let (sector, size) = self.extents[index as u32 as usize];
+            let (sector, size) = self.extents[index as usize];
             let is_efi = self.boot_platforms[position] == PLATFORM_EFI;
             // Only the default entry is marked bootable (0x88). The others are
             // marked "not bootable" (0x00) so a firmware that honours the flag
@@ -1826,7 +1857,7 @@ fn directory_record(name: &[u8], extent: u32, size: u64, flags: u8, system_use: 
     // members and a reader looking for any of them finds none.
     // ECMA-119 9.1.13: a pad byte sits between the identifier and the
     // System Use area when — and only when — the identifier's length is even.
-    let identifier_pad = usize::from(name.len() % 2 == 0);
+    let identifier_pad = usize::from(name.len().is_multiple_of(2));
     let content = 33 + name.len() + identifier_pad + system_use.len();
     let padded = content.div_ceil(2) * 2;
 
@@ -2116,7 +2147,7 @@ fn walk(base: &Path, root: &Path, out: &mut Vec<(Vec<String>, PathBuf, u64)>) ->
 fn check_collisions(files: &[File]) -> Result<(), Error> {
     let mut keys: Vec<&str> = Vec::new();
     for file in files {
-        if keys.iter().any(|seen| *seen == file.key.as_str()) {
+        if keys.contains(&file.key.as_str()) {
             return Err(Error::Collision(file.key.clone()));
         }
         keys.push(file.key.as_str());
@@ -2273,43 +2304,54 @@ mod tests {
         );
         assert_eq!(
             &bytes[catalog + 28..catalog + 32],
-            &[0x5C, 0xAA, 0x55, 0xAA],
-            "the validation entry terminates with 0x5CAA 0x55AA"
+            &[0xAA, 0x55, 0x55, 0xAA],
+            "the validation entry terminates with the checksum and the 0x55 0xAA key"
         );
 
-        // The self-referential LBA must point back at the catalog's own sector;
-        // a firmware that reads the wrong one here rejects the medium. It sits
-        // immediately *after* the 32-byte validation header, so reading it at
-        // `VALIDATION_ENTRY_LEN` would read the next record's boot indicator
-        // instead — which is itself a plausible-looking 0x88.
-        let self_lba = u32::from_le_bytes(
-            bytes[catalog + HEADER_LEN..catalog + HEADER_LEN + 4]
-                .try_into()
-                .expect("four bytes"),
-        );
+        // The validation entry is a 32-byte header and *nothing else*. The
+        // format has no trailing LBA in it — the catalog's own location is in
+        // the boot record — so the byte after the header is the initial
+        // entry's boot indicator.
+        //
+        // An earlier version of this writer appended a self-referential LBA to
+        // the validation entry. Every record after it shifted by four bytes,
+        // the initial entry landed where a reader expects the first boot
+        // entry, and firmware read a plausible-looking indicator out of the
+        // middle of the previous record. The assertion below pins the layout
+        // so that cannot come back.
         assert_eq!(
-            self_lba, catalog_lba,
-            "the validation entry points at itself"
+            bytes[catalog + VALIDATION_ENTRY_LEN],
+            BOOT_INDICATOR_BOOTABLE,
+            "the initial/default entry follows the validation entry immediately"
         );
 
-        // The initial/default entry follows the validation entry and points at
-        // the first boot entry, which starts right after it.
+        // The initial/default entry's load RBA names the LBA of the *boot
+        // image* firmware should load — the same value the boot entry carries.
+        // It is not an index into the catalog's records and not the offset of
+        // the first boot entry.
         let default_entry = catalog + VALIDATION_ENTRY_LEN;
-        let default_rba = u32::from_le_bytes(
+        let default_lba = u32::from_le_bytes(
             bytes[default_entry + 8..default_entry + 12]
                 .try_into()
                 .expect("four bytes"),
         );
+        assert!(
+            (default_lba as usize) < bytes.len() / BLOCK,
+            "the default entry must point inside the image, got {default_lba}"
+        );
+
+        // The section header sits between the initial entry and the boot
+        // entries, and tells a reader how many entries belong to the section.
+        let section_header = catalog + VALIDATION_ENTRY_LEN + INITIAL_ENTRY_LEN;
         assert_eq!(
-            default_rba as usize,
-            VALIDATION_ENTRY_LEN + HEADER_LEN,
-            "the default entry points at the first boot entry"
+            bytes[section_header], SECTION_HEADER_BOOTABLE,
+            "the catalog carries a section header before the boot entries"
         );
 
         // Every record is exactly 32 bytes of header, so the first boot entry
         // starts on a 32-byte boundary. This is the invariant that the earlier
         // hand-rolled layout silently violated.
-        let first_entry = catalog + default_rba as usize;
+        let first_entry = catalog + FIRST_BOOT_ENTRY_OFFSET;
         let indicator = bytes[first_entry];
         assert!(
             indicator == BOOT_INDICATOR_BOOTABLE || indicator == BOOT_INDICATOR_NOT_BOOTABLE,
@@ -2367,37 +2409,70 @@ mod tests {
         ) as usize;
         let catalog = catalog_lba * BLOCK;
 
-        let default_rba = u32::from_le_bytes(
-            bytes[catalog + VALIDATION_ENTRY_LEN + 8..catalog + VALIDATION_ENTRY_LEN + 12]
+        // The initial/default entry's load RBA names the LBA of the *boot
+        // image* firmware should load — a sector of the medium, not an offset
+        // into the catalog. Reading it as a catalog offset is the mistake this
+        // test used to make, and it produced a number that looked plausible
+        // (26) and pointed at the wrong record entirely.
+        let initial_entry = catalog + VALIDATION_ENTRY_LEN;
+        let default_lba = u32::from_le_bytes(
+            bytes[initial_entry + 8..initial_entry + 12]
                 .try_into()
                 .expect("four bytes"),
         ) as usize;
 
-        // The marked default is the *second* entry, so the RBA must skip past
-        // the first one rather than pointing at it.
+        // The initial entry describes the *default* boot entry, so its media
+        // type is that entry's media type.
         assert_eq!(
-            default_rba,
-            VALIDATION_ENTRY_LEN + HEADER_LEN * 2,
-            "the default entry skips the non-default boot entry"
+            bytes[initial_entry + 1],
+            MEDIA_EFI,
+            "the initial entry describes the default entry, which is the EFI one"
         );
 
-        // And it must be the EFI one. What makes an entry an EFI entry is its
-        // *media type*, not its indicator: 0x90 and 0x91 are section-header
-        // indicators, and a firmware scanning for something to boot skips any
-        // indicator that is not 0x88. An EFI image marked with a section-header
-        // indicator is a well-formed catalog that reports no bootable method at
-        // all, so asserting on the indicator here would pin a value that is
-        // correct-looking and wrong.
-        let default_entry = catalog + default_rba;
+        // The boot entries follow the section header, in the order they were
+        // supplied. The marked default is the *second* one.
+        let first_entry = catalog + FIRST_BOOT_ENTRY_OFFSET;
+        let second_entry = first_entry + HEADER_LEN;
+
+        // The initial entry's load RBA must be the extent of the default boot
+        // entry — the second one — and not the first one's.
+        let second_lba = u32::from_le_bytes(
+            bytes[second_entry + 8..second_entry + 12]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
         assert_eq!(
-            bytes[default_entry + 1],
+            default_lba, second_lba,
+            "the default entry skips the non-default boot entry"
+        );
+        // And it must differ from the first one's extent, or "skips" is not
+        // being tested at all.
+        let first_lba = u32::from_le_bytes(
+            bytes[first_entry + 8..first_entry + 12]
+                .try_into()
+                .expect("four bytes"),
+        ) as usize;
+        assert_ne!(
+            default_lba, first_lba,
+            "the two boot entries must not share an extent"
+        );
+
+        // What makes an entry an EFI entry is its *media type*, not its
+        // indicator: 0x90 and 0x91 are section-header indicators, and a
+        // firmware scanning for something to boot skips any indicator that is
+        // not 0x88. An EFI image marked with a section-header indicator is a
+        // well-formed catalog that reports no bootable method at all, so
+        // asserting on the indicator here would pin a value that is
+        // correct-looking and wrong.
+        assert_eq!(
+            bytes[second_entry + 1],
             MEDIA_EFI,
             "the marked default is the EFI entry, and media type is what says so"
         );
         // The indicator is 0x88 because this is the default, and the same would
         // be true of a BIOS default.
         assert_eq!(
-            bytes[default_entry], BOOT_INDICATOR_BOOTABLE,
+            bytes[second_entry], BOOT_INDICATOR_BOOTABLE,
             "the default entry is marked bootable"
         );
         // An EFI image is loaded verbatim, so its sector count is reserved and
@@ -2405,7 +2480,7 @@ mod tests {
         // field and is wrong for an image whose length is not a sector multiple.
         assert_eq!(
             u16::from_le_bytes(
-                bytes[default_entry + 6..default_entry + 8]
+                bytes[second_entry + 6..second_entry + 8]
                     .try_into()
                     .expect("two bytes")
             ),
@@ -2415,7 +2490,6 @@ mod tests {
 
         // The unmarked entry must not be marked bootable, or firmware may try
         // it first and boot the wrong firmware.
-        let first_entry = catalog + VALIDATION_ENTRY_LEN + HEADER_LEN;
         assert_eq!(
             bytes[first_entry], BOOT_INDICATOR_NOT_BOOTABLE,
             "the unmarked entry is not bootable"

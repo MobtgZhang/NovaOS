@@ -184,6 +184,47 @@ if [[ -n "$TIMEOUT" ]]; then
         # `isa-debug-exit` maps a guest status of 0 to 1, and any failure to 3.
         echo "QEMU exited with $status; the log is in $SERIAL_LOG"
     fi
+
+    # --- The `[NOVA-TEST]` verdict -------------------------------------
+    #
+    # The plan requires the serial log to be parsed for the `[NOVA-TEST]`
+    # lines, and requires the counts to be checked rather than a summary
+    # *word*: a kernel that prints "all suites passed" and then reports
+    # `failed=5` has contradicted itself, and the counts are the checkable
+    # half.
+    #
+    # The result line is the kernel's own tally:
+    #
+    #     [NOVA-TEST] RESULT suites=20 cases=81 passed=81 failed=0
+    #
+    # This script reports the verdict; it does not decide the build's exit
+    # status. `cargo xtask run` is the gate, and it has its own parser with
+    # its own tests. Two parsers of the same log is a duplication, but this
+    # one is for a human reading a terminal and that one is for a build
+    # system — and the human-readable summary is the thing worth
+    # duplicating.
+    echo
+    if [[ ! -f "$SERIAL_LOG" ]]; then
+        echo "[NOVA-TEST] no serial log at $SERIAL_LOG"
+    else
+        local_result="$(grep -aE '\[NOVA-TEST\] (RESULT|SUMMARY)' "$SERIAL_LOG" || true)"
+        if [[ -z "$local_result" ]]; then
+            echo "[NOVA-TEST] the kernel never printed a summary."
+            echo "            It most likely never reached the test harness."
+        else
+            echo "$local_result"
+        fi
+
+        # The count of failures, if the kernel reported one.
+        failed="$(grep -aoE '\[NOVA-TEST\] RESULT .*failed=[0-9]+' "$SERIAL_LOG" \
+            | grep -oE 'failed=[0-9]+$' | tail -1 | cut -d= -f2)"
+        if [[ -n "$failed" && "$failed" != "0" ]]; then
+            echo "[NOVA-TEST] FAILED: ${failed} case(s) failed."
+            grep -aE '\[NOVA-TEST\].*FAIL|\[NOVA\] ERR' "$SERIAL_LOG" | head -20
+        elif [[ -n "$failed" ]]; then
+            echo "[NOVA-TEST] PASSED: no failures reported."
+        fi
+    fi
 else
     echo "serial:   interactive (Ctrl-A X to quit)"
     echo

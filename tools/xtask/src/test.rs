@@ -1,28 +1,47 @@
 //! Test orchestration.
 //!
-//! # Two suites, two runners
+//! # Three suites, three runners
 //!
-//! `cargo test --workspace --exclude nova-kernel --exclude xtask` runs the host
-//! tests: pure logic compiled under `std`. The kernel's own tests run inside QEMU
-//! and are reached through `cargo xtask run`.
+//! `cargo xtask test` runs three suites, in this order:
 //!
-//! The two are deliberately *not* unified. The host tests are fast enough to run
-//! on save and are what a developer runs to check a change; the QEMU suite costs
-//! ~7 s of emulation and is what proves the kernel links, boots, and reads the
-//! bootloader's data structures correctly. Merging them would mean every save
-//! either paid the emulation cost or ran a subset without saying so.
+//! 1. `xtask`'s own tests — the ISO layout, the QEMU argument vector, and the
+//!    verdict classification. These are the parts of the harness that decide
+//!    whether a boot counts as a pass, so they are checked before anything
+//!    depends on them.
+//! 2. The host tests — `cargo test --workspace --exclude nova-kernel --exclude
+//!    nova-rt --exclude xtask`: pure logic compiled under `std`. The kernel's
+//!    own tests run inside QEMU and are reached through `cargo xtask run`.
+//! 3. The QEMU boot suite — the kernel, booted for real.
+//!
+//! The host tests and the QEMU suite are deliberately *not* unified. The host
+//! tests are fast enough to run on save and are what a developer runs to check
+//! a change; the QEMU suite costs ~7 s of emulation and is what proves the
+//! kernel links, boots, and reads the bootloader's data structures correctly.
+//! Merging them would mean every save either paid the emulation cost or ran a
+//! subset without saying so.
 //!
 //! # Why the excludes are explicit
 //!
-//! `--exclude nova-kernel` because the kernel is `no_std`/`no_main`: a host
-//! build of its `cfg(test)` modules does not link, and if it ever did, it would
-//! link a binary that never runs them — a green result that tested nothing.
+//! `--exclude nova-kernel` and `--exclude nova-rt` because both are bare-metal
+//! `no_std` / `no_main` binaries with their own `_start`: a host build of
+//! either does not link, and if it ever did, it would link a binary that never
+//! runs them — a green result that tested nothing.
+//!
 //! `--exclude xtask` because it is the tool driving the run, not code under
-//! test. Naming both is deliberate: a future `--workspace` sweep would then
-//! either skip them correctly or fail loudly, never silently skip them.
+//! test — but see [`driver`]: it is excluded from the *workspace sweep* and
+//! run on its own, so that exclusion is a routing decision rather than an
+//! exemption. Naming all three is deliberate: a future `--workspace` sweep
+//! would then either skip them correctly or fail loudly, never silently skip
+//! them.
 
 /// Crates that are not part of the host test run.
-pub const EXCLUDED_HOST_PACKAGES: &[&str] = &["nova-kernel", "xtask"];
+///
+/// `nova-kernel` and `nova-rt` are bare-metal `no_std` / `no_main` binaries
+/// with their own `_start`, and neither can be linked for the host.
+///
+/// `xtask` is the tool driving the run rather than code under test — but it is
+/// not an exemption: [`driver`] runs its own suite.
+pub const EXCLUDED_HOST_PACKAGES: &[&str] = &["nova-kernel", "nova-rt", "nova-apps", "xtask"];
 
 /// Run the host tests.
 ///
@@ -48,6 +67,33 @@ pub fn host() -> Result<(), String> {
     crate::run_command_owned(&command, "run host tests")
 }
 
+/// Run `xtask`'s own unit tests.
+///
+/// `xtask` is excluded from the workspace host-test run because it is the
+/// tool driving the run rather than code under test — but that exclusion is
+/// not an exemption. The tool has its own test suite covering exactly the
+/// things that are easy to get wrong and hard to notice: the El Torito
+/// catalog layout, the QEMU argument vector, and the verdict classification
+/// that decides pass from fail.
+///
+/// Excluding it from one test command and never running it anywhere else
+/// would leave that suite green by absence rather than by result. It runs
+/// here, before the emulation, because it costs milliseconds and it fails
+/// with a precise message.
+pub fn driver() -> Result<(), String> {
+    crate::log("running xtask's own tests");
+
+    crate::run_command_owned(
+        &[
+            "cargo".to_string(),
+            "test".to_string(),
+            "--package".to_string(),
+            "xtask".to_string(),
+        ],
+        "run xtask tests",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::EXCLUDED_HOST_PACKAGES;
@@ -63,6 +109,37 @@ mod tests {
     #[test]
     fn the_driver_is_excluded_from_host_tests() {
         assert!(EXCLUDED_HOST_PACKAGES.contains(&"xtask"));
+    }
+
+    #[test]
+    fn the_user_runtime_is_excluded_from_host_tests() {
+        // `nova-rt` is a bare-metal `no_std` / `no_main` binary with its own
+        // `_start`, exactly like the kernel. It is excluded for the same
+        // reason.
+        //
+        // It is excluded *explicitly* rather than relying on its manifest's
+        // `test = false`: `cargo clippy --all-targets` builds it anyway, and
+        // a host build of it fails. An exclusion that depends on another
+        // file's setting is an exclusion that quietly stops working.
+        assert!(EXCLUDED_HOST_PACKAGES.contains(&"nova-rt"));
+    }
+
+    #[test]
+    fn the_applications_are_excluded_from_host_tests() {
+        assert!(EXCLUDED_HOST_PACKAGES.contains(&"nova-apps"));
+    }
+
+    #[test]
+    fn every_bare_metal_binary_is_excluded() {
+        // The rule, stated once: every workspace member that is a bare-metal
+        // binary rather than a library must be excluded from the host test
+        // run. A new one that is not would fail here rather than in CI.
+        for package in ["nova-kernel", "nova-rt", "nova-apps"] {
+            assert!(
+                EXCLUDED_HOST_PACKAGES.contains(&package),
+                "{package} is a bare-metal binary and must be excluded from the host tests"
+            );
+        }
     }
 
     #[test]

@@ -43,6 +43,67 @@ pub const KERNEL_NAME: &str = "nova-kernel.elf";
 /// Like [`KERNEL_NAME`], this must match the name in [`LIMINE_CONFIG`].
 pub const INITRAMFS_NAME: &str = "initramfs";
 
+/// The user-space runtime ELF's file name inside the ISO.
+///
+/// The kernel reads this file back through Limine's module mechanism, so the
+/// name is a contract between the xtask that stages it and the kernel that
+/// loads it. It is deliberately *not* the same as the initramfs name: the two
+/// are different things on the ISO, and conflating them would make the
+/// kernel's "is there a user image?" check depend on a file that means
+/// something else.
+pub const USER_IMAGE_NAME: &str = "nova-rt.elf";
+
+/// The user-space runtime's package name, as Cargo knows it.
+///
+/// The runtime is a workspace member, so `cargo build --package nova-rt`
+/// builds it for the bare-metal target like any other package. The name is
+/// named once so the build command and the artifact lookup cannot disagree.
+pub const USER_PACKAGE: &str = "nova-rt";
+
+/// The application package name, as Cargo knows it.
+pub const APP_PACKAGE: &str = "nova-apps";
+
+/// Programs packaged into the initramfs, in deterministic order.
+pub const APP_NAMES: &[&str] = &[
+    "init",
+    "echo-server",
+    "echo-client",
+    "file-server",
+    "console-server",
+    "shell",
+];
+
+/// Build a bounded `NOVAFS1` archive from named ELF files.
+pub fn build_initramfs(directory: &Path) -> Result<Vec<u8>, String> {
+    const HEADER_SIZE: usize = 64;
+    const NAME_LIMIT: usize = 31;
+    const MAX_FILES: usize = 8;
+
+    if APP_NAMES.len() > MAX_FILES {
+        return Err(format!("too many initramfs entries: {}", APP_NAMES.len()));
+    }
+
+    let mut archive = Vec::new();
+    for name in APP_NAMES {
+        let path = directory.join(name);
+        let data = std::fs::read(&path)
+            .map_err(|error| format!("cannot read app {}: {error}", path.display()))?;
+        if name.len() > NAME_LIMIT {
+            return Err(format!("app name {name:?} exceeds the initramfs limit"));
+        }
+        let size = u64::try_from(data.len())
+            .map_err(|_| format!("app {name:?} is too large for the initramfs"))?;
+
+        let mut header = [0u8; HEADER_SIZE];
+        header[..8].copy_from_slice(b"NOVAFS1\0");
+        header[8..8 + name.len()].copy_from_slice(name.as_bytes());
+        header[40..48].copy_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(&data);
+    }
+    Ok(archive)
+}
+
 /// The Limine menu entry's title, without its opening `/`.
 ///
 /// Named once so [`LIMINE_CONFIG`]'s opener and its `default_entry` cannot
@@ -242,6 +303,7 @@ serial: yes
     protocol: limine
     path: boot():/boot/{KERNEL_NAME}
     module_path: boot():/boot/{INITRAMFS_NAME}
+    module_path: boot():/boot/{USER_IMAGE_NAME}
 "#
     )
 }
@@ -314,6 +376,40 @@ pub fn kernel_artifact(profile: Option<&str>) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// The built user-space runtime ELF for `profile`.
+pub fn user_artifact(profile: Option<&str>) -> Result<PathBuf, String> {
+    // `debug` rather than `dev`: Cargo's directory name for the default profile
+    // is `debug` even though `--profile dev` is its official name.
+    let directory = match profile {
+        None | Some("dev") | Some("debug") => "debug",
+        Some(other) => other,
+    };
+
+    let path = target_dir().join(TARGET).join(directory).join(USER_PACKAGE);
+
+    if !path.exists() {
+        return Err(format!(
+            "user-space runtime artifact missing at {}; run `cargo xtask build` first",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Locate the built application binaries for `profile`.
+pub fn application_directory(profile: Option<&str>) -> Result<PathBuf, String> {
+    // Match Cargo's profile-directory naming: the default profile is written
+    // to `debug`, even though its official name is `dev`.
+    let directory = match profile {
+        None | Some("dev") | Some("debug") => "debug",
+        Some(other) => other,
+    };
+    let path = target_dir().join(TARGET).join(directory);
+    path.is_dir()
+        .then_some(path)
+        .ok_or_else(|| format!("the applications in {APP_PACKAGE} were not built"))
+}
+
 /// Where the ISO is written.
 pub fn iso_path() -> PathBuf {
     target_dir().join(IMAGE_SUBDIR).join("nova.iso")
@@ -324,13 +420,30 @@ pub fn stage_dir() -> PathBuf {
     target_dir().join(STAGE_SUBDIR)
 }
 
-/// Copy the kernel and Limine's binaries and config into a staging directory.
+/// Copy the kernel, the user-space runtime, and Limine's binaries and config
+/// into a staging directory.
 ///
 /// Returns the staging directory. Everything is copied rather than symlinked
 /// because `xorriso` follows links inconsistently across invocations, and an ISO
 /// that is correct on the author's machine but empty on CI is a miserable thing
 /// to debug.
-pub fn stage_image(kernel: &Path) -> Result<PathBuf, String> {
+///
+/// The user image is staged under [`USER_IMAGE_NAME`], which is the name the
+/// kernel reads back through Limine's module mechanism. It is staged *next to*
+/// the kernel rather than inside the initramfs because it is a different thing:
+/// one is an ELF the kernel maps into a user address space, the other is an
+/// archive the kernel unpacks.
+#[allow(dead_code)]
+fn stage_image(kernel: &Path, user: Option<&Path>) -> Result<PathBuf, String> {
+    stage_image_with_initramfs(kernel, user, None)
+}
+
+/// Copy the boot artifacts, optionally including an initramfs.
+pub fn stage_image_with_initramfs(
+    kernel: &Path,
+    user: Option<&Path>,
+    initramfs: Option<&[u8]>,
+) -> Result<PathBuf, String> {
     let stage = stage_dir();
     let boot = stage.join("boot");
 
@@ -343,6 +456,9 @@ pub fn stage_image(kernel: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&boot)
         .map_err(|error| format!("cannot create {}: {error}", boot.display()))?;
 
+    std::fs::write(boot.join(INITRAMFS_NAME), initramfs.unwrap_or(&[]))
+        .map_err(|error| format!("cannot write initramfs: {error}"))?;
+
     // The kernel, under the exact name `LIMINE_CONFIG` refers to.
     let kernel_dest = boot.join(KERNEL_NAME);
     std::fs::copy(kernel, &kernel_dest).map_err(|error| {
@@ -352,6 +468,21 @@ pub fn stage_image(kernel: &Path) -> Result<PathBuf, String> {
             kernel_dest.display()
         )
     })?;
+
+    // The user-space runtime, under the exact name the kernel looks for. Its
+    // absence is not an error: the kernel boots and reports that there is no
+    // user image, which is the right degradation for a machine with no user
+    // program.
+    if let Some(user) = user {
+        let user_dest = boot.join(USER_IMAGE_NAME);
+        std::fs::copy(user, &user_dest).map_err(|error| {
+            format!(
+                "cannot copy user image {} -> {}: {error}",
+                user.display(),
+                user_dest.display()
+            )
+        })?;
+    }
 
     // Limine's two boot images. Only one is used per boot path, but shipping
     // both means the same ISO works under UEFI and under BIOS, which is what
@@ -397,10 +528,11 @@ pub fn stage_image(kernel: &Path) -> Result<PathBuf, String> {
 
 /// Render [`LIMINE_CONFIG`] for a staging directory.
 ///
-/// `module_path` is emitted only when [`INITRAMFS_NAME`] exists in the staging
-/// tree, which makes this a pure function of what is actually on the ISO.
+/// Each `module_path` is emitted only when the file it names exists in the
+/// staging tree, which makes this a pure function of what is actually on the
+/// ISO.
 ///
-/// # Why the module line cannot simply always be present
+/// # Why the module lines cannot simply always be present
 ///
 /// A `module_path` naming a file that is not on the ISO does not produce a
 /// warning. Limine 12 **drops the entire entry**, leaving it with zero
@@ -417,17 +549,50 @@ pub fn stage_image(kernel: &Path) -> Result<PathBuf, String> {
 /// Omitting the line keeps a missing initramfs a *recoverable* degradation —
 /// the kernel boots with no module instead of the bootloader refusing to boot at
 /// all — which matters while the initramfs is still being built out.
+///
+/// # Why each line is checked separately
+///
+/// The entry names two modules: the initramfs and the user-space image. They
+/// are staged independently and can be absent independently, so filtering
+/// "all module lines if the initramfs is missing" would drop the user image
+/// too — and the user image is the one the kernel actually loads a program
+/// from. The check is per line, against the file that line names.
 fn limine_config(boot: &Path) -> String {
     let template = limine_config_template();
-    if boot.join(INITRAMFS_NAME).is_file() {
-        return template;
-    }
 
-    template
+    let rendered = template
         .lines()
-        .filter(|line| !line.trim_start().starts_with("module_path:"))
+        .filter(|line| {
+            let trimmed = line.trim_start();
+
+            if !trimmed.starts_with("module_path:") {
+                return true;
+            }
+
+            // The file name is the last path component of the option's value.
+            // The `boot():` prefix and the directory are not part of the name:
+            // what has to exist is the file in the staging tree.
+            let name = trimmed
+                .trim_start_matches("module_path:")
+                .trim()
+                .rsplit('/')
+                .next()
+                .unwrap_or_default();
+
+            boot.join(name).is_file()
+        })
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+
+    // `lines()` drops the trailing newline, and a config that does not end in
+    // one is not byte-identical to the template. The trailing newline is
+    // restored so that "nothing was filtered out" means "the bytes are the
+    // same", which is what the verbatim test asserts.
+    if template.ends_with('\n') {
+        format!("{rendered}\n")
+    } else {
+        rendered
+    }
 }
 
 /// Build the ISO from a staging directory.
@@ -641,15 +806,46 @@ mod tests {
 
     /// `limine_config` is a pure function of what is on disk.
     ///
-    /// With an initramfs present the template is emitted verbatim; without one
-    /// only the `module_path` line is filtered out.
+    /// With every module present the template is emitted verbatim; with one
+    /// missing, only the line naming that one file is filtered out.
+    ///
+    /// The user image is staged alongside the initramfs and named by a second
+    /// `module_path`, so a stage that has only the initramfs must lose exactly
+    /// one line and keep the other.
     #[test]
-    fn config_is_verbatim_when_initramfs_present() {
+    fn config_is_verbatim_when_every_module_is_present() {
         let stage = std::env::temp_dir().join(format!("novaos-limcfg-{}", std::process::id()));
         std::fs::create_dir_all(&stage).expect("create temp stage");
         std::fs::write(stage.join(INITRAMFS_NAME), b"").expect("write initramfs");
+        std::fs::write(stage.join(USER_IMAGE_NAME), b"").expect("write user image");
 
         assert_eq!(limine_config(&stage), config());
+
+        std::fs::remove_dir_all(&stage).ok();
+    }
+
+    /// A missing user image drops only the line that names it.
+    ///
+    /// The two modules are staged independently, so the filter has to be per
+    /// line rather than per file: filtering every `module_path` because the
+    /// initramfs is absent would also drop the user image, and the user image
+    /// is the one the kernel loads a program from.
+    #[test]
+    fn a_missing_user_image_keeps_the_initramfs_line() {
+        let stage = std::env::temp_dir().join(format!("novaos-limcfg-user-{}", std::process::id()));
+        std::fs::create_dir_all(&stage).expect("create temp stage");
+        std::fs::write(stage.join(INITRAMFS_NAME), b"").expect("write initramfs");
+
+        let rendered = limine_config(&stage);
+
+        assert!(
+            rendered.contains(&format!("module_path: boot():/boot/{INITRAMFS_NAME}")),
+            "the initramfs is present, so its module line must survive"
+        );
+        assert!(
+            !rendered.contains(&format!("module_path: boot():/boot/{USER_IMAGE_NAME}")),
+            "the user image is absent, so naming it would void the whole entry"
+        );
 
         std::fs::remove_dir_all(&stage).ok();
     }

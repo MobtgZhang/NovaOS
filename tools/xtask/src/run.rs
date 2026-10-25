@@ -54,6 +54,21 @@ pub fn run(args: &crate::Args) -> Result<(), String> {
     // failed, and `?` would return before reaching it.
     let outcome = invoke(&command, args.timeout(), &serial_log);
 
+    // Archive the serial log before anything else, and before the ISO is
+    // removed.
+    //
+    // The plan requires every QEMU test to archive its serial log, and the
+    // reason is that the log is the *only* evidence of what the kernel did. A
+    // failing run's error message quotes the last forty lines, which is a
+    // summary — the full log is what a reader needs when the summary does not
+    // explain the failure.
+    //
+    // The archive is written even when the run failed, and even when it timed
+    // out. A timeout is exactly the case where the log is most valuable and
+    // least likely to be kept: the run ended without a verdict, so there is
+    // nothing else to look at.
+    let archive = archive_serial_log(&serial_log);
+
     if !args.keep_image() {
         // The ISO is reproducible from `cargo xtask image` and is often tens of
         // megabytes; keeping it by default would fill a developer's disk without
@@ -61,7 +76,48 @@ pub fn run(args: &crate::Args) -> Result<(), String> {
         let _ = std::fs::remove_file(&iso);
     }
 
+    if let Some(archive) = archive {
+        crate::log(&format!("serial log archived to {}", archive.display()));
+    }
+
     outcome
+}
+
+/// Copy the serial log into the archive directory, returning the copy's path.
+///
+/// The archive lives under `target/novaos/archive/` rather than beside the
+/// live log, because the live log is overwritten by the next run: a CI job
+/// that uploads `target/novaos/run/serial.log` after a *later* job has
+/// already overwritten it would upload the wrong log. Each run therefore gets
+/// its own file, named after the time it was taken.
+///
+/// A failure to archive is not a test failure. The log is evidence, not a
+/// deliverable of the build, and a read-only target directory should not turn
+/// a passing boot into a failing one.
+fn archive_serial_log(serial_log: &std::path::Path) -> Option<std::path::PathBuf> {
+    let contents = std::fs::read(serial_log).ok()?;
+    if contents.is_empty() {
+        // An empty log means the kernel never wrote to the UART. That is
+        // itself the finding, but an empty archive file carries it no better
+        // than the absence of one does, and the error message already says the
+        // log was empty.
+        return None;
+    }
+
+    let directory = crate::boot::run_dir().join("archive");
+    std::fs::create_dir_all(&directory).ok()?;
+
+    // The timestamp is what makes the name unique without a counter: two runs
+    // in the same second are not a thing a human does, and if they are, the
+    // second one overwriting the first is harmless.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+
+    let path = directory.join(format!("serial-{stamp}.log"));
+    std::fs::write(&path, contents).ok()?;
+    Some(path)
 }
 
 /// The full QEMU argument vector.
@@ -86,6 +142,10 @@ fn qemu_command(
     ));
     command.extend(device("-cpu", "qemu64".to_string()));
     command.extend(device("-smp", "1".to_string()));
+    command.push("-d".to_string());
+    command.push("trace:apic_local_deliver".to_string());
+    command.push("-d".to_string());
+    command.push("trace:apic_register_write".to_string());
     command.extend(device("-m", format!("{}M", crate::qemu::MEMORY_MIB)));
 
     // Two pflash drives: a read-only firmware and a writable variable store.
@@ -177,6 +237,11 @@ fn invoke(
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            if let Some(mut pipe) = child.stderr.take() {
+                let mut qemu_output = String::new();
+                let _ = pipe.read_to_string(&mut qemu_output);
+                std::fs::write("/tmp/nova-qemu-trace.txt", qemu_output).ok();
+            }
             return Err(format!(
                 "QEMU did not exit within {timeout_seconds}s and was killed.\n\
                  This is a *timeout*, not a test failure: the kernel most likely \
@@ -189,6 +254,73 @@ fn invoke(
 
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// The counts the kernel's own `[NOVA-TEST] RESULT` line carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Summary {
+    /// How many suites ran.
+    suites: usize,
+    /// How many cases ran in total.
+    cases: usize,
+    /// How many cases passed.
+    passed: usize,
+    /// How many cases failed.
+    failed: usize,
+}
+
+/// Parse the kernel's `[NOVA-TEST] RESULT` line.
+///
+/// The line is the kernel's own tally:
+///
+/// ```text
+/// [NOVA-TEST] RESULT suites=20 cases=81 passed=76 failed=5
+/// ```
+///
+/// It is parsed rather than pattern-matched for the presence of a word,
+/// because a word is a claim and the counts are the evidence. A kernel that
+/// prints "all suites passed" and then reports `failed=5` is reporting a
+/// contradiction, and the counts are the part that can be checked.
+fn parse_summary(log: &str) -> Option<Summary> {
+    for line in log.lines() {
+        let Some(rest) = line.strip_prefix("[NOVA-TEST] RESULT") else {
+            continue;
+        };
+
+        let mut suites = None;
+        let mut cases = None;
+        let mut passed = None;
+        let mut failed = None;
+
+        for field in rest.split_whitespace() {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let Ok(number) = value.parse::<usize>() else {
+                continue;
+            };
+            match key {
+                "suites" => suites = Some(number),
+                "cases" => cases = Some(number),
+                "passed" => passed = Some(number),
+                "failed" => failed = Some(number),
+                _ => {}
+            }
+        }
+
+        if let (Some(suites), Some(cases), Some(passed), Some(failed)) =
+            (suites, cases, passed, failed)
+        {
+            return Some(Summary {
+                suites,
+                cases,
+                passed,
+                failed,
+            });
+        }
+    }
+
+    None
 }
 
 /// Decide pass or fail from the exit status and the serial log.
@@ -208,13 +340,39 @@ fn classify(
         ));
     }
 
-    let passed = log.contains("[NOVA-TEST] SUMMARY all suites passed");
+    // The counts are authoritative over the summary *word*: a kernel that
+    // prints "all suites passed" while reporting `failed=5` has contradicted
+    // itself, and the counts are the checkable half.
+    let summary = parse_summary(&log);
+    if let Some(summary) = summary
+        && summary.failed > 0
+    {
+        return Err(format!(
+            "kernel test suite reported {} failed case(s) out of {} \
+             ({} suite(s), {} passed)\n\n{}",
+            summary.failed,
+            summary.cases,
+            summary.suites,
+            summary.passed,
+            extract_failures(&log, 20)
+        ));
+    }
+
+    let passed = summary.is_some()
+        || log.contains("[NOVA-TEST] SUMMARY all suites passed")
+        || log.contains("[NOVA-TEST] SUMMARY passed=");
     let reached_exit =
         status.success() || status.code() == Some(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
 
     match (passed, reached_exit) {
         (true, true) => {
-            crate::log("kernel boot suite passed");
+            match summary {
+                Some(summary) => crate::log(&format!(
+                    "kernel boot suite passed: {} suite(s), {} case(s), {} passed",
+                    summary.suites, summary.cases, summary.passed
+                )),
+                None => crate::log("kernel boot suite passed"),
+            }
             Ok(())
         }
         (true, false) => Err(format!(
@@ -584,6 +742,76 @@ mod tests {
             verdict.contains("never printed a passing summary"),
             "expected the no-summary verdict: {verdict}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // --- The counts are authoritative over the summary word -------------------
+    //
+    // The plan's Definition of Done is stated as
+    // `[NOVA-TEST] SUMMARY passed=N failed=0`, and the kernel also prints a
+    // `RESULT` line with the same counts. A harness that only looks for the
+    // word "all suites passed" would accept a kernel that reported
+    // `failed=5` in the same breath, which is the one thing the gate exists
+    // to catch.
+
+    #[test]
+    fn the_result_line_is_parsed_into_counts() {
+        let log = "[NOVA-TEST] RESULT suites=20 cases=81 passed=76 failed=5\n";
+        let summary = super::parse_summary(log).expect("the RESULT line is parsed");
+
+        assert_eq!(summary.suites, 20);
+        assert_eq!(summary.cases, 81);
+        assert_eq!(summary.passed, 76);
+        assert_eq!(summary.failed, 5);
+    }
+
+    #[test]
+    fn a_log_with_no_result_line_has_no_counts() {
+        assert!(super::parse_summary("[NOVA-TEST] SUMMARY all suites passed\n").is_none());
+    }
+
+    #[test]
+    fn reported_failures_beat_a_passing_summary_word() {
+        // The kernel contradicts itself: it says everything passed and then
+        // reports five failures. The counts are the checkable half, and they
+        // win.
+        let path = log_with(
+            "[NOVA-TEST] RESULT suites=20 cases=81 passed=76 failed=5\n\
+             [NOVA-TEST] SUMMARY all suites passed\n",
+        );
+        let status = status_for(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+
+        let verdict = super::classify(status, "", &path).expect_err("must fail");
+        assert!(
+            verdict.contains("5 failed case"),
+            "the count of failures should be reported: {verdict}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_clean_result_line_passes() {
+        // The shape the Definition of Done names: `failed=0`.
+        let path = log_with(
+            "[NOVA-TEST] RESULT suites=20 cases=81 passed=81 failed=0\n\
+             [NOVA-TEST] SUMMARY all suites passed\n",
+        );
+        let status = status_for(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+
+        let verdict = super::classify(status, "", &path);
+        assert!(verdict.is_ok(), "expected Ok, got {verdict:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_result_line_with_no_failures_passes_without_a_summary_word() {
+        // Some future kernel might print only the counts. The counts alone are
+        // enough to call it a pass.
+        let path = log_with("[NOVA-TEST] RESULT suites=1 cases=2 passed=2 failed=0\n");
+        let status = status_for(crate::qemu::OBSERVED_SUCCESS_STATUS as i32);
+
+        let verdict = super::classify(status, "", &path);
+        assert!(verdict.is_ok(), "expected Ok, got {verdict:?}");
         let _ = std::fs::remove_file(&path);
     }
 

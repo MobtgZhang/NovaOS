@@ -18,6 +18,7 @@
 //!   them. That is what makes the host test run work without an override, and it
 //!   is why the two builds can share one workspace.
 
+use crate::boot::{APP_PACKAGE, USER_PACKAGE};
 use crate::{log, run_command_owned};
 
 /// Cargo target triple for the kernel.
@@ -70,6 +71,58 @@ pub fn build_kernel(profile: &str) -> Result<(), String> {
     )
 }
 
+/// Build the user-space runtime for the bare-metal target with `profile`.
+///
+/// # Panics
+///
+/// Never. Every failure is a returned `Err` carrying the command that failed,
+/// because a panic here would print a backtrace instead of the thing worth
+/// reading.
+pub fn build_user(profile: &str) -> Result<(), String> {
+    build_applications(profile)?;
+    build_runtime(profile)
+}
+
+fn build_runtime(profile: &str) -> Result<(), String> {
+    log(&format!(
+        "building the user-space runtime (--package {USER_PACKAGE} --target {KERNEL_TARGET} --profile {profile})"
+    ));
+
+    run_command_owned(
+        &[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--package".to_string(),
+            USER_PACKAGE.to_string(),
+            "--target".to_string(),
+            KERNEL_TARGET.to_string(),
+            "--profile".to_string(),
+            profile.to_string(),
+        ],
+        "user-space runtime build",
+    )
+}
+
+fn build_applications(profile: &str) -> Result<(), String> {
+    log(&format!(
+        "building user-space applications (--package {APP_PACKAGE} --target {KERNEL_TARGET} --profile {profile})"
+    ));
+
+    run_command_owned(
+        &[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--package".to_string(),
+            APP_PACKAGE.to_string(),
+            "--target".to_string(),
+            KERNEL_TARGET.to_string(),
+            "--profile".to_string(),
+            profile.to_string(),
+        ],
+        "user-space application build",
+    )
+}
+
 /// Build the host-side crates, `xtask` included.
 ///
 /// `xtask` is in the list so that a `cargo xtask` invocation always runs code
@@ -99,22 +152,30 @@ pub fn build_host(profile: &str) -> Result<(), String> {
 ///
 /// # Why the host build is not part of the kernel path
 ///
-/// [`crate::image`] needs only the kernel binary: an ISO with one ELF on it
-/// boots, because userspace arrives in M2 and is delivered as an initramfs built
-/// by a separate command. Folding the host build in here would mean a kernel
-/// test run fails for an unrelated reason the moment a `crates/` crate stops
-/// compiling — which is exactly the wrong time to learn it.
+/// [`crate::image`] needs only the two bare-metal binaries: an ISO with the
+/// kernel on it boots, and userspace is a module the kernel may or may not
+/// find. Folding the host build in here would mean a kernel test run fails for
+/// an unrelated reason the moment a `crates/` crate stops compiling — which is
+/// exactly the wrong time to learn it.
 pub fn build_for_profile(requested: Option<&str>) -> Result<String, String> {
     let profile = requested.unwrap_or(DEFAULT_PROFILE).to_string();
     build_kernel(&profile)?;
+    build_user(&profile)?;
     build_host(&profile)?;
     Ok(profile)
 }
 
-/// Build only what an ISO needs: the kernel.
+/// Build only what an ISO needs: the kernel and the user-space runtime.
+///
+/// The user runtime is a separate package with its own linker script and its
+/// own target flags, and the ISO carries it as a Limine module. It is built
+/// here rather than on demand so that a missing user image is a *build*
+/// failure — with a message naming the package — rather than a boot that
+/// silently comes up with no program to run.
 pub fn build_kernel_only(requested: Option<&str>) -> Result<String, String> {
     let profile = requested.unwrap_or(DEFAULT_PROFILE).to_string();
     build_kernel(&profile)?;
+    build_user(&profile)?;
     Ok(profile)
 }
 
