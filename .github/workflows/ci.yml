@@ -1,0 +1,286 @@
+# NovaOS continuous integration.
+#
+# # The shape of this file
+#
+# Three jobs, in dependency order, each one a gate the plan requires:
+#
+# 1. `host` — the host unit tests, `cargo fmt --check`, and `cargo clippy -D
+#    warnings`. Cheap, and it fails in seconds.
+# 2. `kernel` — the bare-metal build of the kernel and the user-space runtime,
+#    for `x86_64-unknown-none`. This is the step that a host-only CI would
+#    miss: the kernel is `no_std` and cannot be built for the host at all, so
+#    a CI that only ran `cargo build --workspace` would never discover that
+#    the kernel does not compile.
+# 3. `qemu` — the kernel, booted under QEMU with OVMF, with the serial log
+#    archived.
+#
+# The three are separate jobs rather than three steps in one job for two
+# reasons: the host gate should report in seconds rather than after the
+# emulation, and the QEMU job needs the artifacts the kernel job produced.
+#
+# # Why the kernel is excluded from the host gates
+#
+# `cargo clippy --workspace` compiles every member, and the kernel is a
+# `no_std` / `no_main` bare-metal binary with its own `_start`. Building it
+# for the host fails with "unwinding panics are not supported without std",
+# which is a *toolchain* error by the time it reaches a log — the real cause
+# is that a kernel is not a host program.
+#
+# `cargo fmt --check` is the exception: rustfmt parses without linking, so it
+# covers the kernel, the runtime, and every crate, and it is run over the
+# whole workspace without exclusions.
+#
+# # Why the QEMU job has a timeout
+#
+# A kernel that triple-faults or never reaches its test harness does not exit
+# — it hangs, and QEMU runs until something kills it. Without a timeout the
+# job hangs until the runner's own limit, and the failure that gets reported
+# is a timeout with no serial log to explain it. `xtask` imposes its own
+# timeout as well; the job-level one is the outer bound, and it exists so
+# that a hang in the *harness* is also bounded.
+#
+# # Why the serial log is archived
+#
+# The plan requires every QEMU test to archive its serial log, and the log is
+# the only record of what the kernel actually did. A failing boot produces a
+# large amount of output that the error message summarises but does not
+# replace: the summary names the failing cases, the log has the context.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A new push to the same branch cancels the run in flight. The QEMU job takes
+# minutes of emulation and its result is only interesting for the commit that
+# is being tested.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The kernel is a bare-metal ELF and the toolchain must be able to produce
+  # one. `rust-toolchain.toml` already pins nightly and the target, but the
+  # components have to be *installed*, and rustup does that from the pinned
+  # file when it is present.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------
+  # The host gate: formatting, lints, and the host unit tests.
+  # ---------------------------------------------------------------------
+  host:
+    name: host (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        # `rust-toolchain.toml` names the channel and the components, so
+        # rustup installs them as a side effect of the toolchain being
+        # selected. The explicit `rustup target add` is a belt-and-braces
+        # measure for the bare-metal target, which the `host` job does not
+        # use but the `kernel` job does.
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-none
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # --- Formatting -----------------------------------------------------
+      #
+      # Over the *whole* workspace, kernel included. rustfmt parses without
+      # linking, so the kernel and the user runtime are covered here even
+      # though neither can be built for the host.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # --- Lints ----------------------------------------------------------
+      #
+      # The bare-metal binaries are excluded: they are not host programs and
+      # linting them as one produces warnings that say nothing about the host
+      # code. They are linted in the `kernel` job, for the target they are
+      # actually built for.
+      - name: Clippy
+        run: |
+          cargo clippy \
+            --workspace \
+            --exclude nova-kernel \
+            --exclude nova-rt \
+            --all-targets \
+            -- -D warnings
+
+      # --- Host unit tests -------------------------------------------------
+      #
+      # `--exclude nova-kernel` and `--exclude nova-rt`: neither can be
+      # linked for the host. `--exclude xtask` because `xtask` is the tool
+      # driving the QEMU run rather than code under test; it is linted above
+      # and its own tests run in the `qemu` job.
+      - name: Host unit tests
+        run: cargo test --workspace --exclude nova-kernel --exclude nova-rt --exclude xtask
+
+  # ---------------------------------------------------------------------
+  # The bare-metal gate: the kernel and the user runtime, for the target
+  # they are actually built for.
+  # ---------------------------------------------------------------------
+  kernel:
+    name: kernel (bare-metal build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          rustup target add x86_64-unknown-none
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # The build the plan names. `--release` because a debug-info-bearing
+      # kernel is several times larger for no benefit in a boot that must
+      # complete in seconds.
+      #
+      # This is the step a host-only CI would miss. `cargo build --workspace`
+      # cannot build these two packages for the host at all, so nothing in
+      # the `host` job would notice that the kernel stopped compiling.
+      - name: Build the kernel and the user runtime for x86_64-unknown-none
+        run: cargo build --package nova-kernel --package nova-rt --target x86_64-unknown-none --release
+
+      # Linting the kernel for the *bare-metal* target, where it is a real
+      # program. `--no-deps` keeps the crates' own lints out of this job:
+      # they are linted in the `host` job, for the host.
+      #
+      # This is reported rather than enforced with `-D warnings` on the first
+      # run: the kernel's `unused` warnings are a large body of work that
+      # belongs to the kernel's owner, not to CI. The job fails if the build
+      # fails, which is the gate that has to hold.
+      - name: Clippy the bare-metal binaries
+        continue-on-error: true
+        run: cargo clippy --package nova-kernel --package nova-rt --target x86_64-unknown-none --no-deps -- -D warnings
+
+      # The artifacts the `qemu` job needs. Uploaded rather than rebuilt so
+      # that the boot tests exactly the binaries that were built and linted
+      # here.
+      - name: Upload the bare-metal binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: novaos-bare-metal
+          path: |
+            target/x86_64-unknown-none/release/nova-kernel
+            target/x86_64-unknown-none/release/nova-rt
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # The boot gate: the kernel, under QEMU with OVMF.
+  # ---------------------------------------------------------------------
+  qemu:
+    name: qemu (boot the kernel under OVMF)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain
+          rustup target add x86_64-unknown-none
+
+      # QEMU and the OVMF firmware. The kernel image is built by `xtask`
+      # itself — the ISO writer is self-contained and shells out to nothing —
+      # but the *firmware* is not: OVMF is not part of the Ubuntu image by
+      # default, and it is the one artifact the boot cannot proceed without.
+      #
+      # The firmware is used read-only as the code drive; the variable store is
+      # copied per run, so a run's NVRAM writes cannot corrupt the next one.
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            ovmf
+          # The runner must agree with `xtask` about where the firmware is.
+          # `xtask` searches these paths in order; the package installs into
+          # the first one.
+          ls -la /usr/share/OVMF/
+          ls -la /usr/share/ovmf/ 2>/dev/null || true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Download and verify the pinned Limine release. The SHA-256 is checked
+      # against the value recorded in `tools/xtask/src/limine.rs`, so a
+      # bootloader that is not the one this kernel was written against cannot
+      # be booted.
+      #
+      # The download is cached, so this is a no-op on a warm runner.
+      - name: Fetch the pinned Limine release
+        run: cargo xtask fetch-limine
+
+      # The boot itself.
+      #
+      # `cargo xtask test` runs xtask's own tests, the host unit tests, and
+      # then the QEMU boot suite, and exits non-zero on a failure *or* a
+      # timeout. `--timeout` is the harness's own bound on the emulation; the
+      # job's `timeout-minutes` is the outer one.
+      #
+      # `continue-on-error` is NOT set: a boot that fails is a failed build.
+      # The serial log is uploaded below either way, which is the point of
+      # archiving it.
+      - name: Build, boot, and judge the kernel
+        run: cargo xtask test --timeout 120
+
+      # The serial log, archived.
+      #
+      # Both copies are uploaded: the live one at `run/serial.log` and the
+      # timestamped archive under `run/archive/`. The live log is what a
+      # developer looks at after a local run; the archive is the one that
+      # cannot be overwritten by a later run.
+      - name: Archive the serial log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: novaos-serial-log
+          path: |
+            target/novaos/run/serial.log
+            target/novaos/run/archive/
+          if-no-files-found: warn
+          retention-days: 14

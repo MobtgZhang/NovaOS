@@ -12,7 +12,32 @@ target-dir = "target"
 # not so the logic lives here.
 nova-build = "build --package nova-kernel --target x86_64-unknown-none"
 nova-run = "run --package xtask --"
-nova-test-host = "test --workspace --exclude nova-kernel --exclude xtask"
+# `nova-rt` is excluded for the same reason as `nova-kernel`: it is a bare-metal
+# `no_std` / `no_main` binary with its own `_start`. `cargo test` does not build
+# it today (its manifest sets `test = false`), but `cargo clippy --all-targets`
+# does, and it fails there — so the exclusion is kept explicit rather than
+# relying on the manifest's current setting.
+nova-test-host = "test --workspace --exclude nova-kernel --exclude nova-rt --exclude xtask"
+
+# The quality gates, as one word each.
+#
+# `nova-fmt` and `nova-clippy` are the two gates the plan requires to be
+# warning-free. Both exclude the bare-metal binaries: a kernel is not a host
+# program, and linting it as one produces hundreds of warnings that say
+# nothing about the host code — `unused` on every kernel-internal symbol, and
+# `undocumented_unsafe_blocks` on a kernel whose `unsafe` surface is the whole
+# of its privileged surface.
+#
+# `nova-clippy-kernel` lints the kernel for the *bare-metal* target instead,
+# where it is a real program. It is not part of `nova-clippy` because a
+# `--target` cannot be combined with `--workspace`, and the two need different
+# targets.
+nova-fmt = "fmt --all -- --check"
+nova-clippy = "clippy --workspace --exclude nova-kernel --exclude nova-rt --all-targets -- -D warnings"
+nova-clippy-kernel = "clippy --package nova-kernel --package nova-rt --target x86_64-unknown-none -- -D warnings"
+
+# The bare-metal build, for both binaries the ISO carries.
+nova-build-bare = "build --package nova-kernel --package nova-rt --target x86_64-unknown-none --release"
 
 # Aliases for the `xtask` subcommands, so the documented workflows read as one
 # word. `cargo xtask <cmd>` is the same binary and takes the same arguments.
@@ -53,15 +78,24 @@ rustflags = [
     # x86-64-unknown-none still advertises SSE2, but no FPU state is initialised
     # before M2 saves it per thread.
     "-C", "target-feature=-sse,-sse2",
-    # The kernel script places the image at a fixed higher-half VMA with a low
-    # LMA. Without this, `rust-lld` picks its own default entry layout and the
-    # `__kernel_phys_base` symbol the allocator reads would not exist.
-    "-C", "link-arg=-Tkernel/linker.ld",
     # Limine's protocol structures are addressed by absolute virtual address, so
     # the linker must not emit a PT_INTERP or dynamic segment looking for a
     # dynamic loader that does not exist on bare metal.
     "-C", "link-arg=--no-dynamic-linker",
 ]
+
+# NOTE: the kernel's *linker script* is deliberately NOT listed here.
+#
+# These rustflags are keyed on the target, so they apply to every crate built
+# for `x86_64-unknown-none` — including the user-space runtime, which needs a
+# completely different layout (low half of the address space, entry at
+# `0x1000`). A `-C link-arg=-T...` here would hand the kernel's script to the
+# user runtime too, and the user image would be linked at the kernel's
+# higher-half addresses, where the loader's user-window check rejects it.
+#
+# The script is named by the *package* instead: `kernel/build.rs` names
+# `kernel/linker.ld`, and `user/nova-rt/build.rs` names `user/linker.ld`.
+# Two packages, two scripts, and neither can pick up the other's.
 
 [target.x86_64-unknown-linux-gnu]
 # Host builds (xtask, unit tests) use std and the default panic strategy.

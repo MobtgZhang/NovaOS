@@ -125,16 +125,51 @@ This structure is a **target layout**; individual directories will be created as
 
 ## Building and Running
 
-There is **no supported build-and-boot workflow yet**. The following commands describe the *intended future* workflow; they will become available after the build tooling is implemented:
+NovaOS builds with a pinned nightly toolchain, the `x86_64-unknown-none` bare-metal target, QEMU, and OVMF. `cargo xtask` owns the build/image/run sequencing.
 
 ```bash
-# Planned commands — not functional in the design-only stage
+# Fetch and verify the pinned Limine release (needed once per checkout)
+cargo xtask fetch-limine
+
+# Build the kernel and the user-space runtime for x86_64-unknown-none
+cargo nova-build-bare
+
+# Build a bootable ISO, then boot it under QEMU/OVMF with a serial console
 cargo xtask image
 cargo xtask run
-cargo xtask test-qemu
+
+# The full test suite: xtask's tests, the host unit tests, then the QEMU
+# boot suite. Exits non-zero on a failure *or* a timeout.
+cargo xtask test
 ```
 
-The build environment will require a pinned Rust toolchain, the x86-64 bare-metal target, QEMU, OVMF, and a compatible Limine version. Producing a bootable image requires packaging the kernel, bootloader, and initial user-space image; `cargo build` alone is not sufficient.
+### Quality gates
+
+`scripts/gates.sh` runs the four gates the plan requires, in cheapest-first order:
+
+```bash
+scripts/gates.sh          # every gate
+scripts/gates.sh fmt      # cargo fmt --all -- --check
+scripts/gates.sh clippy   # cargo clippy -D warnings (host crates)
+scripts/gates.sh test     # host unit tests
+scripts/gates.sh kernel   # the bare-metal build
+scripts/gates.sh boot     # the QEMU boot suite
+```
+
+The same commands are available individually:
+
+| Command | What it does |
+| --- | --- |
+| `cargo nova-test-host` | The host unit tests, without the bare-metal binaries |
+| `cargo nova-fmt` | `cargo fmt --all -- --check`, over the whole workspace |
+| `cargo nova-clippy` | `cargo clippy -D warnings` over the host crates |
+| `cargo nova-clippy-kernel` | The same, for the bare-metal binaries, on the bare-metal target |
+| `cargo nova-build-bare` | The kernel and the user runtime, for `x86_64-unknown-none` |
+| `cargo nova-build` | The kernel, for `x86_64-unknown-none` |
+
+> **The kernel is not a host program.** `nova-kernel` and `nova-rt` are `no_std` / `no_main` bare-metal binaries with their own `_start` and their own linker scripts. Building either for the host fails with `unwinding panics are not supported without std` — an error that reads like a broken toolchain and is really a bare-metal binary being built for the wrong target. They are excluded from the host gates and built by `nova-build-bare` instead.
+
+Every QEMU run writes its serial log to `target/novaos/run/serial.log` and archives a timestamped copy under `target/novaos/run/archive/`.
 
 ## Contributing
 

@@ -14,6 +14,36 @@ members = [
     "crates/nova-ipc",
     "crates/nova-protocols",
     "tools/xtask",
+    "user/nova-rt",
+    "user/apps",
+]
+
+# The members a bare `cargo build` or `cargo test` acts on.
+#
+# `kernel` and `user/nova-rt` are deliberately absent. Both are `no_std` /
+# `no_main` bare-metal binaries with their own `_start` and their own linker
+# scripts, and neither can be linked for the host: the host has no
+# `#[panic_handler]`, and the `unwinding panics are not supported without std`
+# error is what a host build of either one produces.
+#
+# That error is the trap this field exists to close. Without it, `cargo build`
+# in a clean checkout fails with a message about unwinding panics — a problem
+# that reads as a broken toolchain and is really a bare-metal binary being
+# built for the wrong target. The kernel is built for
+# `x86_64-unknown-none` instead, by `cargo nova-build` and by `cargo xtask
+# build`; the user runtime is built by the same commands.
+#
+# `--workspace` still reaches every member, so nothing is hidden from a
+# deliberate sweep — it is only the *implicit* default that changes.
+default-members = [
+    "crates/nova-abi",
+    "crates/nova-cap",
+    "crates/nova-core",
+    "crates/nova-elf",
+    "crates/nova-fs",
+    "crates/nova-ipc",
+    "crates/nova-protocols",
+    "tools/xtask",
 ]
 
 [workspace.package]

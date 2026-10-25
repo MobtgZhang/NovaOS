@@ -13,6 +13,16 @@ name = "nova-abi"
 version = "0.1.0"
 
 [[package]]
+name = "nova-apps"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+ "nova-fs",
+ "nova-ipc",
+ "nova-protocols",
+]
+
+[[package]]
 name = "nova-cap"
 version = "0.1.0"
 dependencies = [
