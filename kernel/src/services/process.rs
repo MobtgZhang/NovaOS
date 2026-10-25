@@ -3,11 +3,12 @@
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
 
+use crate::boot::BootInfo;
 use crate::klog;
 use crate::loader;
 use crate::logger::Level;
 use crate::mm::address_space;
-use crate::services::{KernelState, MAX_TASKS};
+use crate::services::{KernelState, MAX_SERVICE_NAME, MAX_TASKS};
 use crate::task::{self, Entry};
 
 /// A unique identifier for each thread created by the process layer.
@@ -29,31 +30,56 @@ fn next_thread_id() -> u32 {
 /// Execute `name` from the initramfs as a child of the current task.
 pub fn exec_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
     let context = task::current_syscall_context();
+    // SAFETY: service state is installed before user processes can run, and
+    // the syscall path holds the only mutable borrow.
+    let kernel = unsafe { crate::services::state() };
+    crate::services::dispatch::check_spawn_authority(kernel, &context)?;
     exec_image_in(name, context.task_slot)
 }
 
 /// Start `name` from the initramfs as a child of `parent_slot`.
 pub fn exec_image_in(name: &[u8], parent_slot: usize) -> Result<CapHandle, ErrorCode> {
+    // SAFETY: boot capture has run, and syscall entry runs with interrupts
+    // masked; this is the same contract as the rest of the syscall path.
+    let boot_info = unsafe { crate::boot::read_boot_info() };
+    // SAFETY: service state is installed before user processes can run, and
+    // the syscall path holds the only mutable borrow.
+    let kernel = unsafe { crate::services::state() };
+    exec_image_in_state(kernel, name, parent_slot, boot_info)
+}
+
+/// Start an image against an explicit kernel state.
+///
+/// The kernel's real state and the test state are separate static instances.
+/// Keeping the execution logic behind this function lets the test suites
+/// exercise the same authority and spawn logic without observing the live
+/// boot state.
+pub(crate) fn exec_image_in_state(
+    kernel: &mut KernelState,
+    name: &[u8],
+    parent_slot: usize,
+    boot_info: &'static BootInfo,
+) -> Result<CapHandle, ErrorCode> {
     let Some(archive_bytes) = crate::boot::initramfs() else {
         klog!(Level::Error, "process: no initramfs");
         return Err(ErrorCode::Unsupported);
     };
     let archive =
         crate::initramfs::Archive::parse(archive_bytes).map_err(|_| ErrorCode::Invalid)?;
+    if name.len() > MAX_SERVICE_NAME {
+        klog!(Level::Error, "process: service name overflow");
+        return Err(ErrorCode::Invalid);
+    }
     let image = archive.get(name).ok_or(ErrorCode::BadHandle)?;
 
-    // SAFETY: boot capture has run, and syscall entry runs with interrupts
-    // masked; this is the same contract as the rest of the syscall path.
-    let boot_info = unsafe { crate::boot::read_boot_info() };
     if parent_slot >= MAX_TASKS {
         klog!(Level::Error, "process: parent slot overflow");
         return Err(ErrorCode::BadHandle);
     }
 
-    // SAFETY: service state is installed before user processes can run, and
-    // the syscall path holds the only mutable borrow.
-    let kernel = unsafe { crate::services::state() };
-    let Some(child_task) = kernel.create_task() else {
+    crate::services::dispatch::check_spawn_authority_at_slot(kernel, parent_slot)?;
+
+    let Some(child_task) = kernel.create_bare_task() else {
         klog!(Level::Error, "process: no task slot");
         return Err(ErrorCode::NoMemory);
     };
@@ -80,6 +106,8 @@ pub fn exec_image_in(name: &[u8], parent_slot: usize) -> Result<CapHandle, Error
 
     if let Some(child) = kernel.task_at_slot_mut(child_slot) {
         child.management_endpoint = child_endpoint;
+        child.service_name[..name.len()].copy_from_slice(name);
+        child.service_name_len = name.len();
     }
 
     let Some(mut thread) = task::create_thread(
@@ -134,6 +162,20 @@ pub fn live_task_count() -> usize {
             .filter(|task| task.alive)
             .count()
     }
+}
+
+/// Remove a dead task and release its slot.
+pub fn retire_task(slot: usize) -> bool {
+    // SAFETY: syscall path is serialised; exiting thread cannot return.
+    let kernel = unsafe { crate::services::state() };
+    kernel.retire_task(slot)
+}
+
+/// Whether a live task was started from the named initramfs image.
+pub fn service_is_alive(name: &[u8]) -> bool {
+    // SAFETY: syscall path is serialised.
+    let kernel = unsafe { crate::services::state() };
+    kernel.service_is_alive(name)
 }
 
 /// Create both sides of an endpoint pair in the calling task.
