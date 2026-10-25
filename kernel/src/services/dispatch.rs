@@ -241,7 +241,10 @@ pub fn dispatch_typed(
         nr::CALL => send(kernel, context, args, true),
         nr::REPLY => reply(kernel, context, args),
         nr::YIELD => SyscallOutcome::Value(0),
-        nr::THREAD_EXIT => SyscallOutcome::Value(args[0] as i64),
+        nr::THREAD_EXIT => {
+            crate::services::process::retire_task(context.task_slot);
+            SyscallOutcome::Value(args[0] as i64)
+        }
         nr::ENDPOINT_CREATE => match process::create_endpoint_pair() {
             Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
             Err(code) => SyscallOutcome::Failed(code),
@@ -279,11 +282,21 @@ const fn version_word() -> i64 {
 /// dispatched to, it simply holds no authority at all. `E_BAD_HANDLE` would
 /// say the caller named a capability that does not exist, which is a
 /// statement about the *argument* rather than about the caller's authority.
-fn check_spawn_authority(kernel: &KernelState, context: &SyscallContext) -> Result<(), ErrorCode> {
-    let Some(task) = kernel.task_at_slot(context.task_slot) else {
+pub(crate) fn check_spawn_authority(
+    kernel: &KernelState,
+    context: &SyscallContext,
+) -> Result<(), ErrorCode> {
+    check_spawn_authority_at_slot(kernel, context.task_slot)
+}
+
+pub(crate) fn check_spawn_authority_at_slot(
+    kernel: &KernelState,
+    task_slot: usize,
+) -> Result<(), ErrorCode> {
+    let Some(task) = kernel.task_at_slot(task_slot) else {
         return Err(ErrorCode::BadHandle);
     };
-    let Some(table) = kernel.caps_at(context.task_slot) else {
+    let Some(table) = kernel.caps_at(task_slot) else {
         return Err(ErrorCode::BadHandle);
     };
     let rights = table.root_authority(task.root)?;
