@@ -242,6 +242,68 @@ pub unsafe fn exit_current_thread() {
     }
 }
 
+/// Kill the current user thread after an unhandled ring-3 fault.
+///
+/// # Safety
+///
+/// Must only be called from the exception dispatch path, with interrupts
+/// masked, while the faulting user thread is still the scheduler's current
+/// thread.
+pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
+    // SAFETY: exception entry masks interrupts and this is the scheduler path.
+    unsafe {
+        let Some(slot) = CURRENT_SLOT else {
+            klog!(Level::Error, "sched: user fault without current thread");
+            crate::arch::exit(crate::EXIT_PANIC)
+        };
+
+        let Some(mut thread) = task::thread_in_slot(slot) else {
+            klog!(Level::Error, "sched: user fault has no thread record");
+            crate::arch::exit(crate::EXIT_PANIC)
+        };
+
+        thread.fault_address = fault_address;
+        task::update_thread(slot, thread);
+
+        let process = thread.process;
+        exit_current_thread();
+        crate::services::process::retire_task(process);
+        switch_to_next()
+    }
+}
+
+/// Reap exited threads that can no longer be using their kernel stacks.
+///
+/// The exiting thread is still running on its stack until the context switch
+/// returns to another thread, so that thread is deliberately skipped here. It
+/// is reaped on the following switch, once a different thread owns the CPU.
+///
+/// # Safety
+///
+/// Must only be called from the scheduler path, with interrupts masked.
+pub unsafe fn reap_exited_threads() {
+    // SAFETY: scheduler and thread-pool access are serialised by this contract.
+    unsafe {
+        let current_slot = CURRENT_SLOT;
+        for slot in 0..task::MAX_THREADS {
+            if Some(slot) == current_slot {
+                continue;
+            }
+
+            let Some(thread) = task::thread_in_slot(slot) else {
+                continue;
+            };
+            if thread.state != ThreadState::Exited {
+                continue;
+            }
+
+            let thread_id = thread.id;
+            task::reap_thread(slot);
+            let _ = (*SCHEDULER.0.get()).reap(thread_id);
+        }
+    }
+}
+
 /// Account one timer tick and preempt if the timeslice expired.
 ///
 /// Returns `true` when the running thread should be preempted.
@@ -377,6 +439,7 @@ pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
 /// context has been saved.
 pub unsafe fn switch_to_next() -> ! {
     // SAFETY: the scheduler is only mutated with interrupts masked.
+    unsafe { reap_exited_threads() };
     let next_id = unsafe { (*SCHEDULER.0.get()).schedule() };
     let Some(next_id) = next_id else {
         klog!(Level::Error, "sched: no runnable thread");
