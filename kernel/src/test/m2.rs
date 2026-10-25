@@ -39,9 +39,8 @@
 //! scheduler's policy state machine -- by calling the same code the kernel
 //! calls on a user thread's behalf. Where a case can cheaply cross the
 //! privilege boundary for real, it does; where doing so would risk halting the
-//! machine (a genuine ring-3 `#PF` kills the thread, and the reaper that
-//! would collect it is not wired up yet), the case says so in its own comment
-//! rather than pretending to have covered it.
+//! machine (a genuine ring-3 `#PF` kills the owning thread and task), the case
+//! says so in its own comment rather than pretending to have covered it.
 
 use nova_core::address_space::{Protection, UserWindow, VmmError};
 use nova_elf::builder::Segment;
@@ -154,6 +153,10 @@ pub static M2_SUITES: &[TestSuite] = &[
             (
                 "the_kernel_half_is_supervisor_only",
                 the_kernel_half_is_supervisor_only,
+            ),
+            (
+                "user_translation_refuses_the_kernel_half",
+                user_translation_refuses_the_kernel_half,
             ),
             (
                 "the_kernel_half_is_shared_not_copied",
@@ -898,13 +901,12 @@ fn a_preempted_thread_returns_to_queue() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The kernel's own scheduler must account the busy loop's preemption.
+/// The scheduler policy must account the busy loop's preemption.
 ///
 /// The busy loop is a thread that never yields: the only thing that can take
 /// the CPU away from it is the timeslice expiring. This case drives the
-/// kernel's scheduler directly, because a real busy loop in a real thread
-/// would need the timer to be running and the kernel's reaper to be wired up
-/// -- neither of which is in place for the kernel's own thread pool.
+/// kernel's scheduler directly; the real timer path is exercised by the boot
+/// harness, while this case pins the policy state machine's arithmetic.
 fn the_busy_loop_thread_was_preempted() -> Result<(), &'static str> {
     let mut scheduler = nova_core::scheduler::Scheduler::new(crate::sched::DEFAULT_TIMESLICE);
 
@@ -1103,6 +1105,31 @@ fn the_kernel_half_is_supervisor_only() -> Result<(), &'static str> {
         if flags.contains(PageFlags::USER) {
             return Err("a kernel-half PML4 entry is user-accessible");
         }
+    }
+
+    Ok(())
+}
+
+/// User-pointer translation must not resolve the shared kernel half.
+///
+/// The plain translator intentionally can see the kernel half, because the
+/// kernel itself relies on it. The user translator is the syscall boundary:
+/// it must accept a real user mapping and reject a mapped kernel address.
+fn user_translation_refuses_the_kernel_half() -> Result<(), &'static str> {
+    const USER_VIRT: u64 = 0x0000_0000_0000_4000;
+    const KERNEL_VIRT: u64 = 0xFFFF_8000_0000_0000;
+
+    let space = new_process_space().map_err(|_| "could not create an address space")?;
+    let frame = alloc_frame()?;
+
+    address_space::map(&space, USER_VIRT, frame, Protection::UserReadWrite)
+        .map_err(|_| "could not map a user page")?;
+
+    if address_space::translate_user(&space, USER_VIRT) != Some(frame) {
+        return Err("a legitimate user page was not translated");
+    }
+    if address_space::translate_user(&space, KERNEL_VIRT).is_some() {
+        return Err("the kernel half was translated as a user page");
     }
 
     Ok(())
