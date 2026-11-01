@@ -36,6 +36,7 @@
 
 mod arch;
 mod boot;
+mod drivers;
 mod initramfs;
 mod loader;
 mod logger;
@@ -191,6 +192,16 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         sched::init();
         arch::x86_64::apic::init(boot::read_boot_info().direct_map_offset);
     }
+
+    // Devices, then the filesystems that sit on them. This runs after `mm`
+    // (the drivers allocate frames for virtqueues and map BARs) and after
+    // `services` (they mount into the file server), and before the init
+    // process is started so that a user program's first `open` can already
+    // see a disk.
+    //
+    // SAFETY: runs once, from the boot path, with interrupts masked, with the
+    // frame allocator and the service state both published.
+    unsafe { drivers::init() };
 
     if let Some(archive) = crate::boot::initramfs() {
         if crate::initramfs::Archive::parse(archive).is_ok() {

@@ -85,6 +85,14 @@ pub enum FsError {
     BadHandle,
     /// The caller's scope does not cover the request.
     Denied,
+    /// The filesystem, or the mount it sits on, is read-only.
+    ReadOnly,
+    /// The block device beneath the filesystem failed.
+    ///
+    /// The payload survives to `Display` and to `name()`, so a log can tell a
+    /// timeout from a vanished device; at the syscall boundary it collapses
+    /// like every other non-distinct code. See [`DeviceError`].
+    Device(crate::diskfs::DeviceError),
     /// A resource bound was reached: no space, too many inodes, too many
     /// open files.
     Quota,
@@ -108,6 +116,12 @@ impl FsError {
             FsError::InvalidPath(_) => ErrorCode::Invalid,
             FsError::BadHandle => ErrorCode::BadHandle,
             FsError::Denied => ErrorCode::Denied,
+            // A read-only refusal is an authority refusal, not a malformed
+            // request: the caller is allowed to ask, and is being told no.
+            FsError::ReadOnly => ErrorCode::Denied,
+            // The ABI has no `EIO`; a device fault is reported as a general
+            // failure, with the real reason preserved in `name()`.
+            FsError::Device(_) => ErrorCode::Invalid,
             FsError::Quota => ErrorCode::Quota,
             FsError::InvalidArgument => ErrorCode::Invalid,
         }
@@ -123,6 +137,8 @@ impl FsError {
             FsError::InvalidPath(_) => "E_INVALID_PATH",
             FsError::BadHandle => "E_BAD_HANDLE",
             FsError::Denied => "E_DENIED",
+            FsError::ReadOnly => "E_READ_ONLY",
+            FsError::Device(error) => error.name(),
             FsError::Quota => "E_QUOTA",
             FsError::InvalidArgument => "E_INVALID_ARGUMENT",
         }

@@ -39,10 +39,16 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod diskfs;
 pub mod path;
 pub mod ramfs;
 pub mod scope;
 
+pub use diskfs::{
+    BlockDevice, DIR_CACHE_BYTES, DIR_ENTRY_BYTES, DeviceError, DiskFileId, DiskFs, DiskListEntry,
+    DiskStat, FORMAT_VERSION, MAGIC as DISK_MAGIC, MAX_FILE_NAME, MAX_SLOTS as DISK_MAX_SLOTS,
+    MountError, NAME_FIELD_BYTES, SECTOR_BYTES, Superblock, parse_superblock,
+};
 pub use path::{CanonicalPath, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_PATH_COMPONENTS, PathError};
 pub use ramfs::{
     DirEntry, FileHandle, FileKind, FsError, MAX_CHILDREN, MAX_FILE_BYTES, MAX_INODES,
@@ -59,10 +65,11 @@ mod tests {
     /// structural rule is best enforced by a test that reads the source. A
     /// comment or a lint configuration cannot be forgotten, but a function
     /// body can.
-    const SOURCES: [&str; 3] = [
+    const SOURCES: [&str; 4] = [
         include_str!("path.rs"),
         include_str!("ramfs.rs"),
         include_str!("scope.rs"),
+        include_str!("diskfs.rs"),
     ];
 
     /// Whether any *code* line of `source` contains `token`.

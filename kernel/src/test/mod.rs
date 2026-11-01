@@ -33,6 +33,7 @@
 pub mod harness;
 pub mod m2;
 pub mod m34;
+pub mod m5;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -70,6 +71,13 @@ pub const SUITE_NAMES: &[&str] = &[
     "protocol_version_mismatch",
     "service_restart_after_crash",
     "initramfs_boot",
+    // M5: PCI, VirtIO block, block cache, and VFS mounts.
+    "pci_enumeration",
+    "virtio_block_read",
+    "virtio_block_write_and_verify",
+    "block_timeout",
+    "driver_crash_mid_io",
+    "read_only_mount",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

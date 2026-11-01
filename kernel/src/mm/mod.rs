@@ -80,6 +80,26 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
         address_space::init(boot_info);
     }
 
+    // Install the kernel's own tables in CR3. Until this point the bootloader's
+    // tables have been live, and every mapping the kernel added to *its* space
+    // — MMIO windows such as the APIC and the VirtIO BARs — was invisible to
+    // the CPU: `map_kernel_mmio` writes into the kernel space's hierarchy while
+    // the active hierarchy is a different one, so a walk through CR3 finds
+    // nothing where a walk through `kernel_space()` finds a leaf. The two
+    // hierarchies diverge the first time a mapping lands outside the range the
+    // bootloader happened to map (a BAR at 0xC0_0000_0000 is exactly that case).
+    //
+    // The switch is safe because `build_kernel_space` *cloned* the bootloader's
+    // kernel half — the image, the HHDM, and this stack all still resolve — and
+    // this runs with interrupts masked on the boot CPU, so nothing can observe
+    // the half-moment of the reload.
+    //
+    // SAFETY: delegated to this function's contract. The space maps the kernel
+    // image, the HHDM, and the current stack, as required by `activate`.
+    unsafe {
+        address_space::activate(&address_space::kernel_space());
+    }
+
     // SAFETY: delegated to this function's contract; the allocator was just
     // published and has no other readers yet.
     let allocator = unsafe { ALLOCATOR.get() };

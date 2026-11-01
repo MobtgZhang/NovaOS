@@ -415,6 +415,16 @@ pub fn iso_path() -> PathBuf {
     target_dir().join(IMAGE_SUBDIR).join("nova.iso")
 }
 
+/// Where a test disk image is written.
+///
+/// Beside the ISO, because both are derived build artifacts of the same run:
+/// a disk that lived somewhere else would survive a `cargo clean` of the image
+/// directory and go stale, which is the "the kernel booted against an old
+/// disk" failure the ISO deliberately avoids by being rebuilt every time.
+pub fn disk_path(name: &str) -> PathBuf {
+    target_dir().join(IMAGE_SUBDIR).join(name)
+}
+
 /// Where the staging directory is.
 pub fn stage_dir() -> PathBuf {
     target_dir().join(STAGE_SUBDIR)

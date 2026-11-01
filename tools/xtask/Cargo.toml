@@ -12,7 +12,16 @@ publish = false
 # more thing that has to build before the build system itself works, and a
 # bootstrap tool that cannot bootstrap is a bad trade. Hand-rolled argument
 # parsing is a few dozen lines and pulls in nothing.
+#
+# The single exception is `nova-fs`, and it is not a third-party dependency: it
+# is the *same crate the kernel mounts*, used here to format the test disks.
+# Hand-writing the superblock in xtask and mounting it with `DiskFs` in the
+# kernel would mean two independent implementations of one binary format, and
+# the failure they produce is the worst kind — a disk that formats green and
+# mounts red, with the disagreement living in whichever copy drifted. Driving
+# `DiskFs` from both sides makes the formatter and the mounter the same code.
 [dependencies]
+nova-fs = { path = "../../crates/nova-fs" }
 
 [[bin]]
 name = "xtask"

@@ -33,6 +33,7 @@
 
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
+use nova_fs::diskfs::{DiskFileId, DiskFs, DiskListEntry, MountError, NAME_FIELD_BYTES};
 use nova_fs::path::{CanonicalPath, canonicalize};
 use nova_fs::ramfs::{DirEntry, FileHandle, FileKind as FsFileKind, FsError, RamFs};
 use nova_fs::scope::{FileScope, ScopeSet};
@@ -45,6 +46,8 @@ use nova_protocols::file::{
 };
 use nova_protocols::negotiate;
 
+use crate::drivers::block::KernelBlockDevice;
+
 /// Maximum number of path scopes one task may hold.
 ///
 /// A task that needs more than this has a design problem: the grant should be
@@ -56,6 +59,68 @@ pub const MAX_SCOPES_PER_TASK: usize = 8;
 /// The same bound as the filesystem's own open-file table, because the server's
 /// table is what maps a *wire* handle back to a filesystem handle and its path.
 pub const MAX_SERVER_FILES: usize = 32;
+
+/// Maximum number of disks mounted into the namespace.
+///
+/// Two, because that is what the reference machine has — a writable test disk
+/// and a read-only one — and because a mount table that is bounded by a
+/// constant cannot be grown by a caller asking for one.
+pub const MAX_MOUNTS: usize = 2;
+
+/// The bit that marks a wire handle as naming a file on a disk.
+///
+/// Wire handles for RAM files are `generation << 32 | slot`, with both halves
+/// small. Setting the top bit makes every disk handle land in a range no RAM
+/// handle can reach, so a stale handle from one cannot address a file on the
+/// other — the two are checked by construction rather than by remembering to
+/// keep the counters apart.
+const DISK_WIRE_BIT: u64 = 1 << 63;
+
+/// A disk mounted into the file namespace.
+pub struct DiskMount {
+    /// The directory the disk appears at, e.g. `/media/test`.
+    path: CanonicalPath,
+    /// Whether writes are refused on this mount.
+    read_only: bool,
+    /// The filesystem, which validates the image once and keeps its directory
+    /// in memory from then on.
+    disk: DiskFs<KernelBlockDevice>,
+}
+
+impl DiskMount {
+    /// The directory this disk is mounted at.
+    pub const fn path(&self) -> &CanonicalPath {
+        &self.path
+    }
+
+    /// Whether the mount refuses writes.
+    pub const fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// How many files the disk holds.
+    pub fn file_count(&self) -> usize {
+        self.disk.file_count()
+    }
+}
+
+/// Where an open file lives.
+#[derive(Clone, Copy, Debug)]
+enum Origin {
+    /// A file in the RAM filesystem.
+    Ram(FileHandle),
+    /// A file on a mounted disk: which mount, which file, and the offset the
+    /// last protocol-level read or write left off at.
+    Disk {
+        /// Which mount the file is on.
+        mount: usize,
+        /// The filesystem's handle for it.
+        file: DiskFileId,
+        /// The position reads and writes advance from when the request does
+        /// not carry one of its own.
+        position: u64,
+    },
+}
 
 /// One task's path grants.
 ///
@@ -215,8 +280,8 @@ impl ScopePool {
 struct ServerFile {
     /// The handle the client holds.
     wire: u64,
-    /// The filesystem's handle for it.
-    handle: FileHandle,
+    /// Where the file lives, so a later operation reaches the right store.
+    origin: Origin,
     /// The path it was opened at, so the scope can be re-checked on every
     /// later operation.
     path: CanonicalPath,
@@ -224,12 +289,13 @@ struct ServerFile {
 
 /// The file server.
 ///
-/// Owns the RAM filesystem, the table of open files, and the protocol
-/// handling. Everything is inline, so the whole server is a fixed-size value
-/// the kernel can place in a static.
+/// Owns the RAM filesystem, the table of open files, the mounted disks, and the
+/// protocol handling. Everything is inline, so the whole server is a fixed-size
+/// value the kernel can place in a static.
 pub struct FileServer {
     fs: RamFs,
     open_files: [Option<ServerFile>; MAX_SERVER_FILES],
+    mounts: [Option<DiskMount>; MAX_MOUNTS],
 }
 
 impl Default for FileServer {
@@ -239,16 +305,21 @@ impl Default for FileServer {
 }
 
 impl FileServer {
-    /// A server with an empty filesystem.
+    /// A server with an empty filesystem and no mounts.
     ///
     /// A `const fn` so the server can be built as part of a static
     /// initialiser. The server holds a whole [`RamFs`], which is about 71 KiB,
     /// and the kernel's stack is 64 KiB -- building one on the stack overflows
     /// it, and the overflow is reported somewhere else entirely.
+    ///
+    /// The mounts are written out as two explicit `None`s rather than `[None;
+    /// MAX_MOUNTS]`, because the latter needs the element type to be `Copy`
+    /// and a mount holds a filesystem.
     pub const fn new() -> Self {
         Self {
             fs: RamFs::new(),
             open_files: [None; MAX_SERVER_FILES],
+            mounts: [None, None],
         }
     }
 
@@ -262,33 +333,160 @@ impl FileServer {
         &mut self.fs
     }
 
-    /// Forget every open file and empty the filesystem.
+    /// Forget every open file, unmount every disk, and empty the filesystem.
+    ///
+    /// Unmounting is part of "forget everything": a restart that left a disk
+    /// mounted would hand the new incarnation open files it never opened, on a
+    /// device whose state the old incarnation may have left inconsistent.
     pub fn reset(&mut self) {
         // `clear` rather than a fresh `RamFs`: the filesystem is about 71 KiB
         // and the kernel's stack is 64 KiB, so assigning a new one would
         // overflow the stack.
         self.fs.clear();
         self.open_files = [None; MAX_SERVER_FILES];
+        self.mounts = [None, None];
+    }
+
+    /// Mount `disk_id` at `path`.
+    ///
+    /// The image is validated here, before it is reachable by any caller: a
+    /// mount that failed leaves nothing behind, so a client can never see a
+    /// half-mounted disk.
+    ///
+    /// # Errors
+    ///
+    /// A full mount table, an invalid path, or any failure the image's own
+    /// validation reports — a foreign magic, geometry that does not add up, a
+    /// directory entry that disagrees with the superblock.
+    pub fn mount_disk(
+        &mut self,
+        disk_id: usize,
+        path: &[u8],
+        read_only: bool,
+    ) -> Result<(), MountError> {
+        let canonical = canonicalize(path).map_err(|_| MountError::BadGeometry)?;
+        let slot = self
+            .mounts
+            .iter()
+            .position(|mount| mount.is_none())
+            .ok_or(MountError::BadGeometry)?;
+
+        let disk = DiskFs::mount(KernelBlockDevice::new(disk_id), read_only)?;
+        self.mounts[slot] = Some(DiskMount {
+            path: canonical,
+            read_only,
+            disk,
+        });
+        Ok(())
+    }
+
+    /// The mount covering `path`, if any.
+    ///
+    /// The longest match wins, so a mount at `/media` and one at
+    /// `/media/test` resolve `/media/test/x` to the latter. Only whole
+    /// components count: `/media/t` is not under `/media/test`, because a
+    /// prefix that stops mid-name is a coincidence of spelling, not a
+    /// containment.
+    fn mount_covering(&self, path: &CanonicalPath) -> Option<usize> {
+        let requested = path.as_bytes();
+        let mut best: Option<(usize, usize)> = None;
+
+        for (index, mount) in self.mounts.iter().enumerate() {
+            let Some(mount) = mount else { continue };
+            let root = mount.path.as_bytes();
+            if !requested.starts_with(root) {
+                continue;
+            }
+            match requested.get(root.len()) {
+                // Exactly the mount point.
+                None => {}
+                // A whole component below it.
+                Some(&b'/') => {}
+                // Mid-name: `/media/t` against `/media/test`.
+                Some(_) => continue,
+            }
+            if best.is_none_or(|(best_len, _)| root.len() > best_len) {
+                best = Some((root.len(), index));
+            }
+        }
+
+        best.map(|(_, index)| index)
+    }
+
+    /// The path a mount sees: the request with the mount point stripped and a
+    /// fresh root in front, so `/media/test/readme.txt` reaches the disk as
+    /// `/readme.txt`.
+    ///
+    /// Returns `None` when the request *is* the mount point: the root of a
+    /// disk is a directory, and there is no file name to hand the filesystem.
+    fn mounted_relative<'a>(mount_root: &[u8], requested: &'a [u8]) -> Option<&'a [u8]> {
+        let rest = requested.get(mount_root.len()..)?;
+        if rest.is_empty() {
+            return None;
+        }
+        // `rest` begins with '/' because `mount_covering` only matches on a
+        // component boundary; the disk's flat namespace wants exactly one
+        // leading slash and no more.
+        Some(rest)
+    }
+
+    /// Open a file on a mounted disk, for a client whose scopes cover it.
+    fn open_mounted(
+        &mut self,
+        index: usize,
+        canonical: &CanonicalPath,
+    ) -> Result<(u64, u32), FsError> {
+        let mount = self.mounts[index].as_mut().ok_or(FsError::NotFound)?;
+        let Some(relative) = Self::mounted_relative(mount.path.as_bytes(), canonical.as_bytes())
+        else {
+            return Err(FsError::IsADirectory);
+        };
+
+        let file = mount.disk.lookup(relative)?;
+        let stat = mount.disk.stat(file)?;
+        let read_only = mount.read_only;
+        let path = *canonical;
+
+        let wire = self.remember(
+            Origin::Disk {
+                mount: index,
+                file,
+                position: 0,
+            },
+            path,
+        )?;
+        let _ = read_only;
+
+        Ok((wire, stat.size as u32))
     }
 
     /// Open a file for a client whose scopes are `scopes`.
     ///
-    /// The scope check happens before the path is resolved, so a caller without
-    /// a grant learns nothing about whether the file exists.
+    /// The scope check happens before the path is resolved — before the mount
+    /// table is even consulted — so a caller without a grant learns nothing
+    /// about which disks are mounted, let alone what is on them.
     pub fn open_scoped(
         &mut self,
         scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
         path: &[u8],
         required: Rights,
     ) -> Result<(u64, u32), FsError> {
-        let handle = self.fs.open_scoped(scopes, path, required)?;
         let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
+        if scopes.denies(&canonical, required) {
+            return Err(FsError::Denied);
+        }
+
+        if let Some(index) = self.mount_covering(&canonical) {
+            return self.open_mounted(index, &canonical);
+        }
+
+        let handle = self.fs.open_scoped(scopes, path, required)?;
         let size = self
             .fs
             .metadata(canonical.as_bytes())
             .map(|metadata| metadata.size)
             .unwrap_or(0);
-        let wire = self.remember(handle, canonical);
+        let wire = self.remember(Origin::Ram(handle), canonical)?;
         Ok((wire, size))
     }
 
@@ -299,9 +497,21 @@ impl FileServer {
         wire: u64,
         buffer: &mut [u8],
     ) -> Result<usize, FsError> {
-        let (handle, path) = self.lookup(wire)?;
-        require(scopes, &path, Rights::READ)?;
-        self.fs.read(handle, buffer)
+        let entry = self.entry(wire)?;
+        require(scopes, &entry.path, Rights::READ)?;
+        match entry.origin {
+            Origin::Ram(handle) => self.fs.read(handle, buffer),
+            Origin::Disk {
+                mount,
+                file,
+                position,
+            } => {
+                let mount = self.mounts[mount].as_mut().ok_or(FsError::BadHandle)?;
+                let read = mount.disk.read(file, position as usize, buffer)?;
+                self.advance(wire, read as u64);
+                Ok(read)
+            }
+        }
     }
 
     /// Write to a file the client has open.
@@ -311,20 +521,64 @@ impl FileServer {
         wire: u64,
         data: &[u8],
     ) -> Result<usize, FsError> {
-        let (handle, path) = self.lookup(wire)?;
-        require(scopes, &path, Rights::WRITE)?;
-        self.fs.write(handle, data)
+        let entry = self.entry(wire)?;
+        require(scopes, &entry.path, Rights::WRITE)?;
+        match entry.origin {
+            Origin::Ram(handle) => self.fs.write(handle, data),
+            Origin::Disk {
+                mount,
+                file,
+                position,
+            } => {
+                let mount = self.mounts[mount].as_mut().ok_or(FsError::BadHandle)?;
+                if mount.read_only {
+                    return Err(FsError::ReadOnly);
+                }
+                let written = mount.disk.write(file, position as usize, data)?;
+                self.advance(wire, written as u64);
+                Ok(written)
+            }
+        }
+    }
+
+    /// Seek an open disk file, so the next request without an offset of its
+    /// own continues where this one stopped.
+    fn advance(&mut self, wire: u64, delta: u64) {
+        for slot in self.open_files.iter_mut() {
+            if let Some(entry) = slot
+                && entry.wire == wire
+                && let Origin::Disk { position, .. } = &mut entry.origin
+            {
+                *position = position.saturating_add(delta);
+            }
+        }
     }
 
     /// Close a file the client has open.
+    ///
+    /// A disk file is flushed on close. That is the durability point the
+    /// protocol offers: writes are write-through to the device, and `close`
+    /// asks the device to make them durable, so "the write was acknowledged"
+    /// and "the write is on the medium" are never confused for each other.
     pub fn close(
         &mut self,
         scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
         wire: u64,
     ) -> Result<(), FsError> {
-        let (handle, path) = self.lookup(wire)?;
-        require(scopes, &path, Rights::READ)?;
-        self.fs.close(handle)?;
+        let entry = self.entry(wire)?;
+        require(scopes, &entry.path, Rights::READ)?;
+        match entry.origin {
+            Origin::Ram(handle) => self.fs.close(handle)?,
+            Origin::Disk { mount, .. } => {
+                let mount = self.mounts[mount].as_mut().ok_or(FsError::BadHandle)?;
+                if !mount.read_only {
+                    // A flush that fails is reported, because close is the
+                    // only place a caller learns that its writes did not
+                    // become durable.
+                    mount.disk.flush()?;
+                }
+            }
+        }
         for slot in self.open_files.iter_mut() {
             if let Some(entry) = slot
                 && entry.wire == wire
@@ -333,6 +587,20 @@ impl FileServer {
             }
         }
         Ok(())
+    }
+
+    /// One open file's record.
+    fn entry(&self, wire: u64) -> Result<ServerFile, FsError> {
+        self.open_files
+            .iter()
+            .flatten()
+            .find(|entry| entry.wire == wire)
+            .map(|entry| ServerFile {
+                wire: entry.wire,
+                origin: entry.origin,
+                path: entry.path,
+            })
+            .ok_or(FsError::BadHandle)
     }
 
     /// Handle one file-protocol request, returning the reply message.
@@ -491,6 +759,10 @@ impl FileServer {
             return reply_error(ErrorCode::Denied);
         }
 
+        if let Some(index) = self.mount_covering(&canonical) {
+            return self.list_mounted(index, &canonical);
+        }
+
         let mut entries = [DirEntry {
             name: [0; 64],
             name_len: 0,
@@ -557,6 +829,11 @@ impl FileServer {
         if scopes.denies(&canonical, Rights::READ) {
             return reply_error(ErrorCode::Denied);
         }
+
+        if let Some(index) = self.mount_covering(&canonical) {
+            return self.stat_mounted(index, &canonical);
+        }
+
         let metadata = match self.fs.metadata(canonical.as_bytes()) {
             Ok(metadata) => metadata,
             Err(error) => return reply_error(error.code()),
@@ -573,28 +850,119 @@ impl FileServer {
         reply_bytes(&bytes)
     }
 
-    /// Remember an open file, returning the wire handle the client holds.
-    fn remember(&mut self, handle: FileHandle, path: CanonicalPath) -> u64 {
-        // The wire handle carries the slot and the generation, so a client that
-        // keeps a stale handle after a close cannot address a reused slot.
-        let wire = ((handle.generation() as u64) << 32) | (handle.slot() as u64);
-        for slot in self.open_files.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(ServerFile { wire, handle, path });
-                return wire;
-            }
+    /// List the files on the disk a path is mounted from.
+    ///
+    /// Only the mount root lists. The disk format is flat, so `/media/test/x`
+    /// names a file and has nothing beneath it to enumerate — reporting it as
+    /// an empty directory would be a directory the format cannot represent.
+    fn list_mounted(&mut self, index: usize, canonical: &CanonicalPath) -> Message {
+        let Some(mount) = self.mounts[index].as_ref() else {
+            return reply_error(ErrorCode::BadHandle);
+        };
+        if Self::mounted_relative(mount.path.as_bytes(), canonical.as_bytes()).is_some() {
+            return reply_error(ErrorCode::Invalid);
         }
-        wire
+
+        let mut names = [DiskListEntry {
+            name: [0; NAME_FIELD_BYTES],
+            name_len: 0,
+            size: 0,
+        }; 4];
+        let count = mount.disk.list(&mut names);
+
+        let mut bytes = [0u8; 16];
+        write_protocol_version(&mut bytes, FILE_VERSION);
+        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+        // The total is what the listing holds: a disk's directory has no
+        // deeper structure, so "returned" and "there" are the same number.
+        bytes[12..16].copy_from_slice(&(count as u32).to_le_bytes());
+
+        let mut listing = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
+        let mut used = 0usize;
+        for entry in names.iter().take(count) {
+            let name = entry.name_bytes();
+            let entry_size = 16usize.saturating_add(name.len());
+            if used.saturating_add(entry_size) > listing.len() {
+                break;
+            }
+            let record = FileDirEntry {
+                name_len: name.len() as u32,
+                kind: FileKind::File,
+                size: entry.size as u64,
+            };
+            listing[used..used + 4].copy_from_slice(&record.name_len.to_le_bytes());
+            listing[used + 4..used + 8].copy_from_slice(&record.kind.code().to_le_bytes());
+            listing[used + 8..used + 16].copy_from_slice(&record.size.to_le_bytes());
+            used += 16;
+            listing[used..used + name.len()].copy_from_slice(name);
+            used += name.len();
+        }
+
+        reply_bytes(&bytes).with_extra_payload(&listing[..used])
     }
 
-    /// Resolve a wire handle to the filesystem handle and the path.
-    fn lookup(&self, wire: u64) -> Result<(FileHandle, CanonicalPath), FsError> {
-        self.open_files
-            .iter()
-            .flatten()
-            .find(|entry| entry.wire == wire)
-            .map(|entry| (entry.handle, entry.path))
-            .ok_or(FsError::BadHandle)
+    /// Report what a path on a mounted disk names.
+    fn stat_mounted(&mut self, index: usize, canonical: &CanonicalPath) -> Message {
+        let Some(mount) = self.mounts[index].as_ref() else {
+            return reply_error(ErrorCode::BadHandle);
+        };
+
+        let (kind, size) = match Self::mounted_relative(mount.path.as_bytes(), canonical.as_bytes())
+        {
+            // The mount root itself: the disk, which is a directory.
+            None => (FileKind::Directory, 0u64),
+            Some(relative) => {
+                let file = match mount.disk.lookup(relative) {
+                    Ok(file) => file,
+                    Err(error) => return reply_error(error.code()),
+                };
+                match mount.disk.stat(file) {
+                    Ok(stat) => (FileKind::File, stat.size as u64),
+                    Err(error) => return reply_error(error.code()),
+                }
+            }
+        };
+
+        let mut bytes = [0u8; 24];
+        write_protocol_version(&mut bytes, FILE_VERSION);
+        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&kind.code().to_le_bytes());
+        bytes[16..24].copy_from_slice(&size.to_le_bytes());
+        reply_bytes(&bytes)
+    }
+
+    /// The live mounts, in mount order.
+    pub fn mounts(&self) -> impl Iterator<Item = &DiskMount> {
+        self.mounts.iter().flatten()
+    }
+
+    /// Remember an open file, returning the wire handle the client holds.
+    ///
+    /// The wire handle for a RAM file carries the slot and the generation, so
+    /// a client that keeps a stale handle after a close cannot address a
+    /// reused slot. A disk file's wire handle carries its slot in *this*
+    /// table plus the bit that marks it as a disk handle; the disk's own
+    /// handle travels inside [`Origin::Disk`], where a stale one is caught by
+    /// the filesystem rather than by the wire.
+    fn remember(&mut self, origin: Origin, path: CanonicalPath) -> Result<u64, FsError> {
+        for (index, slot) in self.open_files.iter_mut().enumerate() {
+            if slot.is_none() {
+                let wire = match &origin {
+                    Origin::Ram(handle) => {
+                        ((handle.generation() as u64) << 32) | (handle.slot() as u64)
+                    }
+                    Origin::Disk { .. } => DISK_WIRE_BIT | index as u64,
+                };
+                *slot = Some(ServerFile { wire, origin, path });
+                return Ok(wire);
+            }
+        }
+
+        // A table that is full is a quota, not a silent success: a wire handle
+        // with nothing behind it would fail later as `BadHandle`, which reads
+        // as a client bug rather than as the server being out of slots.
+        Err(FsError::Quota)
     }
 }
 

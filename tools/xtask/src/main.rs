@@ -32,6 +32,7 @@
 
 mod boot;
 mod build;
+mod disk;
 mod iso;
 mod limine;
 mod qemu;
@@ -226,6 +227,16 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
     boot::build_iso(&stage)?;
     let iso = boot::iso_path();
     log(&format!("image: {}", iso.display()));
+
+    // The two M5 test disks. They are build artifacts of the same run as the
+    // ISO — generated, not committed — so that a change to the on-disk format
+    // cannot leave a stale image behind for the kernel to refuse to mount.
+    // `run` regenerates them too, so a boot always tests the current format.
+    let disks = disk::generate()?;
+    for disk in &disks {
+        log(&format!("disk: {}", disk.display()));
+    }
+
     Ok(iso)
 }
 
