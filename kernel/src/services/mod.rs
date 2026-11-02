@@ -52,9 +52,11 @@
 //! question does not arise.
 
 pub mod cap;
+pub mod compositor;
 pub mod dispatch;
 pub mod display;
 pub mod fs;
+pub mod input;
 pub mod ipc;
 pub mod object;
 pub mod process;
@@ -69,8 +71,10 @@ use nova_fs::scope::{FileScope, ScopeSet};
 use nova_ipc::endpoint::{ChannelId, Completion, ReplyToken, Side};
 use nova_ipc::message::Message;
 
+use crate::services::compositor::CompositorService;
 use crate::services::display::DisplayService;
 use crate::services::fs::{FileServer, MAX_SCOPES_PER_TASK};
+use crate::services::input::InputService;
 use crate::services::ipc::IpcRegistry;
 use crate::services::object::{ObjectKind, ObjectRegistry};
 use crate::services::supervisor::Supervisor;
@@ -216,6 +220,10 @@ pub struct KernelStateParts<'a> {
     pub supervisor: &'a mut Supervisor,
     /// The display service.
     pub display: &'a mut DisplayService,
+    /// The compositor and surface service.
+    pub compositor: &'a mut CompositorService,
+    /// The input service.
+    pub input: &'a mut InputService,
     /// The message the last receive on each thread produced.
     pub last_message: &'a mut [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -240,6 +248,8 @@ impl KernelState {
             files: &mut self.files,
             supervisor: &mut self.supervisor,
             display: &mut self.display,
+            compositor: &mut self.compositor,
+            input: &mut self.input,
             last_message: &mut self.last_message,
             last_token: &mut self.last_token,
             last_error: &mut self.last_error,
@@ -304,6 +314,10 @@ pub struct KernelState {
     pub supervisor: Supervisor,
     /// The display service.
     pub display: DisplayService,
+    /// The compositor and surface service.
+    pub compositor: CompositorService,
+    /// The input service.
+    pub input: InputService,
     /// The message the last receive on each thread produced.
     pub last_message: [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -346,6 +360,8 @@ impl KernelState {
             files: FileServer::new(),
             supervisor: Supervisor::new(),
             display: DisplayService::new(),
+            compositor: CompositorService::new(),
+            input: InputService::new(),
             last_message: [None; MAX_THREADS],
             last_token: [None; MAX_THREADS],
             last_error: [None; MAX_THREADS],
@@ -609,6 +625,11 @@ impl KernelState {
         let revoked = crate::services::cap::revoke_all(&mut self.caps[slot], &self.objects);
         let _ = revoked;
 
+        // A crashed GUI process must not leave its surfaces, focus, or buffer
+        // frames behind. The compositor owns the placement and the buffer
+        // objects; the task owns only the capabilities it attached.
+        self.compositor.remove_owner(slot, &mut self.objects);
+
         // Kill the task's side of every channel it was party to, which is what
         // wakes a blocked peer with `E_PEER_DIED`.
         self.ipc.kill_task(slot, &sides[..side_count]);
@@ -689,6 +710,8 @@ impl KernelState {
         self.files.reset();
         self.supervisor.reset();
         self.display.reset();
+        self.compositor.reset();
+        self.input.reset();
         self.last_message = [None; MAX_THREADS];
         self.last_token = [None; MAX_THREADS];
         self.last_error = [None; MAX_THREADS];

@@ -1315,6 +1315,17 @@ pub unsafe extern "C" fn nova_kernel_timer_handler(registers: *const UserRegiste
         super::apic::eoi();
     }
 
+    // The trusted input source polls the PS/2 controller here. A key is routed
+    // only to the compositor's focused surface; a pointer is routed by the
+    // compositor's hit test. The driver holds no client capability and cannot
+    // be reached from ring 3.
+    //
+    // SAFETY: the timer path has interrupts masked, the service state is
+    // installed, and the PS/2 ports are owned by this driver.
+    unsafe {
+        crate::drivers::input::poll();
+    }
+
     // SAFETY: delegated to this function's contract. The scheduler switches
     // threads with interrupts masked, and the tick accounting is a single
     // writer.

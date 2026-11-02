@@ -77,13 +77,16 @@ use nova_ipc::endpoint::Side;
 use nova_ipc::message::Message;
 
 use crate::boot::PAGE_SIZE;
+use crate::drivers::display::DisplayError;
 use crate::services::cap;
 use crate::services::ipc::{IpcOutcome, SelfTransfer, TableTransfer};
 use crate::services::object::ObjectKind;
 use crate::services::process;
 use crate::services::state;
 use crate::services::two_caps_mut;
-use crate::services::{KernelState, KernelStateParts, SERVICE_DISPLAY};
+use crate::services::{
+    KernelState, KernelStateParts, SERVICE_COMPOSITOR, SERVICE_DISPLAY, SERVICE_INPUT,
+};
 
 /// The context a syscall is dispatched in.
 ///
@@ -475,7 +478,7 @@ fn release_frames(frames: &[usize]) {
 }
 
 /// Return a memory object's frames to the allocator.
-fn free_memory_object(base: u64, size: u64) {
+pub(crate) fn free_memory_object(base: u64, size: u64) {
     let start = (base / PAGE_SIZE) as usize;
     let count = (size / PAGE_SIZE) as usize;
     let allocator = unsafe { crate::mm::frame_allocator() };
@@ -873,7 +876,7 @@ fn reply(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> 
 /// ring 0.
 pub fn service_request(
     kernel: &mut KernelState,
-    _context: &SyscallContext,
+    context: &SyscallContext,
     service: u32,
     opcode: u64,
     request_payload: &[u8],
@@ -881,10 +884,42 @@ pub fn service_request(
 ) -> Result<usize, ErrorCode> {
     let request = Message::with_payload(opcode, request_payload)?;
 
+    // The fields are borrowed disjointly. The compositor needs the caller's
+    // capability table and the object registry in order to validate an
+    // attached buffer; the display service needs only its own mode.
+    let KernelStateParts {
+        caps,
+        objects,
+        display,
+        compositor,
+        input,
+        ..
+    } = kernel.split();
+
     let reply_message = match service {
-        SERVICE_DISPLAY => kernel.display.handle_message(&request),
+        SERVICE_DISPLAY => display.handle_message(&request),
+        SERVICE_COMPOSITOR => {
+            let Some(table) = caps.get(context.task_slot) else {
+                return Err(ErrorCode::BadHandle);
+            };
+            compositor.handle_message(&request, context.task_slot, table, objects)
+        }
+        SERVICE_INPUT => input.handle_message(&request, compositor),
         _ => return Err(ErrorCode::Unsupported),
     };
+
+    // A surface change is not displayed until the compositor presents the
+    // pending frame. An idle service request with no damage presents nothing,
+    // which is the no-busy-spin path.
+    if matches!(service, SERVICE_COMPOSITOR | SERVICE_INPUT) {
+        match compositor.present() {
+            Ok(_) => {}
+            Err(DisplayError::NoDisplay) => return Err(ErrorCode::Unsupported),
+            Err(DisplayError::OutOfBounds | DisplayError::InvalidBuffer) => {
+                return Err(ErrorCode::Invalid);
+            }
+        }
+    }
 
     let payload = reply_message.payload();
     if payload.len() > reply.len() {

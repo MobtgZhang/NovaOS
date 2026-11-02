@@ -67,10 +67,12 @@ pub const APP_PACKAGE: &str = "nova-apps";
 pub const APP_NAMES: &[&str] = &[
     "init",
     "echo-server",
-    "echo-client",
     "file-server",
     "console-server",
     "shell",
+    "terminal",
+    "editor",
+    "file-manager",
 ];
 
 /// Build a bounded `NOVAFS1` archive from named ELF files.

@@ -34,6 +34,7 @@ pub mod harness;
 pub mod m2;
 pub mod m34;
 pub mod m5;
+pub mod m6;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -78,6 +79,15 @@ pub const SUITE_NAMES: &[&str] = &[
     "block_timeout",
     "driver_crash_mid_io",
     "read_only_mount",
+    // M6: display, compositor surfaces, focus, input, and GUI lifecycle.
+    "display_two_windows",
+    "move_window",
+    "focus_follows_click",
+    "key_only_focused_surface",
+    "invalid_surface_buffer_denied",
+    "gui_app_crash_isolated",
+    "window_open_close_100",
+    "idle_gui_cpu_no_busy_spin",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

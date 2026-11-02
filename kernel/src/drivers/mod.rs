@@ -26,6 +26,7 @@
 
 pub mod block;
 pub mod display;
+pub mod input;
 pub mod mmio;
 pub mod pci;
 pub mod virtio;
@@ -61,6 +62,14 @@ const MOUNT_PARENT: &[u8] = b"/media";
 /// (the drivers allocate frames and map BARs) and after `services::init` (they
 /// mount into the file server). It is called from `main` between the two.
 pub unsafe fn init() {
+    // The PS/2 controller is a device the input service needs a source for.
+    // Bringing it up before the block path means a headless machine without
+    // disks still has a working input driver.
+    //
+    // SAFETY: the boot path runs once with interrupts masked and with IO-port
+    // access initialised by the architecture. See `input::init`.
+    unsafe { input::init() };
+
     let disks = block::init();
     if disks == 0 {
         return;

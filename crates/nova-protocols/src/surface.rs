@@ -46,6 +46,8 @@ pub const SURFACE_OP_COMMIT: u64 = 4;
 pub const SURFACE_OP_DESTROY: u64 = 5;
 pub const COMPOSITOR_OP_CONFIGURE: u64 = 6;
 pub const COMPOSITOR_OP_FRAME_DONE: u64 = 7;
+pub const COMPOSITOR_OP_MOVE: u64 = 8;
+pub const COMPOSITOR_OP_RAISE: u64 = 9;
 
 /// Size of a surface-create request, in bytes.
 pub const SURFACE_CREATE_REQUEST_SIZE: usize = 20;
@@ -80,6 +82,12 @@ pub const COMPOSITOR_CONFIGURE_REQUEST_SIZE: usize = 20;
 
 /// Size of a compositor-frame-done request, in bytes.
 pub const COMPOSITOR_FRAME_DONE_REQUEST_SIZE: usize = 16;
+
+/// Size of a compositor-move request, in bytes.
+pub const COMPOSITOR_MOVE_REQUEST_SIZE: usize = 16;
+
+/// Size of a compositor-raise request, in bytes.
+pub const COMPOSITOR_RAISE_REQUEST_SIZE: usize = 8;
 
 /// Size of a reply that carries only a status, in bytes.
 pub const SURFACE_REPLY_SIZE: usize = 12;
@@ -137,6 +145,8 @@ pub enum SurfaceOpcode {
     Destroy,
     Configure,
     FrameDone,
+    Move,
+    Raise,
 }
 
 impl SurfaceOpcode {
@@ -150,6 +160,8 @@ impl SurfaceOpcode {
             SurfaceOpcode::Destroy => SURFACE_OP_DESTROY,
             SurfaceOpcode::Configure => COMPOSITOR_OP_CONFIGURE,
             SurfaceOpcode::FrameDone => COMPOSITOR_OP_FRAME_DONE,
+            SurfaceOpcode::Move => COMPOSITOR_OP_MOVE,
+            SurfaceOpcode::Raise => COMPOSITOR_OP_RAISE,
         }
     }
 
@@ -163,6 +175,8 @@ impl SurfaceOpcode {
             SURFACE_OP_DESTROY => Some(SurfaceOpcode::Destroy),
             COMPOSITOR_OP_CONFIGURE => Some(SurfaceOpcode::Configure),
             COMPOSITOR_OP_FRAME_DONE => Some(SurfaceOpcode::FrameDone),
+            COMPOSITOR_OP_MOVE => Some(SurfaceOpcode::Move),
+            COMPOSITOR_OP_RAISE => Some(SurfaceOpcode::Raise),
             _ => None,
         }
     }
@@ -318,6 +332,33 @@ pub struct CompositorFrameDoneRequest {
     pub serial: u64,
 }
 
+/// A request to move a surface to a new position.
+///
+/// Positions are signed because a window manager may place a window past an
+/// edge; the compositor clips when it draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct CompositorMoveRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// The surface being moved.
+    pub surface: u32,
+    /// New left coordinate.
+    pub x: i32,
+    /// New top coordinate.
+    pub y: i32,
+}
+
+/// A request to raise a surface in the z-order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct CompositorRaiseRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// The surface to raise.
+    pub surface: u32,
+}
+
 /// A reply that carries only a status.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
@@ -354,6 +395,8 @@ const _: () = assert!(size_of::<SurfaceDestroyRequest>() == SURFACE_DESTROY_REQU
 const _: () = assert!(size_of::<CompositorConfigureRequest>() == COMPOSITOR_CONFIGURE_REQUEST_SIZE);
 const _: () =
     assert!(size_of::<CompositorFrameDoneRequest>() == COMPOSITOR_FRAME_DONE_REQUEST_SIZE);
+const _: () = assert!(size_of::<CompositorMoveRequest>() == COMPOSITOR_MOVE_REQUEST_SIZE);
+const _: () = assert!(size_of::<CompositorRaiseRequest>() == COMPOSITOR_RAISE_REQUEST_SIZE);
 const _: () = assert!(size_of::<SurfaceReply>() == SURFACE_REPLY_SIZE);
 const _: () = assert!(size_of::<SurfaceDamageReply>() == SURFACE_DAMAGE_REPLY_SIZE);
 
@@ -401,6 +444,14 @@ const _: () = assert!(core::mem::offset_of!(CompositorConfigureRequest, reserved
 const _: () = assert!(core::mem::offset_of!(CompositorFrameDoneRequest, version) == 0);
 const _: () = assert!(core::mem::offset_of!(CompositorFrameDoneRequest, surface) == 4);
 const _: () = assert!(core::mem::offset_of!(CompositorFrameDoneRequest, serial) == 8);
+
+const _: () = assert!(core::mem::offset_of!(CompositorMoveRequest, version) == 0);
+const _: () = assert!(core::mem::offset_of!(CompositorMoveRequest, surface) == 4);
+const _: () = assert!(core::mem::offset_of!(CompositorMoveRequest, x) == 8);
+const _: () = assert!(core::mem::offset_of!(CompositorMoveRequest, y) == 12);
+
+const _: () = assert!(core::mem::offset_of!(CompositorRaiseRequest, version) == 0);
+const _: () = assert!(core::mem::offset_of!(CompositorRaiseRequest, surface) == 4);
 
 const _: () = assert!(core::mem::offset_of!(SurfaceReply, version) == 0);
 const _: () = assert!(core::mem::offset_of!(SurfaceReply, status) == 4);

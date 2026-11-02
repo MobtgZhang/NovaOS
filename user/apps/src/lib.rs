@@ -4,6 +4,7 @@
 
 pub mod allocator;
 pub mod console;
+pub mod graphics;
 pub mod ipc;
 pub mod process;
 pub mod syscall;

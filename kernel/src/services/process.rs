@@ -79,7 +79,14 @@ pub(crate) fn exec_image_in_state(
 
     crate::services::dispatch::check_spawn_authority_at_slot(kernel, parent_slot)?;
 
-    let Some(child_task) = kernel.create_bare_task() else {
+    // A spawned task is a real task, not a bare one: it gets its own root
+    // capability. That root is what lets a GUI application create a
+    // `MemoryObject` for its surface buffer and map it into its own address
+    // space. The parent's `SPAWN` authority is checked first, so this is still
+    // an authority-creating operation controlled by the parent; the child's
+    // root is narrow (`SPAWN | GRANT`) and carries no file, device, or input
+    // access by itself.
+    let Some(child_task) = kernel.create_task() else {
         klog!(Level::Error, "process: no task slot");
         return Err(ErrorCode::NoMemory);
     };

@@ -46,6 +46,24 @@ path = "src/bin/shell.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "terminal"
+path = "src/bin/terminal.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "editor"
+path = "src/bin/editor.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "file-manager"
+path = "src/bin/file-manager.rs"
+test = false
+bench = false
+
 [dependencies]
 nova-abi = { workspace = true }
 nova-ipc = { workspace = true }
