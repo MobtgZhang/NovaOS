@@ -415,6 +415,10 @@ struct Outcome {
 /// Every other number goes to the service layer, so the M3/M4 policy is
 /// exercised by exactly one implementation.
 fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
+    if number == nova_abi::nr::SERVICE_REQUEST.number() as u64 {
+        return service_request(args);
+    }
+
     if number == nova_abi::nr::WRITE.number() as u64 {
         return write_to_console(args);
     }
@@ -653,6 +657,79 @@ const fn failed(code: ErrorCode) -> Outcome {
     Outcome {
         result: nova_core::syscall::SyscallResult::Failed(code),
         effect: nova_core::syscall::ThreadEffect::Continue,
+    }
+}
+
+/// Handle `SERVICE_REQUEST`: copy a request out of user space, dispatch it to an
+/// in-kernel service, and copy the reply back.
+///
+/// # Arguments
+///
+/// `arg0` service identifier, `arg1` the service's opcode, `arg2` the user
+/// request pointer, `arg3` the request length, `arg4` the user reply pointer,
+/// `arg5` the reply capacity.
+///
+/// The request copy is bounded by [`nova_abi::ipc::MAX_INLINE_PAYLOAD`]: a
+/// larger request is refused rather than truncated. The reply is copied only up
+/// to the capacity the caller declared, and the service's reply payload is the
+/// return value. A service error is a negative error code, as for every other
+/// call.
+///
+/// The service layer never sees a user pointer. Only this entry path knows the
+/// caller's address space, so it is the only place that can perform the copy.
+fn service_request(args: [u64; 6]) -> Outcome {
+    let service = args[0];
+    let opcode = args[1];
+    let request_ptr = args[2];
+    let request_len = args[3];
+    let reply_ptr = args[4];
+    let reply_capacity = args[5];
+
+    let max = nova_abi::ipc::MAX_INLINE_PAYLOAD as u64;
+    if request_len > max || reply_capacity > max {
+        return failed(ErrorCode::Invalid);
+    }
+
+    let Some(service_id) = u32::try_from(service).ok() else {
+        return failed(ErrorCode::Invalid);
+    };
+
+    let mut request = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
+    if request_len > 0 {
+        if let Err(code) = copy_from_user(&mut request, request_ptr, request_len) {
+            return failed(code);
+        }
+    }
+
+    let mut reply = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
+    let context = crate::task::current_syscall_context();
+
+    // SAFETY: the service state was installed during boot and the entry path
+    // holds no other borrow of it.
+    let kernel = unsafe { crate::services::state() };
+
+    let result = crate::services::dispatch::service_request(
+        kernel,
+        &context,
+        service_id,
+        opcode,
+        &request[..request_len as usize],
+        &mut reply[..reply_capacity as usize],
+    );
+
+    match result {
+        Ok(length) => {
+            if length > 0 {
+                if let Err(code) = copy_to_user(reply_ptr, &reply[..length]) {
+                    return failed(code);
+                }
+            }
+            Outcome {
+                result: nova_core::syscall::SyscallResult::Value(length as i64),
+                effect: nova_core::syscall::ThreadEffect::Continue,
+            }
+        }
+        Err(code) => failed(code),
     }
 }
 

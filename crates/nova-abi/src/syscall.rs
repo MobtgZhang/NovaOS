@@ -163,6 +163,25 @@ pub mod nr {
     /// no authority.
     pub const PROCESS_STATUS: Syscall = Syscall(21);
 
+    /// Make one request of an in-kernel service.
+    ///
+    /// Arguments: `service`, `opcode`, `request_ptr`, `request_len`,
+    /// `reply_ptr`, `reply_capacity`.
+    ///
+    /// This is the M6 route from user space to the services that live inside
+    /// the kernel — the display, input, compositor, and file services. They
+    /// have no task of their own to hold an endpoint, so their protocols ride
+    /// this call instead: the kernel copies the request out of the caller's
+    /// address space (at most one inline message), dispatches it to the named
+    /// service, and copies the reply back into `reply_ptr`, up to
+    /// `reply_capacity`. The reply length is the return value; a service
+    /// error is a negative error code, as for every other call.
+    ///
+    /// The request and reply layouts are each service's own protocol
+    /// (`nova-protocols`), never raw registers: a protocol can be extended,
+    /// and the protocol version is the first field of every request.
+    pub const SERVICE_REQUEST: Syscall = Syscall(22);
+
     /// Every number currently assigned.
     pub const ALL: &[Syscall] = &[
         GET_VERSION,
@@ -187,6 +206,7 @@ pub mod nr {
         ENDPOINT_SELF,
         PROCESS_COUNT,
         PROCESS_STATUS,
+        SERVICE_REQUEST,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -214,6 +234,7 @@ pub mod nr {
             ENDPOINT_SELF => "endpoint_self",
             PROCESS_COUNT => "process_count",
             PROCESS_STATUS => "process_status",
+            SERVICE_REQUEST => "service_request",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

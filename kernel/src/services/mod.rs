@@ -53,6 +53,7 @@
 
 pub mod cap;
 pub mod dispatch;
+pub mod display;
 pub mod fs;
 pub mod ipc;
 pub mod object;
@@ -68,10 +69,21 @@ use nova_fs::scope::{FileScope, ScopeSet};
 use nova_ipc::endpoint::{ChannelId, Completion, ReplyToken, Side};
 use nova_ipc::message::Message;
 
+use crate::services::display::DisplayService;
 use crate::services::fs::{FileServer, MAX_SCOPES_PER_TASK};
 use crate::services::ipc::IpcRegistry;
 use crate::services::object::{ObjectKind, ObjectRegistry};
 use crate::services::supervisor::Supervisor;
+
+/// Service identifiers used by `nr::SERVICE_REQUEST`.
+///
+/// These are wire values, not capability handles: a service request names a
+/// kernel-owned service by number. The display service is implemented now; the
+/// input, compositor, and file services are the M6 follow-on increments.
+pub const SERVICE_DISPLAY: u32 = 1;
+pub const SERVICE_INPUT: u32 = 2;
+pub const SERVICE_COMPOSITOR: u32 = 3;
+pub const SERVICE_FILE: u32 = 4;
 
 /// Maximum number of tasks the kernel tracks.
 ///
@@ -202,6 +214,8 @@ pub struct KernelStateParts<'a> {
     pub files: &'a mut FileServer,
     /// The service supervisor.
     pub supervisor: &'a mut Supervisor,
+    /// The display service.
+    pub display: &'a mut DisplayService,
     /// The message the last receive on each thread produced.
     pub last_message: &'a mut [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -225,6 +239,7 @@ impl KernelState {
             objects: &mut self.objects,
             files: &mut self.files,
             supervisor: &mut self.supervisor,
+            display: &mut self.display,
             last_message: &mut self.last_message,
             last_token: &mut self.last_token,
             last_error: &mut self.last_error,
@@ -287,6 +302,8 @@ pub struct KernelState {
     pub files: FileServer,
     /// The service supervisor.
     pub supervisor: Supervisor,
+    /// The display service.
+    pub display: DisplayService,
     /// The message the last receive on each thread produced.
     pub last_message: [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -328,6 +345,7 @@ impl KernelState {
             ipc: IpcRegistry::new(),
             files: FileServer::new(),
             supervisor: Supervisor::new(),
+            display: DisplayService::new(),
             last_message: [None; MAX_THREADS],
             last_token: [None; MAX_THREADS],
             last_error: [None; MAX_THREADS],
@@ -670,6 +688,7 @@ impl KernelState {
         self.ipc.reset();
         self.files.reset();
         self.supervisor.reset();
+        self.display.reset();
         self.last_message = [None; MAX_THREADS];
         self.last_token = [None; MAX_THREADS];
         self.last_error = [None; MAX_THREADS];

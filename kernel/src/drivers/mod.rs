@@ -25,6 +25,7 @@
 //! filesystem's own scopes.
 
 pub mod block;
+pub mod display;
 pub mod mmio;
 pub mod pci;
 pub mod virtio;

@@ -85,7 +85,19 @@ pub enum ObjectKind {
     /// An address space.
     AddressSpace,
     /// A shareable memory region.
-    MemoryObject,
+    ///
+    /// `base` is the physical address of the first byte and `size` is the
+    /// region's length in bytes. Both are carried here because the region is a
+    /// *map* target: a capability naming it must be able to say which physical
+    /// pages the caller may map, not merely that some memory exists. The
+    /// region is contiguous and page aligned, because the frame allocator hands
+    /// out whole frames and the kernel maps them page by page.
+    MemoryObject {
+        /// First physical byte of the region.
+        base: u64,
+        /// Length of the region in bytes, a multiple of the page size.
+        size: u64,
+    },
     /// A one-shot notification.
     Notification,
     /// The authority to create tasks and spawn objects.
@@ -110,7 +122,7 @@ impl ObjectKind {
             ObjectKind::Task { .. } => ObjectType::Task,
             ObjectKind::Thread { .. } => ObjectType::Thread,
             ObjectKind::AddressSpace => ObjectType::AddressSpace,
-            ObjectKind::MemoryObject => ObjectType::MemoryObject,
+            ObjectKind::MemoryObject { .. } => ObjectType::MemoryObject,
             ObjectKind::Notification => ObjectType::Notification,
             ObjectKind::TaskFactory { .. } => ObjectType::TaskFactory,
         }

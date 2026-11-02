@@ -131,6 +131,53 @@ impl BootValidation {
     }
 }
 
+/// The firmware's linear framebuffer, normalised.
+///
+/// Limine hands over a *virtual* address that it mapped itself; the physical
+/// address is recovered by removing the direct-map offset, because that is
+/// where the bootloader puts every physical page it exposes (the framebuffer
+/// included). Recording both keeps later code from having to redo the
+/// subtraction, and keeps the derivation in one auditable place.
+///
+/// The pixel format is reduced to three bit *shifts*: M6 draws XRGB8888 and
+/// nothing else, and a 32-bit pixel with 8-bit colour components is placed in
+/// memory by where those components sit — so the shifts are the entire
+/// format. The mask *sizes* are checked at capture (all eight bits each) and
+/// not stored, because a size that is not eight is a format this kernel does
+/// not draw, not a parameter of one it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FramebufferInfo {
+    /// Virtual address of the first byte, as the bootloader mapped it.
+    pub virtual_address: u64,
+    /// Physical address of the first byte.
+    pub physical_address: u64,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Bytes between the first pixel of consecutive rows. At least
+    /// `width * 4`; the difference is the display's row padding.
+    pub pitch: u32,
+    /// Bit offset of the red component within one 32-bit pixel.
+    pub red_shift: u8,
+    /// Bit offset of the green component within one 32-bit pixel.
+    pub green_shift: u8,
+    /// Bit offset of the blue component within one 32-bit pixel.
+    pub blue_shift: u8,
+}
+
+impl FramebufferInfo {
+    /// Bytes one row of pixels occupies, padding included.
+    pub fn row_bytes(&self) -> usize {
+        self.pitch as usize
+    }
+
+    /// Total bytes the visible framebuffer occupies, padding included.
+    pub fn byte_count(&self) -> usize {
+        self.row_bytes().saturating_mul(self.height as usize)
+    }
+}
+
 /// Validated snapshot of everything the kernel learns from the bootloader.
 #[derive(Clone, Copy)]
 pub struct BootInfo {
@@ -150,6 +197,13 @@ pub struct BootInfo {
     pub memmap: [MemoryRegion; MAX_MEMMAP_ENTRIES],
     /// Number of populated entries in `memmap`.
     pub memmap_len: usize,
+    /// The firmware framebuffer, when one was set up.
+    ///
+    /// `None` is the normal case on a headless boot and on every M0–M5 run;
+    /// the GUI milestone is what first *uses* it, but capturing it belongs
+    /// here because the bootloader may reclaim its own pages the moment
+    /// control transfers — this snapshot is the only copy that survives.
+    pub framebuffer: Option<FramebufferInfo>,
 }
 
 impl BootInfo {
@@ -166,6 +220,7 @@ impl BootInfo {
                 type_: MEMMAP_USABLE,
             }; MAX_MEMMAP_ENTRIES],
             memmap_len: 0,
+            framebuffer: None,
         }
     }
 
@@ -198,6 +253,11 @@ impl BootInfo {
     /// The bootloader version as a NUL-trimmed string, or `"unknown"`.
     pub fn bootloader_version(&self) -> &str {
         trimmed(&self.bootloader_version)
+    }
+
+    /// The firmware framebuffer, when one was captured.
+    pub fn framebuffer_info(&self) -> Option<FramebufferInfo> {
+        self.framebuffer
     }
 
     /// Check every invariant the rest of the kernel relies on.

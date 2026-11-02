@@ -48,7 +48,12 @@ pub use syscall::{ObjectType, Syscall, nr};
 /// compares it against the one it was built against. The comparison is
 /// major/minor rather than a single integer so that a compatible extension (a new
 /// object type, say) does not read as an incompatible kernel.
-pub const ABI_VERSION: AbiVersion = AbiVersion { major: 0, minor: 1 };
+///
+/// The minor version is `2` because M6 appended [`nr::SERVICE_REQUEST`]: a
+/// number a v0.1 binary never calls, so it keeps working against a v0.2
+/// kernel unchanged, which is exactly what "backwards-compatible addition"
+/// means.
+pub const ABI_VERSION: AbiVersion = AbiVersion { major: 0, minor: 2 };
 
 /// A major/minor ABI version.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -123,11 +128,11 @@ mod tests {
     #[test]
     fn the_version_is_reported_the_same_way_everywhere() {
         assert_eq!(ABI_VERSION.major, 0);
-        assert_eq!(ABI_VERSION.minor, 1);
+        assert_eq!(ABI_VERSION.minor, 2);
 
         let mut sink = Sink::new();
         write!(sink, "{ABI_VERSION}").expect("16 bytes is enough for a version");
-        assert_eq!(sink.as_str(), "0.1");
+        assert_eq!(sink.as_str(), "0.2");
     }
 
     #[test]

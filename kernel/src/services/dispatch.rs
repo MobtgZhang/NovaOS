@@ -72,16 +72,18 @@ use nova_abi::error::ErrorCode;
 use nova_abi::ipc::MAX_INLINE_PAYLOAD;
 use nova_abi::syscall::{ObjectType, Syscall, nr};
 use nova_cap::ObjectRef;
+use nova_core::address_space::Protection;
 use nova_ipc::endpoint::Side;
 use nova_ipc::message::Message;
 
+use crate::boot::PAGE_SIZE;
 use crate::services::cap;
 use crate::services::ipc::{IpcOutcome, SelfTransfer, TableTransfer};
 use crate::services::object::ObjectKind;
 use crate::services::process;
 use crate::services::state;
 use crate::services::two_caps_mut;
-use crate::services::{KernelState, KernelStateParts};
+use crate::services::{KernelState, KernelStateParts, SERVICE_DISPLAY};
 
 /// The context a syscall is dispatched in.
 ///
@@ -218,11 +220,16 @@ pub fn dispatch_syscall_in(
 /// - `RECV` — receive a message on an endpoint;
 /// - `CALL` — send a request and wait for its reply;
 /// - `REPLY` — answer a request once;
+/// - `MAP` — map a `MemoryObject`'s pages into the caller's address space;
 /// - `YIELD`, `THREAD_EXIT` — the scheduler-facing calls.
 ///
-/// Everything else — `MAP`, `UNMAP`, `THREAD_SPAWN`, `CANCEL_WAIT` — returns
-/// `E_UNSUPPORTED`. `MAP` and `UNMAP` need M2's address-space machinery,
-/// `THREAD_SPAWN` needs the scheduler, and `CANCEL_WAIT` needs a blocking
+/// `SERVICE_REQUEST` is handled by the syscall entry path, not here, because
+/// its request and reply are user pointers and only the entry path knows the
+/// caller's address space.
+///
+/// `UNMAP`, `THREAD_SPAWN`, and `CANCEL_WAIT` still return `E_UNSUPPORTED`.
+/// `UNMAP` needs the address-space machinery wired through the same caller-space
+/// path, `THREAD_SPAWN` needs the scheduler, and `CANCEL_WAIT` needs a blocking
 /// primitive that does not exist yet.
 pub fn dispatch_typed(
     kernel: &mut KernelState,
@@ -240,6 +247,7 @@ pub fn dispatch_typed(
         nr::RECV => recv(kernel, context, args),
         nr::CALL => send(kernel, context, args, true),
         nr::REPLY => reply(kernel, context, args),
+        nr::MAP => map_memory(kernel, context, args),
         nr::YIELD => SyscallOutcome::Value(0),
         nr::THREAD_EXIT => {
             crate::services::process::retire_task(context.task_slot);
@@ -308,9 +316,13 @@ pub(crate) fn check_spawn_authority_at_slot(
 
 /// Create a kernel object and hand the caller a capability to it.
 ///
-/// `arg0` is the ABI object type, `arg1` the requested rights. The rights are
-/// *intersected* with the caller's authority to create objects of that kind,
-/// so a caller cannot mint a capability with rights it does not itself hold.
+/// `arg0` is the ABI object type, `arg1` the requested rights, and `arg2` is
+/// the size in bytes for a `MemoryObject`. The size is ignored for the other
+/// kinds; a memory object without a size is refused rather than defaulted.
+///
+/// The rights are *intersected* with the caller's authority to create objects
+/// of that kind, so a caller cannot mint a capability with rights it does not
+/// itself hold.
 fn object_create(
     kernel: &mut KernelState,
     context: &SyscallContext,
@@ -351,7 +363,10 @@ fn object_create(
             thread: context.thread,
         },
         ObjectType::AddressSpace => ObjectKind::AddressSpace,
-        ObjectType::MemoryObject => ObjectKind::MemoryObject,
+        ObjectType::MemoryObject => match create_memory_object(args[2]) {
+            Ok(kind) => kind,
+            Err(code) => return SyscallOutcome::Failed(code),
+        },
         ObjectType::Notification => ObjectKind::Notification,
         ObjectType::IoRegion => {
             // The ABI has no directory kind, so a path-scoped file grant is
@@ -382,6 +397,152 @@ fn object_create(
         Ok((handle, _)) => SyscallOutcome::Value(handle.raw() as i64),
         Err(code) => SyscallOutcome::Failed(code),
     }
+}
+
+/// Maximum number of frames one `MemoryObject` may occupy.
+///
+/// The allocation is contiguous, so the object is `base` plus `size`. The bound
+/// keeps the frame bookkeeping on the kernel's stack: a surface buffer is a few
+/// megabytes, and a request for more is a quota failure rather than a silent
+/// unbounded allocation.
+pub const MAX_MEMORY_FRAMES: usize = 1024;
+
+/// Create a contiguous physical memory object.
+///
+/// The size is rounded up to whole frames, and the frames must be consecutive:
+/// a `MemoryObject` carries one base address and a length, so a fragmented
+/// allocation cannot be represented. A partial or fragmented allocation is
+/// returned to the allocator before the error leaves this function.
+fn create_memory_object(size: u64) -> Result<ObjectKind, ErrorCode> {
+    if size == 0 {
+        return Err(ErrorCode::Invalid);
+    }
+
+    let Some(rounded) = size.checked_add(PAGE_SIZE - 1) else {
+        return Err(ErrorCode::Invalid);
+    };
+    let aligned = rounded & !(PAGE_SIZE - 1);
+    let frame_count = aligned / PAGE_SIZE;
+
+    if frame_count > MAX_MEMORY_FRAMES as u64 {
+        return Err(ErrorCode::NoMemory);
+    }
+    let count = usize::try_from(frame_count).map_err(|_| ErrorCode::Invalid)?;
+    if count == 0 {
+        return Err(ErrorCode::Invalid);
+    }
+
+    let allocator = unsafe { crate::mm::frame_allocator() };
+    let mut frames = [0usize; MAX_MEMORY_FRAMES];
+    let mut used = 0usize;
+
+    for _ in 0..count {
+        match allocator.alloc() {
+            Ok(frame) => {
+                frames[used] = frame;
+                used = used.saturating_add(1);
+            }
+            Err(_) => {
+                release_frames(&frames[..used]);
+                return Err(ErrorCode::NoMemory);
+            }
+        }
+    }
+
+    let first = frames[0];
+    for index in 1..used {
+        if frames[index] != first.saturating_add(index) {
+            release_frames(&frames[..used]);
+            return Err(ErrorCode::NoMemory);
+        }
+    }
+
+    let base = (first as u64).saturating_mul(PAGE_SIZE);
+    Ok(ObjectKind::MemoryObject {
+        base,
+        size: aligned,
+    })
+}
+
+/// Return frames to the allocator.
+fn release_frames(frames: &[usize]) {
+    let allocator = unsafe { crate::mm::frame_allocator() };
+    for frame in frames {
+        // SAFETY: every frame in this slice was allocated by the caller and has
+        // not been released yet, so the double-free rule holds.
+        unsafe { allocator.dealloc(*frame) };
+    }
+}
+
+/// Return a memory object's frames to the allocator.
+fn free_memory_object(base: u64, size: u64) {
+    let start = (base / PAGE_SIZE) as usize;
+    let count = (size / PAGE_SIZE) as usize;
+    let allocator = unsafe { crate::mm::frame_allocator() };
+    for index in 0..count {
+        // SAFETY: the object was created from a contiguous run of frames that
+        // this kernel allocated, and it is being destroyed once.
+        unsafe { allocator.dealloc(start.saturating_add(index)) };
+    }
+}
+
+/// Map a `MemoryObject` into the calling thread's address space.
+///
+/// `arg0` is the memory-object handle, `arg1` the user virtual address, `arg2`
+/// the length in bytes, and `arg3` the protection code: `0` read-write, `1`
+/// read-only, `2` read-execute. The mapping is page by page because the ABI's
+/// address space is page granular; `length` and `virt` must already be page
+/// aligned, and the region must lie inside the object.
+fn map_memory(kernel: &KernelState, context: &SyscallContext, args: [u64; 6]) -> SyscallOutcome {
+    let handle = CapHandle::from_raw(args[0]);
+    let virt = args[1];
+    let length = args[2];
+    let protection_code = args[3];
+
+    if length == 0 || length % PAGE_SIZE != 0 || virt % PAGE_SIZE != 0 {
+        return SyscallOutcome::Failed(ErrorCode::Invalid);
+    }
+
+    let Some(table) = kernel.caps_at(context.task_slot) else {
+        return SyscallOutcome::Failed(ErrorCode::BadHandle);
+    };
+
+    let resolved = match cap::resolve(table, &kernel.objects, handle, Rights::MAP) {
+        Ok(resolved) => resolved,
+        Err(code) => return SyscallOutcome::Failed(code),
+    };
+
+    let ObjectKind::MemoryObject { base, size } = resolved.kind else {
+        return SyscallOutcome::Failed(ErrorCode::Invalid);
+    };
+
+    if length > size {
+        return SyscallOutcome::Failed(ErrorCode::Invalid);
+    }
+
+    let protection = match protection_code {
+        0 => Protection::UserReadWrite,
+        1 => Protection::UserReadOnly,
+        2 => Protection::UserReadExecute,
+        _ => return SyscallOutcome::Failed(ErrorCode::Invalid),
+    };
+
+    let Some(space) = crate::task::current_thread_space() else {
+        return SyscallOutcome::Failed(ErrorCode::BadHandle);
+    };
+
+    let pages = length / PAGE_SIZE;
+    for index in 0..pages {
+        let offset = index.saturating_mul(PAGE_SIZE);
+        let page_virt = virt.saturating_add(offset);
+        let page_phys = base.saturating_add(offset);
+
+        if crate::mm::address_space::map(&space, page_virt, page_phys, protection).is_err() {
+            return SyscallOutcome::Failed(ErrorCode::Invalid);
+        }
+    }
+
+    SyscallOutcome::Value(pages as i64)
 }
 
 /// The handle of the kernel's root capability in a task's table.
@@ -420,6 +581,13 @@ fn object_destroy(
         Ok(resolved) => resolved,
         Err(code) => return SyscallOutcome::Failed(code),
     };
+
+    // A memory object owns physical frames. Destroying it is the point at
+    // which those frames must return to the allocator; otherwise a program
+    // that creates and closes windows leaks every surface buffer it ever used.
+    if let ObjectKind::MemoryObject { base, size } = resolved.kind {
+        free_memory_object(base, size);
+    }
 
     let object_ref = resolved.object_ref;
     let KernelStateParts { caps, objects, .. } = kernel.split();
@@ -688,6 +856,42 @@ fn reply(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> 
         IpcOutcome::Blocked => SyscallOutcome::Blocked,
         IpcOutcome::Failed(code) => SyscallOutcome::Failed(code),
     }
+}
+
+/// Dispatch one request to an in-kernel service.
+///
+/// `service` is the wire identifier ([`SERVICE_DISPLAY`] now), `opcode` the
+/// service's own operation number, `request_payload` the fixed protocol bytes,
+/// and `reply` the caller-owned buffer the reply payload is copied into.
+///
+/// Returns the reply length, or the service's error code. `reply` is not padded:
+/// its first `length` bytes are the reply, and the caller copies exactly those
+/// bytes back into user space.
+///
+/// The entry path owns the copy from and to user space; this function works only
+/// on kernel-owned bytes, which is what keeps the service layer testable from
+/// ring 0.
+pub fn service_request(
+    kernel: &mut KernelState,
+    _context: &SyscallContext,
+    service: u32,
+    opcode: u64,
+    request_payload: &[u8],
+    reply: &mut [u8],
+) -> Result<usize, ErrorCode> {
+    let request = Message::with_payload(opcode, request_payload)?;
+
+    let reply_message = match service {
+        SERVICE_DISPLAY => kernel.display.handle_message(&request),
+        _ => return Err(ErrorCode::Unsupported),
+    };
+
+    let payload = reply_message.payload();
+    if payload.len() > reply.len() {
+        return Err(ErrorCode::Invalid);
+    }
+    reply[..payload.len()].copy_from_slice(payload);
+    Ok(payload.len())
 }
 
 /// The maximum inline payload the dispatcher accepts.

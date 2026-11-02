@@ -16,6 +16,12 @@
 //!   and stat, each with a `#[repr(C)]` request and reply layout.
 //! - [`manifest`] is the service manifest: dependencies, the READY handshake,
 //!   timeouts, and the restart window — with no way to express authority.
+//! - [`display`] is the display service protocol: a mode query, no framebuffer
+//!   address.
+//! - [`surface`] is the surface and compositor protocol: create, attach,
+//!   damage, commit, destroy, configure, and frame-done.
+//! - [`input`] is the input service protocol: key and pointer events, routed by
+//!   the compositor's focus decision.
 //!
 //! # Layout is a cross-binary contract
 //!
@@ -37,14 +43,21 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod console;
+pub mod display;
 pub mod file;
+pub mod input;
 pub mod manifest;
 pub mod shell;
+pub mod surface;
 
 pub use console::{
     CONSOLE_CAPACITY, CONSOLE_OP_READ_LINE, CONSOLE_OP_WRITE, CONSOLE_VERSION, ConsoleBuffer,
     ConsoleOpcode, ConsoleReadLineReply, ConsoleReadLineRequest, ConsoleWriteReply,
     ConsoleWriteRequest, LineOutcome, LineStatus,
+};
+pub use display::{
+    DISPLAY_OP_QUERY, DISPLAY_QUERY_REPLY_SIZE, DISPLAY_QUERY_REQUEST_SIZE, DISPLAY_VERSION,
+    DisplayOpcode, DisplayQueryReply, DisplayQueryRequest,
 };
 pub use file::{
     FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE,
@@ -52,11 +65,28 @@ pub use file::{
     FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply, FileReadRequest, FileStatReply,
     FileStatRequest, FileWriteReply, FileWriteRequest, WireHandle,
 };
+pub use input::{
+    INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_BUTTON_WHEEL, INPUT_KEY_REQUEST_SIZE,
+    INPUT_OP_KEY, INPUT_OP_POINTER, INPUT_POINTER_REQUEST_SIZE, INPUT_REPLY_SIZE, INPUT_VERSION,
+    InputKeyRequest, InputOpcode, InputPointerRequest, InputReply, KeyState,
+};
 pub use manifest::{
     Clock, Dependency, DependencyStatus, MAX_DEPENDENCIES, ManualClock, ReadyMessage,
     RestartDecision, RestartTracker, ServiceManifest, ServiceState, check_dependencies,
 };
 pub use shell::ShellCommand;
+pub use surface::{
+    COMPOSITOR_CONFIGURE_REQUEST_SIZE, COMPOSITOR_FRAME_DONE_REQUEST_SIZE, COMPOSITOR_OP_CONFIGURE,
+    COMPOSITOR_OP_FRAME_DONE, COMPOSITOR_SCALE_ONE, CompositorConfigureRequest,
+    CompositorFrameDoneRequest, MAX_DAMAGE_RECTS, PIXEL_FORMAT_XRGB8888, PixelFormat,
+    SURFACE_ATTACH_REQUEST_SIZE, SURFACE_COMMIT_REQUEST_SIZE, SURFACE_CREATE_REPLY_SIZE,
+    SURFACE_CREATE_REQUEST_SIZE, SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE,
+    SURFACE_DESTROY_REQUEST_SIZE, SURFACE_OP_ATTACH, SURFACE_OP_COMMIT, SURFACE_OP_CREATE,
+    SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_RECT_SIZE, SURFACE_REPLY_SIZE, SURFACE_VERSION,
+    SurfaceAttachRequest, SurfaceCommitRequest, SurfaceCreateReply, SurfaceCreateRequest,
+    SurfaceDamageReply, SurfaceDamageRequest, SurfaceDestroyRequest, SurfaceOpcode, SurfaceRect,
+    SurfaceReply, required_buffer_bytes, stride_is_sufficient,
+};
 
 /// The version of a NovaOS protocol.
 ///
@@ -270,10 +300,13 @@ mod discipline {
     /// structural rule is best enforced by a test that reads the source. A
     /// comment or a lint configuration cannot be forgotten, but a function
     /// body can.
-    const SOURCES: [&str; 3] = [
+    const SOURCES: [&str; 6] = [
         include_str!("console.rs"),
+        include_str!("display.rs"),
         include_str!("file.rs"),
+        include_str!("input.rs"),
         include_str!("manifest.rs"),
+        include_str!("surface.rs"),
     ];
 
     /// Whether any *code* line of `source` contains `token`.

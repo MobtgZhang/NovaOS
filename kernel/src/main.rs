@@ -215,6 +215,23 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // immutable from here on.
     let boot_info = unsafe { boot::read_boot_info() };
 
+    // The framebuffer is mapped here, after `mm::init` built and activated the
+    // kernel's address space and after `services::init` published the display
+    // service's state. `init` records the mode and logs it; a headless boot is
+    // normal and leaves the display unavailable rather than failing.
+    //
+    // SAFETY: runs once from the boot path, with the address space live and no
+    // draw call before it.
+    unsafe { drivers::display::init(boot_info) };
+
+    // SAFETY: the driver's mode is a boot fact; copying it into the service
+    // state is a placement, not an allocation.
+    unsafe {
+        crate::services::state()
+            .display
+            .set_mode(crate::drivers::display::mode());
+    }
+
     klog!(
         Level::Info,
         "boot: {} {} protocol rev {}",

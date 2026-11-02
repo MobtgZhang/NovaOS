@@ -61,13 +61,17 @@ use core::num::NonZeroU64;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use limine::framebuffer::{FRAMEBUFFER_RGB, Framebuffer};
 use limine::request::{
-    BootloaderInfoRequest, HhdmRequest, MemmapRequest, ModulesRequest, StackSizeRequest,
+    BootloaderInfoRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest,
+    StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use crate::arch::shared::exit::EXIT_PANIC;
-use crate::boot::info::{BootInfo, MAX_MEMMAP_ENTRIES, MAX_PHYSICAL_ADDRESS, PAGE_SIZE};
+use crate::boot::info::{
+    BootInfo, FramebufferInfo, MAX_MEMMAP_ENTRIES, MAX_PHYSICAL_ADDRESS, PAGE_SIZE,
+};
 use crate::klog;
 use crate::logger::Level;
 
@@ -115,6 +119,14 @@ pub static LIMINE_STACK_SIZE: StackSizeRequest = StackSizeRequest::new(64 * 1024
 /// user program still runs the kernel and its test suites.
 #[unsafe(no_mangle)]
 pub static LIMINE_MODULES: ModulesRequest = ModulesRequest::new();
+
+/// Request a linear framebuffer from the firmware's GOP setup.
+///
+/// Absent on a headless firmware and on any boot where nobody asked for a
+/// display; [`capture`] records `None` in that case rather than failing, so
+/// M0–M5 boots are unaffected by the M6 request being present.
+#[unsafe(no_mangle)]
+pub static LIMINE_FRAMEBUFFER: FramebufferRequest = FramebufferRequest::new();
 
 /// The single kernel-owned copy of the boot snapshot.
 ///
@@ -340,6 +352,47 @@ pub unsafe fn capture() -> &'static BootInfo {
         // Write the count last: it is what makes the entries visible, so a
         // reader that sees a count must see the entries behind it.
         (&raw mut (*target).memmap_len).write(stored);
+
+        // The firmware framebuffer, when one exists. Its absence is the
+        // normal case on every headless and M0-M5 boot and is recorded as
+        // `None` without a warning; an unusable one is dropped with the
+        // reason spelled out, because a GUI that draws into a framebuffer
+        // whose geometry was never checked corrupts nothing but the user's
+        // understanding of why the screen is wrong.
+        let framebuffer = match LIMINE_FRAMEBUFFER.response() {
+            None => None,
+            Some(response) => match response.framebuffers().first() {
+                None => None,
+                Some(framebuffer) => {
+                    let direct_map_offset = (*target).direct_map_offset;
+                    let outcome = (framebuffer.address() as u64)
+                        .checked_sub(direct_map_offset)
+                        .ok_or("virtual address is below the direct map")
+                        .and_then(|phys| normalise_framebuffer(framebuffer, phys));
+                    match outcome {
+                        Ok(info) => {
+                            klog!(
+                                Level::Info,
+                                "limine: framebuffer {}x{} pitch {} bpp 32 rgb shifts {}/{}/{} at {:#x}",
+                                info.width,
+                                info.height,
+                                info.pitch,
+                                info.red_shift,
+                                info.green_shift,
+                                info.blue_shift,
+                                info.physical_address
+                            );
+                            Some(info)
+                        }
+                        Err(reason) => {
+                            klog!(Level::Warn, "limine: framebuffer unusable: {reason}");
+                            None
+                        }
+                    }
+                }
+            },
+        };
+        (&raw mut (*target).framebuffer).write(framebuffer);
     }
 
     // SAFETY: `capture` owns the single write, and no concurrent writer exists this
@@ -377,6 +430,79 @@ pub unsafe fn capture() -> &'static BootInfo {
 
     // SAFETY: `READY` was just set, and nothing writes the snapshot afterwards.
     unsafe { read_boot_info() }
+}
+
+/// Check a firmware framebuffer against what M6 draws, and normalise it.
+///
+/// The kernel draws one pixel format — XRGB8888, 32 bits, three eight-bit
+/// components — and this function is the gate that keeps that promise honest:
+/// a firmware that hands over a 16-bit or planar framebuffer is *reported*,
+/// not silently drawn into with the wrong pixel layout. The physical address
+/// is taken from the caller, which derived it from the direct-map offset;
+/// this function only checks that the derivation produced a page-aligned
+/// address inside the addressable range, which is what tells the caller the
+/// subtraction was sound.
+fn normalise_framebuffer(
+    framebuffer: &Framebuffer,
+    physical_address: u64,
+) -> Result<FramebufferInfo, &'static str> {
+    if framebuffer.memory_model != FRAMEBUFFER_RGB {
+        return Err("memory model is not RGB");
+    }
+    if framebuffer.bpp != 32 {
+        return Err("bits per pixel is not 32");
+    }
+    if framebuffer.red_mask_size != 8
+        || framebuffer.green_mask_size != 8
+        || framebuffer.blue_mask_size != 8
+    {
+        return Err("colour components are not eight bits each");
+    }
+    if framebuffer.width == 0 || framebuffer.height == 0 {
+        return Err("zero width or height");
+    }
+    // A mode the address space cannot hold is a mode that cannot be drawn:
+    // the visible bytes are `height * pitch`, and both are firmware-supplied.
+    if framebuffer.width > MAX_PHYSICAL_ADDRESS / 4
+        || framebuffer.height > MAX_PHYSICAL_ADDRESS
+        || framebuffer.pitch > MAX_PHYSICAL_ADDRESS
+    {
+        return Err("geometry exceeds the addressable range");
+    }
+    // Rows are padded to the display's transfer granularity, so pitch is at
+    // least the visible bytes and may be more; less means the firmware's own
+    // arithmetic disagrees with its geometry.
+    let minimum_pitch = framebuffer.width * 4;
+    if framebuffer.pitch < minimum_pitch {
+        return Err("pitch is smaller than one row of pixels");
+    }
+    // The visible bytes must fit the addressable range too, or the last rows
+    // land past the end of what the kernel can map. The multiplication is
+    // checked rather than performed and then bounded: two firmware-supplied
+    // words can overflow u64 before any comparison sees them.
+    let Some(visible_bytes) = framebuffer.pitch.checked_mul(framebuffer.height) else {
+        return Err("visible size overflows the address space");
+    };
+    if visible_bytes == 0 || visible_bytes > MAX_PHYSICAL_ADDRESS {
+        return Err("visible size exceeds the addressable range");
+    }
+    if physical_address == 0 || physical_address % PAGE_SIZE != 0 {
+        return Err("physical address is null or not page aligned");
+    }
+    if physical_address.saturating_add(visible_bytes) > MAX_PHYSICAL_ADDRESS {
+        return Err("framebuffer extends past the addressable limit");
+    }
+
+    Ok(FramebufferInfo {
+        virtual_address: framebuffer.address() as u64,
+        physical_address,
+        width: framebuffer.width as u32,
+        height: framebuffer.height as u32,
+        pitch: framebuffer.pitch as u32,
+        red_shift: framebuffer.red_mask_shift,
+        green_shift: framebuffer.green_mask_shift,
+        blue_shift: framebuffer.blue_mask_shift,
+    })
 }
 
 /// Copy a C string into a fixed-size, NUL-padded buffer, truncating safely.
