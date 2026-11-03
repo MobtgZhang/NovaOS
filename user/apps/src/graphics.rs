@@ -16,12 +16,15 @@
 //! resolve the handle in the caller's own capability table. A program cannot
 //! attach memory it does not hold.
 //!
-//! # The client does not move focus
+//! # The client does not inject, and it does not move focus
 //!
-//! The input wrappers name a surface, but the input service routes a key only
-//! to the compositor's focused surface and routes a pointer through the
-//! compositor's own hit test. That is why `Input.key` can be refused even when
-//! the caller names a live surface.
+//! A program cannot write into the input stream. `INPUT_OP_KEY` and
+//! `INPUT_OP_POINTER` are the trusted producer's opcodes — the PS/2 driver in
+//! the kernel — and the ring-3 path answers `INPUT_OP_GET` only, so an
+//! application reads the events its own surface was sent and can forge none.
+//! What it reads is already routed: keys went to the focused surface and
+//! pointer events to the surface under the pointer, decided by the compositor
+//! rather than by the request that carried them.
 
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
@@ -32,8 +35,7 @@ use nova_protocols::display::{
     DisplayQueryRequest,
 };
 use nova_protocols::input::{
-    INPUT_OP_KEY, INPUT_OP_POINTER, INPUT_REPLY_SIZE, INPUT_VERSION, InputKeyRequest,
-    InputPointerRequest, KeyState,
+    INPUT_EVENT_NONE, INPUT_GET_REPLY_SIZE, INPUT_OP_GET, INPUT_VERSION, InputGetRequest,
 };
 use nova_protocols::surface::{
     COMPOSITOR_OP_CONFIGURE, COMPOSITOR_OP_FRAME_DONE, COMPOSITOR_OP_MOVE, COMPOSITOR_OP_RAISE,
@@ -117,10 +119,26 @@ fn protocol_bytes<T>(value: &T) -> &[u8] {
 }
 
 /// Read a little-endian `u32` from a reply.
-fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let end = offset.checked_add(4)?;
     let part = bytes.get(offset..end)?;
     Some(u32::from_le_bytes([part[0], part[1], part[2], part[3]]))
+}
+
+/// Read a little-endian `u64` from a reply.
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let end = offset.checked_add(8)?;
+    let part = bytes.get(offset..end)?;
+    Some(u64::from_le_bytes([
+        part[0], part[1], part[2], part[3], part[4], part[5], part[6], part[7],
+    ]))
+}
+
+/// Read a little-endian `u16` from a reply.
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let end = offset.checked_add(2)?;
+    let part = bytes.get(offset..end)?;
+    Some(u16::from_le_bytes([part[0], part[1]]))
 }
 
 /// Read a little-endian `i32` from a reply.
@@ -130,7 +148,7 @@ fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
 }
 
 /// Whether a service reply carries success.
-fn reply_ok(bytes: &[u8]) -> Result<(), ErrorCode> {
+pub(crate) fn reply_ok(bytes: &[u8]) -> Result<(), ErrorCode> {
     let status = read_i32(bytes, 4).ok_or(ErrorCode::Invalid)?;
     if status == 0 {
         return Ok(());
@@ -378,48 +396,182 @@ pub fn compositor_frame_done(surface: u32, serial: u64) -> Result<(), ErrorCode>
     reply_ok(&reply)
 }
 
-/// Send a key event for a surface. The service refuses it unless the
-/// compositor has focused that surface.
-pub fn input_key(surface: u32, scancode: u16, state: KeyState) -> Result<(), ErrorCode> {
-    let request = InputKeyRequest {
-        version: INPUT_VERSION,
+/// Show the window's current contents: damage it, commit it, acknowledge it.
+///
+/// The three steps are §15.3's `damage`/`commit`/`frame_done`, in the order
+/// the protocol implies. Damage first so the commit has something to publish;
+/// the acknowledgement last, because it is the client saying it has finished
+/// with the serial it just committed.
+///
+/// The whole window is damaged every time rather than only what changed. An
+/// application redraws when its own state changes — a keystroke, a click — not
+/// on a timer, so a full-surface copy costs one blit per *event* and never a
+/// frame per tick; and it cannot leave a stale region behind when a window
+/// that covered this one moves away.
+pub fn present(surface: u32, serial: u64, width: u32, height: u32) -> Result<(), ErrorCode> {
+    surface_damage(
         surface,
-        scancode,
-        state,
-    };
-    let mut reply = [0u8; INPUT_REPLY_SIZE];
-    let length = service_request(
-        SERVICE_INPUT,
-        INPUT_OP_KEY,
-        protocol_bytes(&request),
-        &mut reply,
+        SurfaceRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        },
     )?;
-    if length != INPUT_REPLY_SIZE {
-        return Err(ErrorCode::Invalid);
-    }
-    reply_ok(&reply)
+    surface_commit(surface, serial)?;
+    compositor_frame_done(surface, serial)
 }
 
-/// Send a pointer event. Focus is decided by the compositor's hit test.
-pub fn input_pointer(surface: u32, x: i32, y: i32, buttons: u32) -> Result<(), ErrorCode> {
-    let request = InputPointerRequest {
+/// A window: its surface, its mapped pixels, and the serial of the last frame
+/// it committed.
+///
+/// Every GUI application needs these four things together and needs the
+/// serial to advance once per redraw, so they travel as one value. The
+/// buffer is the same pointer [`open_window`] mapped; a [`crate::ui::Canvas`]
+/// is built over it by the caller, because the toolkit draws and the window
+/// only publishes.
+///
+/// The serial is what makes consecutive frames distinguishable to the
+/// compositor: two commits with the same serial are the same frame read
+/// twice, and a client that reuses one would have its acknowledgement
+/// credited to the wrong commit.
+#[derive(Clone, Copy)]
+pub struct Window {
+    /// The surface the compositor tracks for this window.
+    pub surface: u32,
+    /// The mapped pixel buffer: `width * height` XRGB8888 words.
+    pub buffer: *mut u8,
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// The serial of the last committed frame.
+    serial: u64,
+}
+
+impl Window {
+    /// Open a `width` x `height` window and map the buffer to draw into.
+    pub fn open(width: u32, height: u32) -> Result<Window, ErrorCode> {
+        let (surface, buffer) = open_window(width, height)?;
+        Ok(Window {
+            surface,
+            buffer,
+            width,
+            height,
+            serial: 0,
+        })
+    }
+
+    /// Show the window's current contents under a fresh serial.
+    pub fn present(&mut self) -> Result<(), ErrorCode> {
+        self.serial = self.serial.wrapping_add(1);
+        present(self.surface, self.serial, self.width, self.height)
+    }
+
+    /// Drain the input events queued for this window into `out`.
+    ///
+    /// Events arrive only for the surface the compositor routed them to: keys
+    /// for the focused window, pointer events for the one under the pointer.
+    /// An empty drain is the normal case between clicks, not an error.
+    pub fn drain(&self, out: &mut [InputEvent]) -> Result<usize, ErrorCode> {
+        input_drain(self.surface, out)
+    }
+}
+
+/// One event read back from the input service.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InputEvent {
+    /// `INPUT_EVENT_KEY` or `INPUT_EVENT_POINTER`.
+    pub kind: u32,
+    /// Key state for a key event; zero otherwise.
+    pub state: u16,
+    /// Scancode for a key event; zero otherwise.
+    pub scancode: u16,
+    /// Pointer x, already local to this surface; zero for a key event.
+    pub x: i32,
+    /// Pointer y, already local to this surface; zero for a key event.
+    pub y: i32,
+    /// Button mask for a pointer event; zero for a key event.
+    pub buttons: u32,
+    /// The surface the event belongs to.
+    pub surface: u32,
+}
+
+impl InputEvent {
+    /// An event of no kind at all.
+    ///
+    /// A caller fills a fixed array with these before draining: the drain
+    /// overwrites the first `count` entries, and the rest stay as this —
+    /// kind [`INPUT_EVENT_NONE`], which every handler ignores. The array
+    /// needs no `Option`, because "no event" is already a state the protocol
+    /// defines.
+    pub const EMPTY: InputEvent = InputEvent {
+        kind: INPUT_EVENT_NONE,
+        state: 0,
+        scancode: 0,
+        x: 0,
+        y: 0,
+        buttons: 0,
+        surface: 0,
+    };
+}
+
+/// Read the next event addressed to `surface`.
+///
+/// `Ok(None)` means the queue was empty — not an error, and not a reason to
+/// spin: a caller that gets `None` should yield and ask again. The surface
+/// must be one this program owns, or the service refuses with `E_DENIED`, so
+/// a program cannot read another window's keystrokes by naming its surface.
+pub fn input_get(surface: u32) -> Result<Option<InputEvent>, ErrorCode> {
+    let request = InputGetRequest {
         version: INPUT_VERSION,
         surface,
-        x,
-        y,
-        buttons,
     };
-    let mut reply = [0u8; INPUT_REPLY_SIZE];
+    let mut reply = [0u8; INPUT_GET_REPLY_SIZE];
     let length = service_request(
         SERVICE_INPUT,
-        INPUT_OP_POINTER,
+        INPUT_OP_GET,
         protocol_bytes(&request),
         &mut reply,
     )?;
-    if length != INPUT_REPLY_SIZE {
+    if length != INPUT_GET_REPLY_SIZE {
         return Err(ErrorCode::Invalid);
     }
-    reply_ok(&reply)
+    reply_ok(&reply)?;
+
+    let kind = read_u32(&reply, 8).ok_or(ErrorCode::Invalid)?;
+    if kind == INPUT_EVENT_NONE {
+        return Ok(None);
+    }
+    Ok(Some(InputEvent {
+        kind,
+        state: read_u16(&reply, 12).ok_or(ErrorCode::Invalid)?,
+        scancode: read_u16(&reply, 14).ok_or(ErrorCode::Invalid)?,
+        x: read_i32(&reply, 16).ok_or(ErrorCode::Invalid)?,
+        y: read_i32(&reply, 20).ok_or(ErrorCode::Invalid)?,
+        buttons: read_u32(&reply, 24).ok_or(ErrorCode::Invalid)?,
+        surface: read_u32(&reply, 28).ok_or(ErrorCode::Invalid)?,
+    }))
+}
+
+/// Drain every event currently queued for `surface`.
+///
+/// A window that has just been focused may have a backlog waiting for it, and
+/// acting on one event per frame makes the window feel a beat behind. The
+/// bound keeps a flood of input from turning one frame into an unbounded
+/// amount of work.
+pub fn input_drain(surface: u32, out: &mut [InputEvent]) -> Result<usize, ErrorCode> {
+    let mut count = 0;
+    while count < out.len() {
+        match input_get(surface)? {
+            None => break,
+            Some(event) => {
+                out[count] = event;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 /// Create a shareable `MemoryObject` and return its capability.

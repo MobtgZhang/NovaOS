@@ -4,10 +4,18 @@
 
 pub mod allocator;
 pub mod console;
+pub mod fsclient;
 pub mod graphics;
 pub mod ipc;
 pub mod process;
 pub mod syscall;
+
+// The toolkit is a crate of its own rather than a module here: everything in
+// it is pure `core` logic, and a crate can be compiled for the host and *tested*
+// there — which this one cannot, being a set of bare-metal binaries. See
+// `nova-ui`'s own documentation for the longer version.
+pub use nova_ui as ui;
+pub use nova_ui::keyboard;
 
 use nova_abi::nr;
 

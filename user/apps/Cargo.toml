@@ -69,6 +69,7 @@ nova-abi = { workspace = true }
 nova-ipc = { workspace = true }
 nova-protocols = { workspace = true }
 nova-fs = { workspace = true }
+nova-ui = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
