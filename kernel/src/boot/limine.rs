@@ -145,9 +145,18 @@ static mut INITRAMFS_LEN: usize = 0;
 
 /// The largest initramfs this kernel will copy.
 ///
-/// Six small ELF binaries fit easily; a larger archive is refused before it can
-/// overwrite kernel-owned storage.
-const INITRAMFS_CAPACITY: usize = 256 * 1024;
+/// The archive holds every packaged program, and the desktop's programs are not
+/// the handful of small IPC services this bound started with: eight binaries,
+/// three of which link the UI toolkit and the built-in font, run to about
+/// 270 KiB today — so the first value of this constant (256 KiB) is already a
+/// boot failure rather than a margin.
+///
+/// It is a guard, not a target. The length is checked *before* the copy, so an
+/// oversized archive is refused rather than truncated into a corrupt one, and
+/// the storage is `.bss`: raising the bound costs RAM the machine already has
+/// (the QEMU VM is 1 GiB) and no image bytes, while lowering the risk of the
+/// next application silently pushing the desktop past a boot it used to pass.
+const INITRAMFS_CAPACITY: usize = 512 * 1024;
 
 /// Borrow the kernel-owned initramfs snapshot.
 pub fn initramfs() -> Option<&'static [u8]> {
