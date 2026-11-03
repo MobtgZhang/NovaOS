@@ -40,13 +40,30 @@ use nova_fs::scope::{FileScope, ScopeSet};
 use nova_ipc::Message;
 use nova_protocols::ProtocolVersion;
 use nova_protocols::file::{
-    FILE_FLAG_CREATE, FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT,
-    FILE_OP_WRITE, FILE_VERSION, FileCloseReply, FileDirEntry, FileKind, FileListReply,
-    FileOpenReply, FileReadReply, FileStatReply, FileWriteReply,
+    FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_LIST,
+    FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE, FILE_READ_REPLY_SIZE,
+    FILE_VERSION, FileCloseReply, FileDirEntry, FileKind, FileListReply, FileOpenReply,
+    FileReadReply, FileStatReply, FileWriteReply,
 };
 use nova_protocols::negotiate;
 
 use crate::drivers::block::KernelBlockDevice;
+
+/// Bytes a directory listing may spend on records.
+///
+/// The inline payload is 64 bytes and the reply header takes 16 of them, so a
+/// listing has 48 left. A record is sixteen bytes plus the name, which means
+/// roughly two entries per reply — the reason `FILE_OP_LIST_AT` exists. The
+/// budget is computed here rather than left to each call site, because a call
+/// site that got it wrong would produce a reply the IPC layer refuses to build
+/// and the client would read a header whose `count` names records that are
+/// not there.
+const LISTING_BUDGET: usize = nova_abi::ipc::MAX_INLINE_PAYLOAD - FILE_LIST_REPLY_SIZE;
+
+/// Bytes one read may return in its reply.
+///
+/// The same arithmetic as [`LISTING_BUDGET`], for the read header.
+const READ_BUDGET: usize = nova_abi::ipc::MAX_INLINE_PAYLOAD - FILE_READ_REPLY_SIZE;
 
 /// Maximum number of path scopes one task may hold.
 ///
@@ -333,6 +350,42 @@ impl FileServer {
         &mut self.fs
     }
 
+    /// Assemble the top-level directory layout the report specifies.
+    ///
+    /// `RamFs::new` creates only the root inode, and a file cannot be created
+    /// under a parent that does not exist — so without this the very first
+    /// `open("/home/…", CREATE)` would fail with a missing directory rather
+    /// than with a permission decision. §14.5.2 lists the layout as a
+    /// *convention* the `FileServer` assembles, not as special cases in the
+    /// VFS, and this is that assembly, once, at boot.
+    ///
+    /// Nothing here grants anyone access to the tree it creates: a directory
+    /// that exists is a directory a capability still has to name.
+    pub fn seed_default_layout(&mut self) {
+        const DIRECTORIES: [&[u8]; 12] = [
+            b"/system",
+            b"/system/services",
+            b"/system/runtime",
+            b"/system/manifests",
+            b"/devices",
+            b"/proc",
+            b"/tmp",
+            b"/var",
+            b"/var/log",
+            b"/home",
+            b"/media",
+            b"/dev",
+        ];
+        for path in DIRECTORIES {
+            // Already present means the layout is already assembled, which is
+            // the right answer for a second call rather than an error.
+            let _ = self.fs.create_dir(path);
+        }
+        // The per-user subtree the desktop's own files live in. One user is
+        // enough for M6; the account model is M8's.
+        let _ = self.fs.create_dir(b"/home/nova");
+    }
+
     /// Forget every open file, unmount every disk, and empty the filesystem.
     ///
     /// Unmounting is part of "forget everything": a restart that left a disk
@@ -567,7 +620,17 @@ impl FileServer {
     ) -> Result<(), FsError> {
         let entry = self.entry(wire)?;
         require(scopes, &entry.path, Rights::READ)?;
-        match entry.origin {
+        self.release(wire, entry.origin)
+    }
+
+    /// Drop a wire handle and the file behind it, with no scope check.
+    ///
+    /// This is the server's own bookkeeping — a close it performs because an
+    /// *open* it just made failed halfway — and never a client's request: a
+    /// client reaches the filesystem only through [`FileServer::handle_message`],
+    /// which checks the caller's scopes first.
+    fn release(&mut self, wire: u64, origin: Origin) -> Result<(), FsError> {
+        match origin {
             Origin::Ram(handle) => self.fs.close(handle)?,
             Origin::Disk { mount, .. } => {
                 let mount = self.mounts[mount].as_mut().ok_or(FsError::BadHandle)?;
@@ -587,6 +650,26 @@ impl FileServer {
             }
         }
         Ok(())
+    }
+
+    /// Empty an open file, under the caller's scopes.
+    ///
+    /// Truncating is writing, so the check is `WRITE`: a client that may read
+    /// a file may not empty it. A mounted disk has no truncate operation, and
+    /// the flag is refused there rather than quietly ignored — a client that
+    /// asked for an empty file and got a full one would write its new content
+    /// into the wrong place.
+    fn truncate_scoped(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        wire: u64,
+    ) -> Result<(), FsError> {
+        let entry = self.entry(wire)?;
+        require(scopes, &entry.path, Rights::WRITE)?;
+        match entry.origin {
+            Origin::Ram(handle) => self.fs.truncate(handle),
+            Origin::Disk { .. } => Err(FsError::Unsupported),
+        }
     }
 
     /// One open file's record.
@@ -622,6 +705,7 @@ impl FileServer {
             FILE_OP_WRITE => self.handle_write(scopes, payload),
             FILE_OP_CLOSE => self.handle_close(scopes, payload),
             FILE_OP_LIST => self.handle_list(scopes, payload),
+            FILE_OP_LIST_AT => self.handle_list_at(scopes, payload),
             FILE_OP_STAT => self.handle_stat(scopes, payload),
             _ => reply_error(ErrorCode::Unsupported),
         }
@@ -642,7 +726,12 @@ impl FileServer {
         };
 
         let creating = flags & FILE_FLAG_CREATE != 0;
-        let required = if creating {
+        // Both flags are writes: one puts bytes where there were none, the
+        // other takes them away. `required` therefore names the right the
+        // *open* needs, which is what both the pre-check below and the
+        // resolution inside `open_scoped` consult.
+        let truncating = flags & FILE_FLAG_TRUNCATE != 0;
+        let required = if creating || truncating {
             Rights::WRITE
         } else {
             Rights::READ
@@ -664,11 +753,26 @@ impl FileServer {
 
         match self.open_scoped(scopes, path, required) {
             Ok((wire, size)) => {
+                if truncating && let Err(error) = self.truncate_scoped(scopes, wire) {
+                    // The file is open and must not stay open. A client that
+                    // was refused the truncation would otherwise hold a
+                    // handle to a file whose contents it got wrong, and the
+                    // server would be one open-file slot down for nothing.
+                    let entry = self.entry(wire).ok();
+                    if let Some(entry) = entry {
+                        let _ = self.release(wire, entry.origin);
+                    }
+                    return reply_error(error.code());
+                }
                 let mut bytes = [0u8; 24];
                 write_protocol_version(&mut bytes, FILE_VERSION);
                 bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
                 bytes[8..16].copy_from_slice(&wire.to_le_bytes());
-                bytes[16..24].copy_from_slice(&(size as u64).to_le_bytes());
+                // A truncation happened after the size was measured, so the
+                // size reported here has to be the one the client will read
+                // back, not the one that was true a moment earlier.
+                let reported = if truncating { 0 } else { size };
+                bytes[16..24].copy_from_slice(&(reported as u64).to_le_bytes());
                 reply_bytes(&bytes)
             }
             Err(error) => reply_error(error.code()),
@@ -683,11 +787,11 @@ impl FileServer {
         if negotiate(FILE_VERSION, version).is_err() {
             return reply_error(ErrorCode::Unsupported);
         }
-        let mut buffer = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
-        let wanted = usize::try_from(length).unwrap_or(0).min(buffer.len());
+        let mut buffer = [0u8; READ_BUDGET];
+        let wanted = usize::try_from(length).unwrap_or(0).min(READ_BUDGET);
         match self.read(scopes, wire, &mut buffer[..wanted]) {
             Ok(count) => {
-                let mut bytes = [0u8; 16];
+                let mut bytes = [0u8; FILE_READ_REPLY_SIZE];
                 write_protocol_version(&mut bytes, FILE_VERSION);
                 bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
                 bytes[8..12].copy_from_slice(&(count as u32).to_le_bytes());
@@ -743,6 +847,35 @@ impl FileServer {
 
     /// The `list` operation.
     fn handle_list(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        self.list_from(scopes, payload, 0)
+    }
+
+    /// The `list_at` operation: the same listing, starting at one child index.
+    ///
+    /// The header has `list`'s shape with `reserved` read as the index of the
+    /// first child to return, so a client pages through a directory with the
+    /// same path, the same scope check, and the same record format. An offset
+    /// past the end is an empty page, not an error: the directory may have
+    /// shrunk between two pages, and a client that treats that as a failure
+    /// cannot finish a listing it had already started.
+    fn handle_list_at(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        payload: &[u8],
+    ) -> Message {
+        let Some(offset) = read_u32(payload, 12) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        self.list_from(scopes, payload, offset as usize)
+    }
+
+    /// Enumerate a directory from `offset`, under `scopes`' permission.
+    fn list_from(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        payload: &[u8],
+        offset: usize,
+    ) -> Message {
         let Some((version, path_len)) = read_path_header(payload) else {
             return reply_error(ErrorCode::Invalid);
         };
@@ -760,15 +893,20 @@ impl FileServer {
         }
 
         if let Some(index) = self.mount_covering(&canonical) {
-            return self.list_mounted(index, &canonical);
+            return self.list_mounted(index, &canonical, offset);
         }
 
+        // The whole directory at once, not just the first few: the reply
+        // budget decides how many records fit, and the *skip* decides which
+        // of them are this page's. Reading only as many as the reply could
+        // hold would make the pages depend on the record sizes of the
+        // entries before them.
         let mut entries = [DirEntry {
             name: [0; 64],
             name_len: 0,
             kind: FsFileKind::File,
             size: 0,
-        }; 4];
+        }; nova_fs::ramfs::MAX_CHILDREN];
         let count = match self.fs.list_dir(canonical.as_bytes(), &mut entries) {
             Ok(count) => count,
             Err(error) => return reply_error(error.code()),
@@ -778,16 +916,11 @@ impl FileServer {
             Err(_) => 0,
         };
 
-        let mut bytes = [0u8; 16];
-        write_protocol_version(&mut bytes, FILE_VERSION);
-        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
-        bytes[8..12].copy_from_slice(&(count as u32).to_le_bytes());
-        bytes[12..16].copy_from_slice(&total.to_le_bytes());
-
-        // The entries follow the header in the payload, clipped to what fits.
-        let mut listing = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
+        let start = offset.min(count);
+        let mut listing = [0u8; LISTING_BUDGET];
         let mut used = 0usize;
-        for entry in entries.iter().take(count) {
+        let mut included = 0u32;
+        for entry in entries.iter().take(count).skip(start) {
             let name = entry.name_bytes();
             let entry_size = 16usize.saturating_add(name.len());
             if used.saturating_add(entry_size) > listing.len() {
@@ -807,7 +940,17 @@ impl FileServer {
             used += 16;
             listing[used..used + name.len()].copy_from_slice(name);
             used += name.len();
+            included += 1;
         }
+
+        // `count` is what *arrived*, not what the directory holds: `total` is
+        // the second, and a client telling them apart is how it knows to ask
+        // for the next page.
+        let mut bytes = [0u8; FILE_LIST_REPLY_SIZE];
+        write_protocol_version(&mut bytes, FILE_VERSION);
+        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&included.to_le_bytes());
+        bytes[12..16].copy_from_slice(&total.to_le_bytes());
 
         reply_bytes(&bytes).with_extra_payload(&listing[..used])
     }
@@ -855,7 +998,7 @@ impl FileServer {
     /// Only the mount root lists. The disk format is flat, so `/media/test/x`
     /// names a file and has nothing beneath it to enumerate — reporting it as
     /// an empty directory would be a directory the format cannot represent.
-    fn list_mounted(&mut self, index: usize, canonical: &CanonicalPath) -> Message {
+    fn list_mounted(&mut self, index: usize, canonical: &CanonicalPath, offset: usize) -> Message {
         let Some(mount) = self.mounts[index].as_ref() else {
             return reply_error(ErrorCode::BadHandle);
         };
@@ -867,20 +1010,14 @@ impl FileServer {
             name: [0; NAME_FIELD_BYTES],
             name_len: 0,
             size: 0,
-        }; 4];
+        }; nova_fs::ramfs::MAX_CHILDREN];
         let count = mount.disk.list(&mut names);
 
-        let mut bytes = [0u8; 16];
-        write_protocol_version(&mut bytes, FILE_VERSION);
-        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
-        bytes[8..12].copy_from_slice(&(count as u32).to_le_bytes());
-        // The total is what the listing holds: a disk's directory has no
-        // deeper structure, so "returned" and "there" are the same number.
-        bytes[12..16].copy_from_slice(&(count as u32).to_le_bytes());
-
-        let mut listing = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
+        let start = offset.min(count);
+        let mut listing = [0u8; LISTING_BUDGET];
         let mut used = 0usize;
-        for entry in names.iter().take(count) {
+        let mut included = 0u32;
+        for entry in names.iter().take(count).skip(start) {
             let name = entry.name_bytes();
             let entry_size = 16usize.saturating_add(name.len());
             if used.saturating_add(entry_size) > listing.len() {
@@ -897,7 +1034,16 @@ impl FileServer {
             used += 16;
             listing[used..used + name.len()].copy_from_slice(name);
             used += name.len();
+            included += 1;
         }
+
+        let mut bytes = [0u8; FILE_LIST_REPLY_SIZE];
+        write_protocol_version(&mut bytes, FILE_VERSION);
+        bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&included.to_le_bytes());
+        // The total is what the listing holds: a disk's directory has no
+        // deeper structure, so "returned" and "there" are the same number.
+        bytes[12..16].copy_from_slice(&(count as u32).to_le_bytes());
 
         reply_bytes(&bytes).with_extra_payload(&listing[..used])
     }

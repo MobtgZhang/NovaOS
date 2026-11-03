@@ -177,6 +177,22 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // before any reader of the state exists. See `services::init`.
     unsafe { services::init() };
 
+    // §14.5.2's runtime layout is assembled before anything can open a path:
+    // `RamFs` starts with only a root inode, and a file cannot be created
+    // under a directory that does not exist. This is directory creation, not
+    // an authorization — every task still needs a path capability before the
+    // filesystem will let it read or write anything here.
+    //
+    // It runs before `drivers::init`, because that is where a disk is mounted
+    // at `/media/…` and a mount needs its parent directory to exist.
+    //
+    // SAFETY: `services::init` above has published the state, nothing has
+    // taken a borrow of it yet, and this is the boot path with interrupts
+    // masked.
+    unsafe {
+        services::state().files.seed_default_layout();
+    }
+
     // The M2 machinery: the syscall MSRs, the timer, and the scheduler.
     //
     // The order matters. The syscall MSRs need the GDT and TSS, which

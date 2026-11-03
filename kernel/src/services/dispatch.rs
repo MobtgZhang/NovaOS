@@ -85,7 +85,7 @@ use crate::services::process;
 use crate::services::state;
 use crate::services::two_caps_mut;
 use crate::services::{
-    KernelState, KernelStateParts, SERVICE_COMPOSITOR, SERVICE_DISPLAY, SERVICE_INPUT,
+    KernelState, KernelStateParts, SERVICE_COMPOSITOR, SERVICE_DISPLAY, SERVICE_FILE, SERVICE_INPUT,
 };
 
 /// The context a syscall is dispatched in.
@@ -884,6 +884,12 @@ pub fn service_request(
 ) -> Result<usize, ErrorCode> {
     let request = Message::with_payload(opcode, request_payload)?;
 
+    // The file service executes on the *caller's* behalf: the scopes are the
+    // caller's, rebuilt from its own capability table, because the client's
+    // grants — never the service's — decide what the request may reach. They
+    // are built before the split because the split borrows the task table.
+    let scopes = kernel.scope_set_for(context.task_slot);
+
     // The fields are borrowed disjointly. The compositor needs the caller's
     // capability table and the object registry in order to validate an
     // attached buffer; the display service needs only its own mode.
@@ -893,6 +899,7 @@ pub fn service_request(
         display,
         compositor,
         input,
+        files,
         ..
     } = kernel.split();
 
@@ -904,7 +911,10 @@ pub fn service_request(
             };
             compositor.handle_message(&request, context.task_slot, table, objects)
         }
-        SERVICE_INPUT => input.handle_message(&request, compositor),
+        // Ring 3 reads the input queue and may not inject into it: the
+        // trusted `handle_message` path is the driver's, not a client's.
+        SERVICE_INPUT => input.handle_client_message(&request, compositor, context.task_slot),
+        SERVICE_FILE => files.handle_message(&scopes, &request),
         _ => return Err(ErrorCode::Unsupported),
     };
 
