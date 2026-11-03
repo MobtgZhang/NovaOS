@@ -98,6 +98,11 @@ pub enum FsError {
     Quota,
     /// The argument was well-formed but unusable.
     InvalidArgument,
+    /// The operation is not something this filesystem can do.
+    ///
+    /// Distinct from [`FsError::ReadOnly`], which says "you are not allowed";
+    /// this says "no filesystem here can do that, whoever you are".
+    Unsupported,
 }
 
 impl FsError {
@@ -124,6 +129,7 @@ impl FsError {
             FsError::Device(_) => ErrorCode::Invalid,
             FsError::Quota => ErrorCode::Quota,
             FsError::InvalidArgument => ErrorCode::Invalid,
+            FsError::Unsupported => ErrorCode::Unsupported,
         }
     }
 
@@ -141,6 +147,7 @@ impl FsError {
             FsError::Device(error) => error.name(),
             FsError::Quota => "E_QUOTA",
             FsError::InvalidArgument => "E_INVALID_ARGUMENT",
+            FsError::Unsupported => "E_UNSUPPORTED",
         }
     }
 }
@@ -568,6 +575,32 @@ impl RamFs {
         Ok(count)
     }
 
+    /// Empty an open file, returning its length to zero.
+    ///
+    /// The wire protocol declares `FILE_FLAG_TRUNCATE` — "truncate an existing
+    /// file to zero length on open" — and a flag the service accepts but does
+    /// not honour is worse than no flag: a second, shorter save would leave the
+    /// tail of the first one in place, and the file would read back as its new
+    /// text with the old text glued to the end. The bytes past the new length
+    /// stay where they are, as they do in any in-place store; only the length
+    /// changes, so the next read stops where the caller expects.
+    ///
+    /// The open-table offset is reset too, so the handle that asked for the
+    /// truncation writes from the beginning rather than from the position the
+    /// previous write left it at.
+    pub fn truncate(&mut self, handle: FileHandle) -> Result<(), FsError> {
+        let slot = self.slot_of(handle)?;
+        let inode = usize::from(self.open[slot].inode);
+        if self.inodes[inode].kind != FileKind::File {
+            return Err(FsError::IsADirectory);
+        }
+        let freed = self.inodes[inode].data_len;
+        self.inodes[inode].data_len = 0;
+        self.total_bytes = self.total_bytes.saturating_sub(freed as usize);
+        self.open[slot].offset = 0;
+        Ok(())
+    }
+
     /// Close an open file.
     ///
     /// The slot is released and its generation advanced, so any handle the
@@ -703,6 +736,41 @@ mod tests {
         let metadata = fs.metadata(b"/docs/notes.txt").expect("metadata");
         assert_eq!(metadata.kind, FileKind::File);
         assert_eq!(metadata.size, 10);
+    }
+
+    #[test]
+    fn truncating_drops_the_old_tail_and_frees_the_quota() {
+        let mut fs = fs_with_files();
+        let handle = fs.open(b"/docs/notes.txt").expect("open notes");
+        const DRAFT: &[u8] = b"a long first draft";
+        fs.write(handle, DRAFT).expect("write");
+        assert_eq!(
+            fs.metadata(b"/docs/notes.txt").expect("stat").size,
+            DRAFT.len() as u32
+        );
+        let before = fs.total_bytes();
+
+        fs.truncate(handle).expect("truncate");
+        assert_eq!(fs.metadata(b"/docs/notes.txt").expect("stat").size, 0);
+        assert_eq!(
+            fs.total_bytes(),
+            before - DRAFT.len(),
+            "the bytes the truncation freed must come back to the quota"
+        );
+
+        // A shorter second save must not leave the first one's tail behind.
+        fs.write(handle, b"hi").expect("write");
+        let mut buffer = [0u8; 32];
+        let handle = fs.open(b"/docs/notes.txt").expect("reopen");
+        let read = fs.read(handle, &mut buffer).expect("read");
+        assert_eq!(&buffer[..read], b"hi");
+    }
+
+    #[test]
+    fn truncating_a_directory_is_refused() {
+        let mut fs = fs_with_files();
+        let handle = fs.open(b"/docs").expect("open the directory");
+        assert_eq!(fs.truncate(handle).unwrap_err(), FsError::IsADirectory);
     }
 
     #[test]
