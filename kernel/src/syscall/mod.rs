@@ -617,6 +617,7 @@ fn copy_received_payload(thread: usize, args: [u64; 6]) {
 /// Start an initramfs image as a child process.
 fn process_exec(args: [u64; 6]) -> Outcome {
     const MAX_NAME: usize = 32;
+    const MAX_SCOPE: usize = 128;
     let mut name = [0u8; MAX_NAME];
     if args[1] == 0 || args[1] as usize > MAX_NAME {
         return failed(ErrorCode::Invalid);
@@ -625,7 +626,30 @@ fn process_exec(args: [u64; 6]) -> Outcome {
         return failed(ErrorCode::Invalid);
     }
 
-    match crate::services::process::exec_image(&name[..args[1] as usize]) {
+    // An optional path scope to hand the child: `arg2` the path pointer,
+    // `arg3` its length, `arg4` the rights. Zero length means "no grant", so
+    // the original three-argument call still works unchanged — the ABI grows
+    // by addition, never by reinterpretation.
+    let mut scope = [0u8; MAX_SCOPE];
+    let scope_len = args[3] as usize;
+    if scope_len > MAX_SCOPE {
+        return failed(ErrorCode::Invalid);
+    }
+    if scope_len > 0 {
+        if copy_from_user(&mut scope[..scope_len], args[2], args[3]).is_err() {
+            return failed(ErrorCode::Invalid);
+        }
+    }
+    let grant = if scope_len == 0 {
+        None
+    } else {
+        let Some(rights) = nova_abi::cap::Rights::from_bits(args[4] as u32) else {
+            return failed(ErrorCode::Invalid);
+        };
+        Some((&scope[..scope_len], rights))
+    };
+
+    match crate::services::process::exec_image(&name[..args[1] as usize], grant) {
         Ok(handle) => Outcome {
             result: nova_core::syscall::SyscallResult::Value(handle.raw() as i64),
             effect: nova_core::syscall::ThreadEffect::Continue,

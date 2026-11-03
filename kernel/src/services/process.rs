@@ -28,13 +28,46 @@ fn next_thread_id() -> u32 {
 }
 
 /// Execute `name` from the initramfs as a child of the current task.
-pub fn exec_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
+///
+/// `grant` is an optional path scope the parent passes down with the child:
+/// §16.1's "默认无内核级文件/网络权限；通过父进程/桌面授权流程传入能力" — a
+/// task starts with no file authority at all, and receives a slice of its
+/// parent's. The parent may pass on only what it holds, and only if what it
+/// holds carries `GRANT`; anything else is `E_DENIED` before the child exists.
+pub fn exec_image(name: &[u8], grant: Option<(&[u8], Rights)>) -> Result<CapHandle, ErrorCode> {
     let context = task::current_syscall_context();
     // SAFETY: service state is installed before user processes can run, and
     // the syscall path holds the only mutable borrow.
     let kernel = unsafe { crate::services::state() };
     crate::services::dispatch::check_spawn_authority(kernel, &context)?;
-    exec_image_in(name, context.task_slot)
+    if let Some((path, rights)) = grant {
+        check_grant_is_delegable(kernel, context.task_slot, path, rights)?;
+    }
+    // SAFETY: boot capture has run, and syscall entry runs with interrupts
+    // masked; this is the same contract as the rest of the syscall path.
+    let boot_info = unsafe { crate::boot::read_boot_info() };
+    exec_image_in_state_with_grant(kernel, name, context.task_slot, boot_info, grant)
+}
+
+/// Whether `parent_slot` may hand `path` and `rights` to a child.
+///
+/// The check is against the parent's *own* scope set, which is rebuilt from
+/// its capability table on every call — so a revoked grant stops delegating
+/// the moment it is revoked. A scope without `GRANT` cannot be delegated at
+/// all, which is what makes the chain from `init` down to an application a
+/// chain rather than a free-for-all.
+fn check_grant_is_delegable(
+    kernel: &KernelState,
+    parent_slot: usize,
+    path: &[u8],
+    rights: Rights,
+) -> Result<(), ErrorCode> {
+    let canonical = nova_fs::path::canonicalize(path).map_err(|_| ErrorCode::Invalid)?;
+    let scopes = kernel.scope_set_for(parent_slot);
+    if scopes.denies(&canonical, rights | Rights::GRANT) {
+        return Err(ErrorCode::Denied);
+    }
+    Ok(())
 }
 
 /// Start `name` from the initramfs as a child of `parent_slot`.
@@ -45,7 +78,17 @@ pub fn exec_image_in(name: &[u8], parent_slot: usize) -> Result<CapHandle, Error
     // SAFETY: service state is installed before user processes can run, and
     // the syscall path holds the only mutable borrow.
     let kernel = unsafe { crate::services::state() };
-    exec_image_in_state(kernel, name, parent_slot, boot_info)
+    exec_image_in_state_with_grant(kernel, name, parent_slot, boot_info, None)
+}
+
+/// Start an image against an explicit kernel state, without a path grant.
+pub(crate) fn exec_image_in_state(
+    kernel: &mut KernelState,
+    name: &[u8],
+    parent_slot: usize,
+    boot_info: &'static BootInfo,
+) -> Result<CapHandle, ErrorCode> {
+    exec_image_in_state_with_grant(kernel, name, parent_slot, boot_info, None)
 }
 
 /// Start an image against an explicit kernel state.
@@ -54,11 +97,18 @@ pub fn exec_image_in(name: &[u8], parent_slot: usize) -> Result<CapHandle, Error
 /// Keeping the execution logic behind this function lets the test suites
 /// exercise the same authority and spawn logic without observing the live
 /// boot state.
-pub(crate) fn exec_image_in_state(
+///
+/// `grant`, when present, is minted into the *child's* capability table and
+/// scope pool together, so the handle the child can name and the path it
+/// opens are always the same pair. It is minted only after every other step
+/// has succeeded: a child that failed to start must not inherit authority it
+/// will never use.
+pub(crate) fn exec_image_in_state_with_grant(
     kernel: &mut KernelState,
     name: &[u8],
     parent_slot: usize,
     boot_info: &'static BootInfo,
+    grant: Option<(&[u8], Rights)>,
 ) -> Result<CapHandle, ErrorCode> {
     let Some(archive_bytes) = crate::boot::initramfs() else {
         klog!(Level::Error, "process: no initramfs");
@@ -117,6 +167,19 @@ pub(crate) fn exec_image_in_state(
         child.service_name_len = name.len();
     }
 
+    // The parent's path scope, minted into the child's table and scope pool
+    // as one pair. This is the only place a scope is created outside the
+    // kernel's own `grant_file_scope` callers, and it runs only when the
+    // caller was already authorised to pass the scope down.
+    if let Some((path, rights)) = grant {
+        kernel
+            .grant_file_scope(child_slot, path, rights)
+            .map_err(|error| {
+                klog!(Level::Error, "process: child grant failed {}", error as i64);
+                error
+            })?;
+    }
+
     let Some(mut thread) = task::create_thread(
         next_thread_id(),
         child_slot,
@@ -153,7 +216,24 @@ pub fn start_init_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
         return Err(ErrorCode::NoMemory);
     };
     klog!(Level::Info, "process: init task {slot} created");
-    let result = exec_image_in(name, slot);
+
+    // §10.3's first step: `init` receives the boot's limited root authority.
+    // What it receives is a path scope on `/` — `READ`, `WRITE` and `GRANT` —
+    // and not a bypass of the filesystem. Every other task in the system gets
+    // its file authority by being handed a slice of this one, which is what
+    // makes the delegation a chain with `init` at the top rather than a set of
+    // unrelated grants.
+    //
+    // SAFETY: boot capture has run, and the boot path runs serialised with
+    // interrupts masked; this is the same contract as `exec_image_in`.
+    let boot_info = unsafe { crate::boot::read_boot_info() };
+    let result = exec_image_in_state_with_grant(
+        kernel,
+        name,
+        slot,
+        boot_info,
+        Some((b"/", Rights::READ | Rights::WRITE | Rights::GRANT)),
+    );
     klog!(Level::Info, "process: init exec result={result:?}");
     return result;
 }
