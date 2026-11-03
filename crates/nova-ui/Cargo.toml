@@ -1,0 +1,25 @@
+[package]
+name = "nova-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS widget toolkit: geometry, widgets, text and key decoding"
+
+# A library, and a host-testable one: everything in it is `core`-only logic
+# that compiles for both the bare-metal applications and the host test runner.
+# That is the whole reason it is a crate of its own rather than a module
+# inside `nova-apps`, which is excluded from every host test sweep because it
+# is a set of bare-metal binaries.
+[lib]
+bench = false
+
+[dependencies]
+nova-protocols = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"

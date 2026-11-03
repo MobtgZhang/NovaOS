@@ -1,0 +1,93 @@
+NovaOS built-in bitmap font — licence notice
+=============================================
+
+What this file covers
+---------------------
+
+The glyph designs baked into `crates/nova-ui/src/font.rs`: the 8x16 bitmaps
+for ASCII 32 through 126 that NovaOS draws text with at milestone M6 (see
+`reports/NovaOS.md` §15.4, "文本与字体").
+
+Those bitmaps are rasterisations of **DejaVu Sans Mono**, which in turn
+derives its glyph designs from **Bitstream Vera Sans Mono**. DejaVu's own
+changes are in the public domain; the Vera designs are not, and they travel
+under the permission notice reproduced below. NovaOS redistributes derived
+copies, so the notice ships with them — which is the whole reason this file
+exists.
+
+Nothing else in the repository is under this licence. The NovaOS source is
+under the repository's own licence; only the font data is Bitstream's.
+
+Modification
+-----------
+
+The glyphs have been modified: they are rasterised at 13 pixels with a fixed
+baseline into an 8x16 cell and thresholded to one bit per pixel, so they are
+bitmap representations rather than outlines, and a program cannot recover the
+original outlines from them. `tools/gen_font.py` is the script that performs
+the rasterisation.
+
+Rename requirement
+------------------
+
+The Vera permission notice allows modification only if the result is renamed
+to a name that does not contain "Bitstream" or "Vera". The derived font is
+called the **NovaOS built-in bitmap font**, lives in the module `nova_ui::
+font`, and contains neither word. The notice below therefore stays in force.
+
+Provenance
+----------
+
+- DejaVu Sans Mono: https://dejavu-fonts.github.io/
+  Debian package `fonts-dejavu-core`, file `usr/share/fonts/truetype/
+  dejavu/DejaVuSansMono.ttf`.
+- Bitstream Vera Sans Mono: the typeface DejaVu is derived from.
+
+Bitstream copyright and permission notice
+-----------------------------------------
+
+    Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+    Bitstream Vera is a trademark of Bitstream, Inc.
+    DejaVu changes are in public domain.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of the fonts accompanying this license ("Fonts") and associated
+    documentation files (the "Font Software"), to reproduce and distribute the
+    Font Software, including without limitation the rights to use, copy,
+    merge, publish, distribute, and/or sell copies of the Font Software, and
+    to permit persons to whom the Font Software is furnished to do so,
+    subject to the following conditions:
+
+    The above copyright and trademark notices and this permission notice
+    shall be included in all copies of one or more of the Font Software
+    typefaces.
+
+    The Font Software may be modified, altered, or added to, and in
+    particular the designs of glyphs or characters in the Fonts may be
+    modified and additional glyphs or characters may be added to the Fonts,
+    only if the fonts are renamed to names not containing either the words
+    "Bitstream" or the word "Vera".
+
+    This License becomes null and void to the extent applicable to Fonts or
+    Font Software that has been modified and is distributed under the
+    "Bitstream Vera" names.
+
+    The Font Software may be sold as part of a larger software package but no
+    copy of one or more of the Font Software typefaces may be sold by itself.
+
+    THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+    COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL BITSTREAM
+    OR THE GNOME FOUNDATION BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR
+    CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+    OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT
+    SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
+
+    Except as contained in this notice, the names of Gnome, the Gnome
+    Foundation, and Bitstream Inc., shall not be used in advertising or
+    otherwise to promote the sale, use or other dealings in this Font
+    Software without prior written authorization from the Gnome Foundation or
+    Bitstream Inc., respectively. For further information, contact: fonts at
+    gnome dot org.
