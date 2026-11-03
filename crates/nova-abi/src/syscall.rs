@@ -138,9 +138,18 @@ pub mod nr {
 
     /// Execute an image from the initramfs as a new process.
     ///
-    /// Arguments: `name_ptr`, `name_len`. The caller must hold `SPAWN`
+    /// Arguments: `name_ptr`, `name_len`, `scope_ptr`, `scope_len`,
+    /// `scope_rights`, `reserved`. The caller must hold `SPAWN`
     /// authority. On success the parent receives the management endpoint for
     /// the child; the child retrieves its side with `ENDPOINT_SELF`.
+    ///
+    /// `scope_*` is an optional path grant passed down to the child, and is
+    /// the parent-driven authorisation flow §16.1 describes: a process starts
+    /// with no file authority and is handed a slice of its parent's. A zero
+    /// `scope_len` means no grant, which is what every pre-existing caller
+    /// passes. The parent may pass on only what it holds, and only when what
+    /// it holds carries `GRANT`; otherwise the call is refused *before* the
+    /// child is created.
     pub const PROCESS_EXEC: Syscall = Syscall(16);
 
     /// Create the first side of an endpoint pair.

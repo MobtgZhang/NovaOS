@@ -60,14 +60,17 @@ pub use display::{
     DisplayOpcode, DisplayQueryReply, DisplayQueryRequest,
 };
 pub use file::{
-    FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE,
-    FILE_VERSION, FileCloseReply, FileCloseRequest, FileDirEntry, FileKind, FileListReply,
-    FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply, FileReadRequest, FileStatReply,
-    FileStatRequest, FileWriteReply, FileWriteRequest, WireHandle,
+    FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT,
+    FILE_OP_WRITE, FILE_VERSION, FileCloseReply, FileCloseRequest, FileDirEntry, FileKind,
+    FileListAtRequest, FileListReply, FileListRequest, FileOpenReply, FileOpenRequest,
+    FileReadReply, FileReadRequest, FileStatReply, FileStatRequest, FileWriteReply,
+    FileWriteRequest, WireHandle,
 };
 pub use input::{
-    INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_BUTTON_WHEEL, INPUT_KEY_REQUEST_SIZE,
-    INPUT_OP_KEY, INPUT_OP_POINTER, INPUT_POINTER_REQUEST_SIZE, INPUT_REPLY_SIZE, INPUT_VERSION,
+    INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_BUTTON_WHEEL, INPUT_EVENT_KEY,
+    INPUT_EVENT_NONE, INPUT_EVENT_POINTER, INPUT_GET_REPLY_SIZE, INPUT_GET_REQUEST_SIZE,
+    INPUT_KEY_REQUEST_SIZE, INPUT_OP_GET, INPUT_OP_KEY, INPUT_OP_POINTER,
+    INPUT_POINTER_REQUEST_SIZE, INPUT_REPLY_SIZE, INPUT_VERSION, InputGetReply, InputGetRequest,
     InputKeyRequest, InputOpcode, InputPointerRequest, InputReply, KeyState,
 };
 pub use manifest::{

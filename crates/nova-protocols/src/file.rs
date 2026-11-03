@@ -47,6 +47,16 @@ pub const FILE_OP_LIST: u64 = 5;
 /// Opcode for reading a path's metadata.
 pub const FILE_OP_STAT: u64 = 6;
 
+/// Opcode for listing a directory from a given entry index.
+///
+/// A directory listing does not fit in one inline message: the payload budget
+/// is 64 bytes, the reply header takes 16, and an entry record takes sixteen
+/// bytes plus the name. [`FILE_OP_LIST`] therefore returns the first entries
+/// and a `count` smaller than `total` means "there are more". This operation
+/// is that same listing *with a starting index*, so a client can page through
+/// a directory instead of being told only that it is incomplete.
+pub const FILE_OP_LIST_AT: u64 = 7;
+
 /// Flag: open without failing if the file does not exist.
 pub const FILE_FLAG_CREATE: u32 = 1 << 0;
 
@@ -251,6 +261,28 @@ pub struct FileListRequest {
 /// Size of a file list request, in bytes.
 pub const FILE_LIST_REQUEST_SIZE: usize = 16;
 
+/// A request to list a directory starting at one of its children.
+///
+/// `offset` is an index into the directory's children in the same order
+/// [`FILE_OP_LIST`] would return them, so the two operations page through one
+/// enumeration rather than each inventing their own. An `offset` of zero is
+/// exactly [`FILE_OP_LIST`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct FileListAtRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// Reserved flags. Must be zero.
+    pub flags: u32,
+    /// How many payload bytes carry the path.
+    pub path_len: u32,
+    /// The index of the first child to return.
+    pub offset: u32,
+}
+
+/// Size of a file list-at request, in bytes.
+pub const FILE_LIST_AT_REQUEST_SIZE: usize = 16;
+
 /// One entry of a directory listing, as it travels on the wire.
 ///
 /// The name follows the entry in the payload; `name_len` says how many bytes.
@@ -336,6 +368,7 @@ const _: () = assert!(size_of::<FileWriteReply>() == FILE_WRITE_REPLY_SIZE);
 const _: () = assert!(size_of::<FileCloseRequest>() == FILE_CLOSE_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileCloseReply>() == FILE_CLOSE_REPLY_SIZE);
 const _: () = assert!(size_of::<FileListRequest>() == FILE_LIST_REQUEST_SIZE);
+const _: () = assert!(size_of::<FileListAtRequest>() == FILE_LIST_AT_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileDirEntry>() == FILE_DIR_ENTRY_SIZE);
 const _: () = assert!(size_of::<FileListReply>() == FILE_LIST_REPLY_SIZE);
 const _: () = assert!(size_of::<FileStatRequest>() == FILE_STAT_REQUEST_SIZE);
@@ -389,6 +422,11 @@ const _: () = assert!(core::mem::offset_of!(FileListRequest, flags) == 4);
 const _: () = assert!(core::mem::offset_of!(FileListRequest, path_len) == 8);
 const _: () = assert!(core::mem::offset_of!(FileListRequest, reserved) == 12);
 
+const _: () = assert!(core::mem::offset_of!(FileListAtRequest, version) == 0);
+const _: () = assert!(core::mem::offset_of!(FileListAtRequest, flags) == 4);
+const _: () = assert!(core::mem::offset_of!(FileListAtRequest, path_len) == 8);
+const _: () = assert!(core::mem::offset_of!(FileListAtRequest, offset) == 12);
+
 const _: () = assert!(core::mem::offset_of!(FileDirEntry, name_len) == 0);
 const _: () = assert!(core::mem::offset_of!(FileDirEntry, kind) == 4);
 const _: () = assert!(core::mem::offset_of!(FileDirEntry, size) == 8);
@@ -426,11 +464,11 @@ impl WireHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_OPEN,
-        FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE, FILE_VERSION, FileCloseReply, FileCloseRequest,
-        FileDirEntry, FileKind, FileListReply, FileListRequest, FileOpenReply, FileOpenRequest,
-        FileReadReply, FileReadRequest, FileStatReply, FileStatRequest, FileWriteReply,
-        FileWriteRequest, WireHandle,
+        FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_LIST_AT,
+        FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE, FILE_VERSION, FileCloseReply,
+        FileCloseRequest, FileDirEntry, FileKind, FileListAtRequest, FileListReply,
+        FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply, FileReadRequest,
+        FileStatReply, FileStatRequest, FileWriteReply, FileWriteRequest, WireHandle,
     };
     use crate::ProtocolVersion;
     use nova_abi::ipc::MAX_INLINE_PAYLOAD;
@@ -449,6 +487,7 @@ mod tests {
         assert_eq!(size_of::<FileCloseRequest>(), 24);
         assert_eq!(size_of::<FileCloseReply>(), 16);
         assert_eq!(size_of::<FileListRequest>(), 16);
+        assert_eq!(size_of::<FileListAtRequest>(), 16);
         assert_eq!(size_of::<FileDirEntry>(), 16);
         assert_eq!(size_of::<FileListReply>(), 16);
         assert_eq!(size_of::<FileStatRequest>(), 16);
@@ -502,6 +541,11 @@ mod tests {
         assert_eq!(core::mem::offset_of!(FileListRequest, path_len), 8);
         assert_eq!(core::mem::offset_of!(FileListRequest, reserved), 12);
 
+        assert_eq!(core::mem::offset_of!(FileListAtRequest, version), 0);
+        assert_eq!(core::mem::offset_of!(FileListAtRequest, flags), 4);
+        assert_eq!(core::mem::offset_of!(FileListAtRequest, path_len), 8);
+        assert_eq!(core::mem::offset_of!(FileListAtRequest, offset), 12);
+
         assert_eq!(core::mem::offset_of!(FileDirEntry, name_len), 0);
         assert_eq!(core::mem::offset_of!(FileDirEntry, kind), 4);
         assert_eq!(core::mem::offset_of!(FileDirEntry, size), 8);
@@ -541,6 +585,7 @@ mod tests {
             FILE_OP_CLOSE,
             FILE_OP_LIST,
             FILE_OP_STAT,
+            FILE_OP_LIST_AT,
         ];
         for (index, opcode) in opcodes.iter().enumerate() {
             for other in &opcodes[index + 1..] {
@@ -695,6 +740,28 @@ mod tests {
         };
         assert_eq!(list.path_len, 5);
         assert_eq!(stat.path_len, 5);
+    }
+
+    #[test]
+    fn a_paged_listing_starts_where_the_previous_page_stopped() {
+        let first = FileListAtRequest {
+            version: FILE_VERSION,
+            flags: 0,
+            path_len: 5,
+            offset: 0,
+        };
+        let second = FileListAtRequest {
+            offset: first.offset + 2,
+            ..first
+        };
+        assert_eq!(first.offset, 0, "offset zero is the plain listing");
+        assert_eq!(second.offset, 2);
+        assert_eq!(
+            size_of::<FileListAtRequest>(),
+            size_of::<FileListRequest>(),
+            "the two list requests are the same shape but not the same opcode"
+        );
+        assert_ne!(FILE_OP_LIST_AT, FILE_OP_LIST);
     }
 
     #[test]
