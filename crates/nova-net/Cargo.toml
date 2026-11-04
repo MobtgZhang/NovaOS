@@ -1,0 +1,22 @@
+[package]
+name = "nova-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS network stack: Ethernet, ARP, IPv4, UDP, and DNS wire formats"
+
+# `no_std` and free of `unsafe`: these are bounded wire formats built from
+# plain bytes. The kernel supplies the device and the copies; this crate only
+# says what a frame means.
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# A wire format is arithmetic over offsets and lengths. An overflow there is a
+# memory-safety bug in the driver that slices the frame, so it is denied here.
+unsafe_code = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+arithmetic_side_effects = "deny"

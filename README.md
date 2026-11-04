@@ -2,7 +2,7 @@
 
 **An experimental Rust-based desktop operating system featuring a lightweight microkernel, capability-based security, and modular user-space services.**
 
-> 🚧 **Status: early design / pre-alpha.** NovaOS is not yet bootable and does not provide a desktop release. Features and milestones described below are planned unless explicitly marked as implemented.
+> ✅ **Status: bootable in QEMU (M0–M7).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop and network paths. It is still an experimental system, not a production desktop: SMP, TCP, DHCP, IPv6, package management, audio, user accounts, and real-hardware support are not implemented. The roadmap below marks what is actually built.
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
 
@@ -79,20 +79,21 @@ sequenceDiagram
 | Boot protocol | **Limine** |
 | Executable format | **ELF64** and a NovaOS-specific ABI |
 | Initial device targets | Serial, timers, framebuffer, and VirtIO |
-| Tooling | Cargo, QEMU, GDB, and a planned `xtask` workflow |
+| Tooling | Cargo, `make`, QEMU, GDB, and the `xtask` workflow |
 
 ## Roadmap
 
-All milestones are **planned**. They are engineering gates, not guaranteed delivery dates.
+All listed milestones are engineering gates. The first seven are implemented in the repository; the later ones are not.
 
-- [ ] **M0 — Foundation:** Repository, Rust workspace, architecture decisions, and QEMU test harness.
-- [ ] **M1 — Boot:** UEFI boot, serial logging, exception handling, and memory-map validation.
-- [ ] **M2 — Isolation:** Paging, user mode, processes, syscalls, threads, and preemptive scheduling.
-- [ ] **M3 — Microkernel:** Capability tables, IPC, an `init` process, and an IPC echo service.
-- [ ] **M4 — Command line:** Service Manager, RAMFS, File Server, console, and shell.
-- [ ] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
-- [ ] **M6 — Desktop Alpha:** Input system, window compositor, terminal, editor, and file manager.
-- [ ] **M7+ — Expansion:** Networking, SMP, package management, security hardening, and selected real hardware.
+- [x] **M0 — Foundation:** Repository, Rust workspace, architecture decisions, and QEMU test harness.
+- [x] **M1 — Boot:** UEFI boot, serial logging, exception handling, and memory-map validation.
+- [x] **M2 — Isolation:** Paging, user mode, processes, syscalls, threads, and preemptive scheduling.
+- [x] **M3 — Microkernel:** Capability tables, IPC, an `init` process, and an IPC echo service.
+- [x] **M4 — Command line:** Service Manager, RAMFS, File Server, console, and shell.
+- [x] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
+- [x] **M6 — Desktop Alpha:** Input system, window compositor, terminal, editor, and file manager.
+- [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, and a versioned network service. TCP, DHCP, IPv6, and general sockets are not implemented.
+- [ ] **M8+ — Expansion:** SMP, package management, audio, user accounts, security hardening, and selected real hardware.
 
 **First major architecture milestone:** two isolated Rust processes communicate through a capability-protected IPC endpoint.
 
@@ -107,25 +108,43 @@ NovaOS/
 │   ├── nova-abi/         # Shared syscall and ABI definitions
 │   ├── nova-ipc/         # User-space IPC library
 │   ├── nova-cap/         # Typed capability handles
+│   ├── nova-net/         # Host-testable Ethernet, ARP, IPv4, UDP, DNS formats
+│   ├── nova-protocols/   # Versioned service wire contracts
 │   └── nova-async/       # Async runtime
 ├── user/
 │   ├── init/             # First user-space process
 │   ├── services/         # System services
 │   └── apps/             # Native applications
-├── drivers/              # Device drivers
 ├── boot/                 # Boot configuration
 ├── tools/xtask/          # Build and QEMU automation
-├── tests/                # Unit and integration tests
 ├── docs/                 # ADRs and technical specifications
-├── NovaOS.md             # Detailed design plan
+├── scripts/              # POSIX build/run helpers
+├── Makefile              # POSIX make entry points
+├── reports/NovaOS.md     # Detailed design plan
 └── README.md
 ```
 
-This structure is a **target layout**; individual directories will be created as implementation progresses.
+The layout above is the current tree for the implemented milestones; later directories are added as those milestones are implemented.
 
 ## Building and Running
 
-NovaOS builds with a pinned nightly toolchain, the `x86_64-unknown-none` bare-metal target, QEMU, and OVMF. `cargo xtask` owns the build/image/run sequencing.
+NovaOS builds with a pinned nightly toolchain, the `x86_64-unknown-none` bare-metal target, QEMU, and OVMF. `cargo xtask` owns the build/image/run sequencing, and the `Makefile` exposes POSIX-style entry points over it.
+
+```bash
+# The POSIX build/run entry point: build the image and boot it in QEMU's GUI.
+make run
+
+# Headless boot for servers, SSH sessions, and CI-like environments.
+make run-headless
+
+# Build the kernel, the user runtime, the ISO, and the test disks.
+make build
+
+# The full gate: xtask tests, host unit tests, then the QEMU boot suite.
+make test
+```
+
+The lower-level commands remain available:
 
 ```bash
 # Fetch and verify the pinned Limine release (needed once per checkout)
@@ -142,6 +161,22 @@ cargo xtask run
 # boot suite. Exits non-zero on a failure *or* a timeout.
 cargo xtask test
 ```
+
+`make run` is the interactive path: it opens QEMU's graphical window and mirrors the kernel's serial console to the terminal and to `target/novaos/serial-interactive.log`. `cargo xtask run` remains the automated path and is headless.
+
+Both `Makefile`, `scripts/qemu.sh`, and `scripts/gates.sh` use POSIX conventions: `make` recipes, `#!/bin/sh`, no bash arrays, and no `[[ ]]` tests.
+
+### M7 networking
+
+The M7 network path is a bounded phase-one stack, not a general TCP/IP implementation:
+
+- the kernel enumerates a `virtio-net-pci` device and negotiates `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MAC`, and `VIRTIO_NET_F_STATUS`;
+- the driver uses two virtqueues, a 12-byte VirtIO 1.0 net header, bounded Ethernet frames, ARP, IPv4, UDP, and a DNS A-record query;
+- QEMU's `user` backend supplies the fixed `10.0.2.0/24` guest network: guest `10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`;
+- the `net_dns_resolves_example_com` suite resolves `example.com` through the emulated resolver;
+- the network service protocol is versioned and bounds names, datagrams, and reply sizes.
+
+Deliberately not implemented: TCP, DHCP, IPv6, a general socket API, full SMP scheduling, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
 
 ### Quality gates
 

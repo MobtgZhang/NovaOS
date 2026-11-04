@@ -92,6 +92,12 @@ pub const DEVICE_VIRTIO_BLK_LEGACY: u16 = 0x1001;
 /// VirtIO block, modern (VirtIO 1.0) device ID.
 pub const DEVICE_VIRTIO_BLK_MODERN: u16 = 0x1042;
 
+/// VirtIO network, legacy device ID.
+pub const DEVICE_VIRTIO_NET_LEGACY: u16 = 0x1000;
+
+/// VirtIO network, modern (VirtIO 1.0) device ID.
+pub const DEVICE_VIRTIO_NET_MODERN: u16 = 0x1041;
+
 /// Class code: the device is a bridge between buses.
 pub const CLASS_BRIDGE: u8 = 0x06;
 
@@ -186,6 +192,17 @@ impl Device {
         self.vendor_id == VENDOR_VIRTIO
             && (self.device_id == DEVICE_VIRTIO_BLK_LEGACY
                 || self.device_id == DEVICE_VIRTIO_BLK_MODERN)
+    }
+
+    /// Whether this is a VirtIO network device this kernel can drive.
+    ///
+    /// As with block devices, the ID alone is not the whole answer: a
+    /// transitional device keeps the legacy ID while offering the modern
+    /// capability list. The transport check remains the final word.
+    pub const fn is_virtio_net(&self) -> bool {
+        self.vendor_id == VENDOR_VIRTIO
+            && (self.device_id == DEVICE_VIRTIO_NET_LEGACY
+                || self.device_id == DEVICE_VIRTIO_NET_MODERN)
     }
 
     /// Whether this function is a PCI-to-PCI bridge.

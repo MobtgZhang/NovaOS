@@ -12,6 +12,7 @@ members = [
     "crates/nova-elf",
     "crates/nova-fs",
     "crates/nova-ipc",
+    "crates/nova-net",
     "crates/nova-protocols",
     "crates/nova-ui",
     "tools/xtask",
@@ -43,6 +44,7 @@ default-members = [
     "crates/nova-elf",
     "crates/nova-fs",
     "crates/nova-ipc",
+    "crates/nova-net",
     "crates/nova-protocols",
     "crates/nova-ui",
     "tools/xtask",
@@ -62,6 +64,7 @@ nova-core = { path = "crates/nova-core" }
 nova-elf = { path = "crates/nova-elf" }
 nova-fs = { path = "crates/nova-fs" }
 nova-ipc = { path = "crates/nova-ipc" }
+nova-net = { path = "crates/nova-net" }
 nova-protocols = { path = "crates/nova-protocols" }
 nova-ui = { path = "crates/nova-ui" }
 

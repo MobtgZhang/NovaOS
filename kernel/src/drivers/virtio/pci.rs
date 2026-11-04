@@ -72,6 +72,12 @@ mod common {
     pub const REQUIRED_BYTES: u32 = 0x38;
 }
 
+/// The most queues this transport records notify offsets for.
+///
+/// A block device uses one and a network device uses two. Four is a bound that
+/// covers both without turning the transport into a general multi-queue driver.
+pub const MAX_VIRTIO_QUEUES: usize = 4;
+
 /// How many times a status readback is retried before the device is declared
 /// wedged.
 ///
@@ -93,6 +99,13 @@ pub struct Transport {
     isr: *mut u8,
     /// The queue-notify offset this device's single queue uses.
     queue_notify_off: u16,
+    /// The notify offset for every queue the driver has configured.
+    ///
+    /// A block device uses one queue, but a network device uses a receive and a
+    /// transmit queue, and each has its own notify offset. Keeping the array
+    /// here means `notify_queue` can name the queue it means instead of assuming
+    /// queue 0 is the only live one.
+    notify_offs: [u16; MAX_VIRTIO_QUEUES],
 }
 
 impl Transport {
@@ -139,6 +152,7 @@ impl Transport {
             device_config: device_config.unwrap_or(core::ptr::null_mut()),
             isr,
             queue_notify_off: 0,
+            notify_offs: [0; MAX_VIRTIO_QUEUES],
         })
     }
 
@@ -250,6 +264,7 @@ impl Transport {
         avail_phys: u64,
         used_phys: u64,
     ) -> Result<u16, VirtioError> {
+        let notify_off;
         // SAFETY: as `status`.
         unsafe {
             mmio::write_u16(self.common, common::QUEUE_SELECT, index);
@@ -274,8 +289,13 @@ impl Transport {
 
             mmio::write_u16(self.common, common::QUEUE_ENABLE, 1);
 
-            let notify_off = mmio::read_u16(self.common, common::QUEUE_NOTIFY_OFF);
-            self.queue_notify_off = notify_off;
+            notify_off = mmio::read_u16(self.common, common::QUEUE_NOTIFY_OFF);
+            if index == 0 {
+                self.queue_notify_off = notify_off;
+            }
+            if (index as usize) < MAX_VIRTIO_QUEUES {
+                self.notify_offs[index as usize] = notify_off;
+            }
 
             // Read every write back. A queue that was configured but whose
             // configuration did not *stick* is indistinguishable from a queue
@@ -307,17 +327,30 @@ impl Transport {
         }
         mmio::fence();
 
-        Ok(self.queue_notify_off)
+        Ok(notify_off)
     }
 
     /// Tell the device to look at queue 0.
     pub fn notify(&self) {
-        let offset = self.queue_notify_off as u32 * self.notify_multiplier;
+        self.notify_queue(0);
+    }
+
+    /// Tell the device to look at `index`.
+    ///
+    /// The notify register is `queue_notify_off * multiplier`, and the value
+    /// written is the queue index. A wrong offset or a wrong value names a
+    /// queue the device does not have, and the symptom is a request that never
+    /// completes with no error anywhere — so the offset is recorded per queue
+    /// at setup time rather than guessed at notify time.
+    pub fn notify_queue(&self, index: usize) {
+        let Some(offset) = self.notify_offs.get(index) else {
+            return;
+        };
+        let computed = *offset as u32 * self.notify_multiplier;
         // SAFETY: the notify structure was mapped with room for at least one
         // register, and the computed offset is the one the capability's
-        // multiplier defines. The value written is the queue index, which is 0:
-        // this driver runs one queue per device.
-        unsafe { mmio::write_u32(self.notify, offset as usize, 0) };
+        // multiplier defines for this queue.
+        unsafe { mmio::write_u32(self.notify, computed as usize, index as u32) };
         mmio::fence();
     }
 

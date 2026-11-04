@@ -58,6 +58,7 @@ pub mod display;
 pub mod fs;
 pub mod input;
 pub mod ipc;
+pub mod net;
 pub mod object;
 pub mod process;
 pub mod supervisor;
@@ -76,18 +77,20 @@ use crate::services::display::DisplayService;
 use crate::services::fs::{FileServer, MAX_SCOPES_PER_TASK};
 use crate::services::input::InputService;
 use crate::services::ipc::IpcRegistry;
+use crate::services::net::NetService;
 use crate::services::object::{ObjectKind, ObjectRegistry};
 use crate::services::supervisor::Supervisor;
 
 /// Service identifiers used by `nr::SERVICE_REQUEST`.
 ///
 /// These are wire values, not capability handles: a service request names a
-/// kernel-owned service by number. The display service is implemented now; the
-/// input, compositor, and file services are the M6 follow-on increments.
+/// kernel-owned service by number. The display, input, compositor, file, and
+/// network services are the implemented kernel-side services in v0.5.0.
 pub const SERVICE_DISPLAY: u32 = 1;
 pub const SERVICE_INPUT: u32 = 2;
 pub const SERVICE_COMPOSITOR: u32 = 3;
 pub const SERVICE_FILE: u32 = 4;
+pub const SERVICE_NET: u32 = 5;
 
 /// Maximum number of tasks the kernel tracks.
 ///
@@ -224,6 +227,8 @@ pub struct KernelStateParts<'a> {
     pub compositor: &'a mut CompositorService,
     /// The input service.
     pub input: &'a mut InputService,
+    /// The network service.
+    pub net: &'a mut NetService,
     /// The message the last receive on each thread produced.
     pub last_message: &'a mut [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -250,6 +255,7 @@ impl KernelState {
             display: &mut self.display,
             compositor: &mut self.compositor,
             input: &mut self.input,
+            net: &mut self.net,
             last_message: &mut self.last_message,
             last_token: &mut self.last_token,
             last_error: &mut self.last_error,
@@ -318,6 +324,8 @@ pub struct KernelState {
     pub compositor: CompositorService,
     /// The input service.
     pub input: InputService,
+    /// The network service.
+    pub net: NetService,
     /// The message the last receive on each thread produced.
     pub last_message: [Option<Message>; MAX_THREADS],
     /// The reply token the last receive on each thread handed out.
@@ -362,6 +370,7 @@ impl KernelState {
             display: DisplayService::new(),
             compositor: CompositorService::new(),
             input: InputService::new(),
+            net: NetService::new(),
             last_message: [None; MAX_THREADS],
             last_token: [None; MAX_THREADS],
             last_error: [None; MAX_THREADS],
@@ -712,6 +721,7 @@ impl KernelState {
         self.display.reset();
         self.compositor.reset();
         self.input.reset();
+        self.net.reset();
         self.last_message = [None; MAX_THREADS];
         self.last_token = [None; MAX_THREADS];
         self.last_error = [None; MAX_THREADS];

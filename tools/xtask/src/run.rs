@@ -200,6 +200,16 @@ fn qemu_command(
     ));
     command.extend(device("-device", "virtio-blk-pci,drive=nova1".to_string()));
 
+    // The M7 network device. QEMU's `user` backend gives the guest the fixed
+    // 10.0.2.0/24 network the driver's constants describe: guest 10.0.2.15,
+    // gateway 10.0.2.2, DNS 10.0.2.3. This is an emulated NIC, not a claim
+    // that NovaOS has a full TCP/IP stack.
+    command.extend(device("-netdev", "user,id=novanet".to_string()));
+    command.extend(device(
+        "-device",
+        "virtio-net-pci,netdev=novanet".to_string(),
+    ));
+
     // The exit device. `iosize=0x04` matches the kernel's 32-bit write.
     command.extend(device(
         "-device",
@@ -631,6 +641,25 @@ mod tests {
         assert!(
             ro_drive.contains("readonly=on"),
             "the second disk must be attached read-only"
+        );
+    }
+
+    /// The M7 network device must be attached to the user backend.
+    ///
+    /// The kernel's network driver assumes QEMU's user network: guest
+    /// 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3. A missing NIC makes the
+    /// network suites fail for a reason unrelated to the driver, and a
+    /// different backend would silently give addresses the driver cannot use.
+    #[test]
+    fn the_command_attaches_a_virtio_net_device() {
+        let joined = temp_args().join(" ");
+        assert!(
+            joined.contains("-netdev user,id=novanet"),
+            "QEMU user networking must be present"
+        );
+        assert!(
+            joined.contains("virtio-net-pci,netdev=novanet"),
+            "the NIC must be a virtio-net-pci device"
         );
     }
 

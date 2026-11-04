@@ -35,6 +35,7 @@ pub mod m2;
 pub mod m34;
 pub mod m5;
 pub mod m6;
+pub mod m7;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -88,6 +89,11 @@ pub const SUITE_NAMES: &[&str] = &[
     "gui_app_crash_isolated",
     "window_open_close_100",
     "idle_gui_cpu_no_busy_spin",
+    // M7: VirtIO net, link state, DNS, and malformed input.
+    "virtio_net_device",
+    "net_link_query",
+    "net_dns_resolves_example_com",
+    "net_malformed_input_denied",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

@@ -70,8 +70,13 @@ dependencies = [
  "nova-elf",
  "nova-fs",
  "nova-ipc",
+ "nova-net",
  "nova-protocols",
 ]
+
+[[package]]
+name = "nova-net"
+version = "0.1.0"
 
 [[package]]
 name = "nova-protocols"

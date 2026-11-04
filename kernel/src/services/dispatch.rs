@@ -85,7 +85,8 @@ use crate::services::process;
 use crate::services::state;
 use crate::services::two_caps_mut;
 use crate::services::{
-    KernelState, KernelStateParts, SERVICE_COMPOSITOR, SERVICE_DISPLAY, SERVICE_FILE, SERVICE_INPUT,
+    KernelState, KernelStateParts, SERVICE_COMPOSITOR, SERVICE_DISPLAY, SERVICE_FILE,
+    SERVICE_INPUT, SERVICE_NET,
 };
 
 /// The context a syscall is dispatched in.
@@ -900,6 +901,7 @@ pub fn service_request(
         compositor,
         input,
         files,
+        net,
         ..
     } = kernel.split();
 
@@ -915,6 +917,7 @@ pub fn service_request(
         // trusted `handle_message` path is the driver's, not a client's.
         SERVICE_INPUT => input.handle_client_message(&request, compositor, context.task_slot),
         SERVICE_FILE => files.handle_message(&scopes, &request),
+        SERVICE_NET => net.handle_message(&request),
         _ => return Err(ErrorCode::Unsupported),
     };
 

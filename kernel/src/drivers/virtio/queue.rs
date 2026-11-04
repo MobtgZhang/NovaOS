@@ -240,6 +240,63 @@ impl VirtQueue {
         Ok(head)
     }
 
+    /// Publish one descriptor chain, for a device whose protocol has a single
+    /// buffer rather than the block device's header/data/status stages.
+    ///
+    /// VirtIO net is exactly that shape: the receive buffer and the transmit
+    /// buffer each begin with the protocol header and continue with the frame,
+    /// so one descriptor is the whole request. A block request needs three
+    /// descriptors because the status byte is a separate output stage; folding
+    /// the block shape into this method would publish a chain the net device
+    /// does not understand.
+    ///
+    /// # Safety
+    ///
+    /// `address` must name kernel-owned memory that outlives the request, of at
+    /// least `length` bytes, and no other request may be in flight.
+    pub unsafe fn publish_one(
+        &mut self,
+        address: u64,
+        length: u32,
+        device_writes: bool,
+    ) -> Result<u16, QueueError> {
+        if self.in_flight() {
+            return Err(QueueError::Busy);
+        }
+        if length == 0 || length as usize > ADDRESS_SPACE.page_size as usize {
+            return Err(QueueError::UnsupportedSize);
+        }
+
+        // SAFETY: descriptor 0 exists because the queue size is at least 8
+        // (checked in `allocate`), and the length was bounded above.
+        unsafe {
+            write_descriptor(
+                self.desc,
+                0,
+                address,
+                length,
+                if device_writes { FLAG_DEVICE_WRITES } else { 0 },
+                0,
+            );
+        }
+
+        let slot = (self.published % self.size) as usize;
+        // SAFETY: the available ring is `4 + size * 2` bytes in its own frame,
+        // and `slot` is below `size`.
+        unsafe {
+            mmio::write_u16(self.avail, 4 + slot * 2, 0);
+        }
+        mmio::fence();
+        self.published = self.published.wrapping_add(1);
+        // SAFETY: as above; the index field is the ring's second word.
+        unsafe {
+            mmio::write_u16(self.avail, 2, self.published);
+        }
+        mmio::fence();
+
+        Ok(0)
+    }
+
     /// What the two rings say right now: (available index, used index).
     ///
     /// A diagnostic for the timeout path. A request that never completes has

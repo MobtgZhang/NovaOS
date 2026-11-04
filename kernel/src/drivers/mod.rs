@@ -7,13 +7,15 @@
 //!
 //! ```text
 //! pci        find functions, read config space, probe BARs
-//! virtio     take a device over: transport, queue, one disk at a time
+//! virtio     take a device over: transport, queue, block or network
 //! block      the disks that were found, a sector cache, and the counters
+//! net        the NIC that was found, and the bounded packet path
 //! ```
 //!
 //! What this module adds on top is the *join to the filesystem*: a disk is
 //! useless to the rest of the kernel until something can open a path on it, so
-//! [`init`] mounts each disk into the file server as well as starting it.
+//! [`init`] mounts each disk into the file server as well as starting it. The
+//! network device is joined to the kernel-owned network service instead.
 //!
 //! # Capability discipline
 //!
@@ -28,6 +30,7 @@ pub mod block;
 pub mod display;
 pub mod input;
 pub mod mmio;
+pub mod net;
 pub mod pci;
 pub mod virtio;
 
@@ -71,6 +74,12 @@ pub unsafe fn init() {
     unsafe { input::init() };
 
     let disks = block::init();
+
+    // The NIC is brought up even if no disk exists: a headless machine with a
+    // network device still has a network service, and a machine with neither is
+    // simply a kernel with no device services.
+    let _nics = net::init();
+
     if disks == 0 {
         return;
     }

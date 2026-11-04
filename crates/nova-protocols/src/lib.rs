@@ -22,6 +22,8 @@
 //!   damage, commit, destroy, configure, and frame-done.
 //! - [`input`] is the input service protocol: key and pointer events, routed by
 //!   the compositor's focus decision.
+//! - [`net`] is the network service protocol: link query, DNS resolve, UDP send,
+//!   and UDP receive, all with bounded payloads and no NIC authority.
 //!
 //! # Layout is a cross-binary contract
 //!
@@ -47,6 +49,7 @@ pub mod display;
 pub mod file;
 pub mod input;
 pub mod manifest;
+pub mod net;
 pub mod shell;
 pub mod surface;
 
@@ -76,6 +79,13 @@ pub use input::{
 pub use manifest::{
     Clock, Dependency, DependencyStatus, MAX_DEPENDENCIES, ManualClock, ReadyMessage,
     RestartDecision, RestartTracker, ServiceManifest, ServiceState, check_dependencies,
+};
+pub use net::{
+    NET_FLAG_A_ONLY, NET_LINK_REPLY_SIZE, NET_LINK_REQUEST_SIZE, NET_MAX_DATAGRAM, NET_MAX_NAME,
+    NET_MAX_RECV, NET_OP_LINK_QUERY, NET_OP_RECV, NET_OP_RESOLVE, NET_OP_SEND, NET_RECV_REPLY_SIZE,
+    NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE, NET_RESOLVE_REQUEST_SIZE, NET_SEND_REPLY_SIZE,
+    NET_SEND_REQUEST_SIZE, NET_VERSION, NetLinkReply, NetLinkRequest, NetRecvReply, NetRecvRequest,
+    NetResolveReply, NetResolveRequest, NetSendReply, NetSendRequest,
 };
 pub use shell::ShellCommand;
 pub use surface::{

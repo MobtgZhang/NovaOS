@@ -1,6 +1,6 @@
 # The NovaOS ABI
 
-Three documents, one subject: the boundary between a NovaOS user program and
+Four documents, one subject: the boundary between a NovaOS user program and
 the kernel.
 
 | Document | What it freezes |
@@ -8,6 +8,7 @@ the kernel.
 | [address-layout.md](address-layout.md) | Where memory lives: the kernel half, the direct map, the user window, the stack and its guard page, and the W^X rule |
 | [syscalls-x86_64.md](syscalls-x86_64.md) | How a ring-3 program calls into the kernel: register mapping, the error encoding, the entry and return mechanism |
 | [ipc.md](ipc.md) | What a message is, how a capability travels with it, how a reply is authorised, and what happens when a peer dies |
+| [net.md](net.md) | The versioned network service: link query, DNS resolve, UDP send/receive, bounded payloads, and the M7 driver limits |
 
 ## How the three fit together
 
