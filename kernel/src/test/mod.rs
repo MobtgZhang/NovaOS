@@ -89,11 +89,16 @@ pub const SUITE_NAMES: &[&str] = &[
     "gui_app_crash_isolated",
     "window_open_close_100",
     "idle_gui_cpu_no_busy_spin",
-    // M7: VirtIO net, link state, DNS, and malformed input.
+    // M7: VirtIO net, link state, DNS, malformed input, TCP, ICMP, DHCP,
+    // and the socket API.
     "virtio_net_device",
     "net_link_query",
     "net_dns_resolves_example_com",
     "net_malformed_input_denied",
+    "net_tcp_handshake",
+    "net_icmp_echo",
+    "net_dhcp_lease",
+    "net_socket_api",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

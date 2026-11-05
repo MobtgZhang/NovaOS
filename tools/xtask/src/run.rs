@@ -204,7 +204,10 @@ fn qemu_command(
     // 10.0.2.0/24 network the driver's constants describe: guest 10.0.2.15,
     // gateway 10.0.2.2, DNS 10.0.2.3. This is an emulated NIC, not a claim
     // that NovaOS has a full TCP/IP stack.
-    command.extend(device("-netdev", "user,id=novanet".to_string()));
+    command.extend(device(
+        "-netdev",
+        "user,id=novanet,guestfwd=tcp:10.0.2.100:80-cmd:/bin/cat".to_string(),
+    ));
     command.extend(device(
         "-device",
         "virtio-net-pci,netdev=novanet".to_string(),

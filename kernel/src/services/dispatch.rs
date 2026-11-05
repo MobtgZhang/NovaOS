@@ -917,7 +917,7 @@ pub fn service_request(
         // trusted `handle_message` path is the driver's, not a client's.
         SERVICE_INPUT => input.handle_client_message(&request, compositor, context.task_slot),
         SERVICE_FILE => files.handle_message(&scopes, &request),
-        SERVICE_NET => net.handle_message(&request),
+        SERVICE_NET => net.handle_message(&request, context.task_slot),
         _ => return Err(ErrorCode::Unsupported),
     };
 

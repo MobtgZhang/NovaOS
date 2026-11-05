@@ -2,7 +2,7 @@
 
 **An experimental Rust-based desktop operating system featuring a lightweight microkernel, capability-based security, and modular user-space services.**
 
-> ✅ **Status: bootable in QEMU (M0–M7).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop and network paths. It is still an experimental system, not a production desktop: SMP, TCP, DHCP, IPv6, package management, audio, user accounts, and real-hardware support are not implemented. The roadmap below marks what is actually built.
+> ✅ **Status: bootable in QEMU (M0–M7).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop and network paths. It is still an experimental system, not a production desktop: SMP, IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network, but full multi-CPU scheduling is not. The roadmap below marks what is actually built.
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
 
@@ -92,7 +92,7 @@ All listed milestones are engineering gates. The first seven are implemented in 
 - [x] **M4 — Command line:** Service Manager, RAMFS, File Server, console, and shell.
 - [x] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
 - [x] **M6 — Desktop Alpha:** Input system, window compositor, terminal, editor, and file manager.
-- [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, and a versioned network service. TCP, DHCP, IPv6, and general sockets are not implemented.
+- [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, TCP, ICMP, DHCP, and a versioned bounded socket API. IPv6 and real-hardware networking are not implemented.
 - [ ] **M8+ — Expansion:** SMP, package management, audio, user accounts, security hardening, and selected real hardware.
 
 **First major architecture milestone:** two isolated Rust processes communicate through a capability-protected IPC endpoint.
@@ -171,12 +171,13 @@ Both `Makefile`, `scripts/qemu.sh`, and `scripts/gates.sh` use POSIX conventions
 The M7 network path is a bounded phase-one stack, not a general TCP/IP implementation:
 
 - the kernel enumerates a `virtio-net-pci` device and negotiates `VIRTIO_F_VERSION_1`, `VIRTIO_NET_F_MAC`, and `VIRTIO_NET_F_STATUS`;
-- the driver uses two virtqueues, a 12-byte VirtIO 1.0 net header, bounded Ethernet frames, ARP, IPv4, UDP, and a DNS A-record query;
+- the driver uses two virtqueues, a 12-byte VirtIO 1.0 net header, bounded Ethernet frames, ARP, IPv4, UDP, TCP, ICMP, DHCP, and a DNS A-record query;
 - QEMU's `user` backend supplies the fixed `10.0.2.0/24` guest network: guest `10.0.2.15`, gateway `10.0.2.2`, DNS `10.0.2.3`;
-- the `net_dns_resolves_example_com` suite resolves `example.com` through the emulated resolver;
-- the network service protocol is versioned and bounds names, datagrams, and reply sizes.
+- TCP handshake, request/response, and close are verified against a `guestfwd` endpoint at `10.0.2.100:80`;
+- DHCP acquisition returns a bounded lease and acknowledgement from the emulated server;
+- the network service protocol is versioned and bounds names, datagrams, socket payloads, ICMP payloads, and reply sizes; socket handles are owned by the caller's task slot.
 
-Deliberately not implemented: TCP, DHCP, IPv6, a general socket API, full SMP scheduling, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
+Deliberately not implemented or not asserted: IPv6, a blocking socket API, full SMP scheduling, arbitrary external-host TCP reachability, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
 
 ### Quality gates
 

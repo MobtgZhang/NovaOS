@@ -41,9 +41,12 @@ use crate::klog;
 use crate::logger::Level;
 use crate::mm::{direct_map, frame_allocator};
 use nova_net::{
-    BROADCAST_MAC, ETHERTYPE_IPV4, IP_PROTOCOL_UDP, Ipv4Addr, MacAddr, build_arp_request,
-    build_dns_query, build_ethernet, build_ipv4, build_udp, parse_arp_reply, parse_dns_a_record,
-    parse_ethernet, parse_ipv4, parse_udp,
+    BROADCAST_MAC, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHERTYPE_IPV4, IP_PROTOCOL_ICMP,
+    IP_PROTOCOL_TCP, IP_PROTOCOL_UDP, Ipv4Addr, MacAddr, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
+    build_arp_request, build_dhcp_discover, build_dhcp_request, build_dns_query, build_ethernet,
+    build_icmp_echo_request, build_ipv4, build_tcp, build_udp, parse_arp_reply, parse_dhcp_reply,
+    parse_dns_a_record, parse_ethernet, parse_icmp_echo_reply, parse_ipv4, parse_tcp, parse_udp,
+    DhcpReply, TcpSegment,
 };
 
 /// `VIRTIO_NET_F_MAC`: the device configuration structure carries a MAC.
@@ -81,6 +84,32 @@ pub const DNS_SERVER: Ipv4Addr = Ipv4Addr::new([10, 0, 2, 3]);
 /// Source port this driver uses for its DNS query.
 pub const DNS_SOURCE_PORT: u16 = 49152;
 
+/// Source port this driver uses for TCP clients.
+pub const TCP_SOURCE_PORT: u16 = 49153;
+
+/// Initial sequence number this driver uses for TCP clients.
+///
+/// A nonzero sequence avoids the degenerate `seq=0` state some emulated TCP
+/// stacks treat specially; the handshake still checks `ack = sequence + 1`.
+pub const TCP_INITIAL_SEQUENCE: u32 = 0x1234_5678;
+
+/// A live TCP connection's sequence state.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpConnection {
+    /// The remote address.
+    pub remote: Ipv4Addr,
+    /// The remote Ethernet address.
+    pub remote_mac: MacAddr,
+    /// The local port.
+    pub local_port: u16,
+    /// The remote port.
+    pub remote_port: u16,
+    /// The next sequence number this side will send.
+    pub local_seq: u32,
+    /// The next sequence number this side expects from the peer.
+    pub remote_seq: u32,
+}
+
 /// How many poll iterations one request may wait.
 ///
 /// An iteration bound rather than a wall-clock deadline, for the same reason as
@@ -116,6 +145,12 @@ pub enum NetError {
     ArpFailed,
     /// No DNS answer was found.
     DnsFailed,
+    /// No TCP handshake or segment was found.
+    TcpFailed,
+    /// No ICMP echo reply was found.
+    IcmpFailed,
+    /// No DHCP offer or acknowledgement was found.
+    DhcpFailed,
 }
 
 impl NetError {
@@ -133,6 +168,9 @@ impl NetError {
             NetError::BufferSmall => "N_BUFFER_SMALL",
             NetError::ArpFailed => "N_ARP_FAILED",
             NetError::DnsFailed => "N_DNS_FAILED",
+            NetError::TcpFailed => "N_TCP_FAILED",
+            NetError::IcmpFailed => "N_ICMP_FAILED",
+            NetError::DhcpFailed => "N_DHCP_FAILED",
         }
     }
 }
@@ -167,6 +205,8 @@ pub struct VirtioNet {
     tx: VirtQueue,
     rx_frame: Option<usize>,
     tx_frame: Option<usize>,
+    /// Whether a receive descriptor is already published and waiting.
+    rx_primed: bool,
     mac: MacAddr,
     link_up: bool,
 }
@@ -255,6 +295,7 @@ impl VirtioNet {
             tx,
             rx_frame: Some(rx_frame),
             tx_frame: Some(tx_frame),
+            rx_primed: false,
             mac,
             link_up,
         })
@@ -313,7 +354,13 @@ impl VirtioNet {
         }
         self.transport.notify_queue(1);
 
-        let completion = self.await_completion(true)?;
+        let completion = match self.await_completion(true) {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.unwind_after_failure();
+                return Err(error);
+            }
+        };
         if completion.head != 0 || completion.written != 0 {
             self.unwind_after_failure();
             return Err(NetError::BadResponse);
@@ -329,6 +376,9 @@ impl VirtioNet {
     /// the buffer exists. This method separates “make the buffer available”
     /// from “wait for the device to fill it” so every send path primes first.
     fn prime_receive(&mut self) -> Result<(), NetError> {
+        if self.rx_primed {
+            return Ok(());
+        }
         let Some(frame_index) = self.rx_frame else {
             return Err(NetError::BadResponse);
         };
@@ -353,6 +403,7 @@ impl VirtioNet {
                 .publish_one(base, capacity as u32, true)
                 .map_err(NetError::Queue)?;
         }
+        self.rx_primed = true;
         self.transport.notify_queue(0);
         Ok(())
     }
@@ -365,7 +416,13 @@ impl VirtioNet {
         let base = frame_phys(frame_index);
         let capacity = NET_HEADER_BYTES + MAX_FRAME_BYTES;
 
-        let completion = self.await_completion(false)?;
+        let completion = match self.await_completion(false) {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.unwind_after_failure();
+                return Err(error);
+            }
+        };
         if completion.head != 0
             || completion.written < NET_HEADER_BYTES as u32
             || completion.written > capacity as u32
@@ -374,6 +431,7 @@ impl VirtioNet {
             return Err(NetError::BadResponse);
         }
 
+        self.rx_primed = false;
         let written = completion.written as usize;
         let frame_len = written - NET_HEADER_BYTES;
         if frame_len > out.len() {
@@ -433,6 +491,20 @@ impl VirtioNet {
         Err(NetError::ArpFailed)
     }
 
+    /// Resolve the Ethernet address used to reach `destination`.
+    ///
+    /// QEMU's user network only has the guest, the gateway, the DNS server, and
+    /// the SMB server on the emulated link. External addresses are reached
+    /// through the gateway, so an ARP request for an off-link address has no
+    /// reply and the driver must fall back to the gateway's MAC.
+    fn resolve_destination_mac(&mut self, destination: Ipv4Addr) -> Result<MacAddr, NetError> {
+        match self.resolve_arp(destination) {
+            Ok(mac) => Ok(mac),
+            Err(NetError::ArpFailed) | Err(NetError::Timeout) => self.resolve_arp(LINK_GATEWAY),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Send one UDP datagram. The destination's MAC is resolved first.
     pub fn send_udp(
         &mut self,
@@ -440,10 +512,34 @@ impl VirtioNet {
         destination_port: u16,
         payload: &[u8],
     ) -> Result<(), NetError> {
-        let destination_mac = self.resolve_arp(destination)?;
+        self.send_udp_from(DNS_SOURCE_PORT, destination, destination_port, payload)
+    }
 
+    /// Send one UDP datagram from `source_port`. The destination's MAC is
+    /// resolved first.
+    pub fn send_udp_from(
+        &mut self,
+        source_port: u16,
+        destination: Ipv4Addr,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
+        let destination_mac = self.resolve_destination_mac(destination)?;
+        self.prime_receive()?;
+        self.send_udp_to(destination, destination_mac, source_port, destination_port, payload)
+    }
+
+    /// Send one UDP datagram to a known destination MAC.
+    fn send_udp_to(
+        &mut self,
+        destination: Ipv4Addr,
+        destination_mac: MacAddr,
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
         let mut udp = [0u8; MAX_FRAME_BYTES];
-        let udp_length = build_udp(DNS_SOURCE_PORT, destination_port, payload, &mut udp)
+        let udp_length = build_udp(source_port, destination_port, payload, &mut udp)
             .ok_or(NetError::FrameTooLong)?;
 
         let mut packet = [0u8; MAX_FRAME_BYTES];
@@ -469,8 +565,466 @@ impl VirtioNet {
         self.send_frame(&frame[..frame_length])
     }
 
+    /// Send one UDP datagram to the IPv4 broadcast address.
+    fn send_udp_broadcast(
+        &mut self,
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
+        let mut udp = [0u8; MAX_FRAME_BYTES];
+        let udp_length = build_udp(source_port, destination_port, payload, &mut udp)
+            .ok_or(NetError::FrameTooLong)?;
+
+        let mut packet = [0u8; MAX_FRAME_BYTES];
+        let packet_length = build_ipv4(
+            LINK_ADDRESS,
+            Ipv4Addr::new([255, 255, 255, 255]),
+            IP_PROTOCOL_UDP,
+            &udp[..udp_length],
+            &mut packet,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        let frame_length = build_ethernet(
+            BROADCAST_MAC,
+            self.mac,
+            ETHERTYPE_IPV4,
+            &packet[..packet_length],
+            &mut frame,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        self.send_frame(&frame[..frame_length])
+    }
+
+    /// Open a TCP connection with a SYN / SYN-ACK / ACK handshake.
+    pub fn connect_tcp(&mut self, destination: Ipv4Addr, port: u16) -> Result<TcpConnection, NetError> {
+        self.connect_tcp_from(destination, port, TCP_SOURCE_PORT)
+    }
+
+    /// Open a TCP connection from a chosen local port.
+    pub fn connect_tcp_from(
+        &mut self,
+        destination: Ipv4Addr,
+        port: u16,
+        local_port: u16,
+    ) -> Result<TcpConnection, NetError> {
+        let remote_mac = self.resolve_destination_mac(destination)?;
+        let mut connection = TcpConnection {
+            remote: destination,
+            remote_mac,
+            local_port,
+            remote_port: port,
+            local_seq: TCP_INITIAL_SEQUENCE,
+            remote_seq: 0,
+        };
+
+        // SYN.
+        let mut tcp = [0u8; MAX_FRAME_BYTES];
+        let tcp_length = build_tcp(
+            LINK_ADDRESS,
+            destination,
+            local_port,
+            port,
+            connection.local_seq,
+            0,
+            TCP_SYN,
+            &[],
+            &mut tcp,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+        self.prime_receive()?;
+        self.send_tcp_payload(destination, remote_mac, &tcp[..tcp_length])?;
+
+        let mut buffer = [0u8; MAX_FRAME_BYTES];
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let frame_length = self.poll_receive(&mut buffer)?;
+            let Some(segment) = self.parse_tcp_frame(&buffer[..frame_length], port, local_port) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            klog!(
+                Level::Info,
+                "virtio-net: tcp flags {} seq {} ack {} len {}",
+                segment.flags,
+                segment.sequence,
+                segment.acknowledgement,
+                segment.payload.len()
+            );
+            if !segment.has(TCP_SYN) || !segment.has(TCP_ACK) {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            }
+            if segment.acknowledgement != connection.local_seq.wrapping_add(1) {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            }
+
+            connection.local_seq = connection.local_seq.wrapping_add(1);
+            connection.remote_seq = segment.sequence.wrapping_add(1);
+
+            let mut ack = [0u8; MAX_FRAME_BYTES];
+            let ack_length = build_tcp(
+                LINK_ADDRESS,
+                destination,
+                local_port,
+                port,
+                connection.local_seq,
+                connection.remote_seq,
+                TCP_ACK,
+                &[],
+                &mut ack,
+            )
+            .ok_or(NetError::FrameTooLong)?;
+            self.send_tcp_payload(destination, remote_mac, &ack[..ack_length])?;
+            return Ok(connection);
+        }
+        Err(NetError::TcpFailed)
+    }
+
+    /// Send bytes on an already-connected TCP connection.
+    pub fn send_tcp(&mut self, connection: &mut TcpConnection, payload: &[u8]) -> Result<(), NetError> {
+        let mut tcp = [0u8; MAX_FRAME_BYTES];
+        let tcp_length = build_tcp(
+            LINK_ADDRESS,
+            connection.remote,
+            connection.local_port,
+            connection.remote_port,
+            connection.local_seq,
+            connection.remote_seq,
+            TCP_ACK | TCP_PSH,
+            payload,
+            &mut tcp,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+        self.prime_receive()?;
+        self.send_tcp_payload(connection.remote, connection.remote_mac, &tcp[..tcp_length])?;
+        connection.local_seq = connection.local_seq.wrapping_add(payload.len() as u32);
+        Ok(())
+    }
+
+    /// Receive payload bytes from an already-connected TCP connection.
+    pub fn receive_tcp(
+        &mut self,
+        connection: &mut TcpConnection,
+        out: &mut [u8],
+    ) -> Result<usize, NetError> {
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let frame_length = self.receive_frame(&mut frame)?;
+            let Some(segment) = self.parse_tcp_frame(
+                &frame[..frame_length],
+                connection.remote_port,
+                connection.local_port,
+            ) else {
+                continue;
+            };
+
+            if segment.payload.is_empty() {
+                if segment.has(TCP_FIN) {
+                    return Ok(0);
+                }
+                continue;
+            }
+            if segment.sequence != connection.remote_seq {
+                continue;
+            }
+            if segment.acknowledgement != connection.local_seq {
+                continue;
+            }
+            if segment.payload.len() > out.len() {
+                return Err(NetError::BufferSmall);
+            }
+            out[..segment.payload.len()].copy_from_slice(segment.payload);
+            let length = segment.payload.len();
+
+            connection.remote_seq = connection.remote_seq.wrapping_add(length as u32);
+
+            let mut ack = [0u8; MAX_FRAME_BYTES];
+            let ack_length = build_tcp(
+                LINK_ADDRESS,
+                connection.remote,
+                connection.local_port,
+                connection.remote_port,
+                connection.local_seq,
+                connection.remote_seq,
+                TCP_ACK,
+                &[],
+                &mut ack,
+            )
+            .ok_or(NetError::FrameTooLong)?;
+            self.send_tcp_payload(connection.remote, connection.remote_mac, &ack[..ack_length])?;
+            return Ok(length);
+        }
+        Err(NetError::TcpFailed)
+    }
+
+    /// Close a TCP connection with FIN.
+    pub fn close_tcp(&mut self, connection: &mut TcpConnection) -> Result<(), NetError> {
+        let mut tcp = [0u8; MAX_FRAME_BYTES];
+        let tcp_length = build_tcp(
+            LINK_ADDRESS,
+            connection.remote,
+            connection.local_port,
+            connection.remote_port,
+            connection.local_seq,
+            connection.remote_seq,
+            TCP_FIN | TCP_ACK,
+            &[],
+            &mut tcp,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+        self.send_tcp_payload(connection.remote, connection.remote_mac, &tcp[..tcp_length])?;
+        connection.local_seq = connection.local_seq.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Send a raw TCP segment inside Ethernet + IPv4 framing.
+    fn send_tcp_payload(
+        &mut self,
+        destination: Ipv4Addr,
+        destination_mac: MacAddr,
+        tcp: &[u8],
+    ) -> Result<(), NetError> {
+        let mut packet = [0u8; MAX_FRAME_BYTES];
+        let packet_length = build_ipv4(
+            LINK_ADDRESS,
+            destination,
+            IP_PROTOCOL_TCP,
+            tcp,
+            &mut packet,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        let frame_length = build_ethernet(
+            destination_mac,
+            self.mac,
+            ETHERTYPE_IPV4,
+            &packet[..packet_length],
+            &mut frame,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        self.send_frame(&frame[..frame_length])
+    }
+
+    /// Send an ICMP echo request and wait for its reply.
+    pub fn icmp_echo(
+        &mut self,
+        destination: Ipv4Addr,
+        identifier: u16,
+        sequence: u16,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, NetError> {
+        let destination_mac = self.resolve_destination_mac(destination)?;
+
+        let mut icmp = [0u8; MAX_FRAME_BYTES];
+        let icmp_length = build_icmp_echo_request(identifier, sequence, payload, &mut icmp)
+            .ok_or(NetError::FrameTooLong)?;
+
+        let mut packet = [0u8; MAX_FRAME_BYTES];
+        let packet_length = build_ipv4(
+            LINK_ADDRESS,
+            destination,
+            IP_PROTOCOL_ICMP,
+            &icmp[..icmp_length],
+            &mut packet,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        let mut frame = [0u8; MAX_FRAME_BYTES];
+        let frame_length = build_ethernet(
+            destination_mac,
+            self.mac,
+            ETHERTYPE_IPV4,
+            &packet[..packet_length],
+            &mut frame,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+
+        self.prime_receive()?;
+        self.send_frame(&frame[..frame_length])?;
+
+        let mut buffer = [0u8; MAX_FRAME_BYTES];
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let length = self.poll_receive(&mut buffer)?;
+            let Some(ethernet) = parse_ethernet(&buffer[..length]) else {
+                continue;
+            };
+            if ethernet.ethertype != ETHERTYPE_IPV4 {
+                continue;
+            }
+            let Some(packet) = parse_ipv4(ethernet.payload) else {
+                continue;
+            };
+            if packet.protocol != IP_PROTOCOL_ICMP || packet.source != destination {
+                continue;
+            }
+            let Some(reply) = parse_icmp_echo_reply(packet.payload) else {
+                continue;
+            };
+            if reply.identifier != identifier || reply.sequence != sequence {
+                continue;
+            }
+            if reply.payload.len() > out.len() {
+                return Err(NetError::BufferSmall);
+            }
+            out[..reply.payload.len()].copy_from_slice(reply.payload);
+            return Ok(reply.payload.len());
+        }
+        Err(NetError::IcmpFailed)
+    }
+
+    /// Acquire an address from QEMU's built-in DHCP server.
+    pub fn dhcp_acquire(&mut self) -> Result<DhcpReply, NetError> {
+        let xid = 0x1234_5678u32;
+
+        let mut discover = [0u8; MAX_FRAME_BYTES];
+        let discover_length = build_dhcp_discover(self.mac, xid, &mut discover)
+            .ok_or(NetError::FrameTooLong)?;
+        self.prime_receive()?;
+        self.send_udp_broadcast(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &discover[..discover_length])?;
+
+        let mut buffer = [0u8; MAX_FRAME_BYTES];
+        let mut offer = None;
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let length = self.poll_receive(&mut buffer)?;
+            let Some(datagram) = self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
+            else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            let Some(reply) = parse_dhcp_reply(datagram) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            if reply.message_type == 2 {
+                offer = Some(reply);
+                break;
+            }
+            if attempt + 1 < LOOKUP_ATTEMPTS {
+                self.prime_receive()?;
+            }
+        }
+
+        let offer = offer.ok_or(NetError::DhcpFailed)?;
+        let server = offer.server.ok_or(NetError::DhcpFailed)?;
+        let server_mac = self.resolve_destination_mac(server)?;
+
+        let mut request = [0u8; MAX_FRAME_BYTES];
+        let request_length = build_dhcp_request(self.mac, xid, offer.address, server, &mut request)
+            .ok_or(NetError::FrameTooLong)?;
+        self.prime_receive()?;
+        self.send_udp_to(server, server_mac, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &request[..request_length])?;
+
+        let mut buffer = [0u8; MAX_FRAME_BYTES];
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let length = self.poll_receive(&mut buffer)?;
+            let Some(datagram) = self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
+            else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            let Some(reply) = parse_dhcp_reply(datagram) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            if reply.message_type == 5 {
+                return Ok(reply);
+            }
+            if attempt + 1 < LOOKUP_ATTEMPTS {
+                self.prime_receive()?;
+            }
+        }
+        Err(NetError::DhcpFailed)
+    }
+
+    /// Parse one TCP segment from an Ethernet + IPv4 frame.
+    fn parse_tcp_frame<'a>(
+        &self,
+        frame: &'a [u8],
+        source_port: u16,
+        destination_port: u16,
+    ) -> Option<TcpSegment<'a>> {
+        let ethernet = parse_ethernet(frame)?;
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            return None;
+        }
+        let packet = parse_ipv4(ethernet.payload)?;
+        if packet.protocol != IP_PROTOCOL_TCP {
+            return None;
+        }
+        let segment = parse_tcp(packet.payload, packet.source, packet.destination)?;
+        if segment.source_port != source_port || segment.destination_port != destination_port {
+            return None;
+        }
+        Some(segment)
+    }
+
+    /// Parse one UDP payload from an Ethernet + IPv4 frame.
+    fn parse_udp_frame<'a>(
+        &self,
+        frame: &'a [u8],
+        source_port: u16,
+        destination_port: u16,
+    ) -> Option<&'a [u8]> {
+        let ethernet = parse_ethernet(frame)?;
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            return None;
+        }
+        let packet = parse_ipv4(ethernet.payload)?;
+        if packet.protocol != IP_PROTOCOL_UDP {
+            return None;
+        }
+        let datagram = parse_udp(packet.payload)?;
+        if datagram.source_port != source_port || datagram.destination_port != destination_port {
+            return None;
+        }
+        Some(datagram.payload)
+    }
+
+
     /// Receive one UDP datagram whose source port is `port`.
     pub fn receive_udp(&mut self, port: u16, out: &mut [u8]) -> Result<usize, NetError> {
+        self.receive_udp_matching(port, 0, out)
+    }
+
+    /// Receive one UDP datagram addressed to a given local port.
+    ///
+    /// This is the socket path: a bound local port receives whatever datagrams
+    /// the remote endpoint sends to it. Matching only the destination port is
+    /// what makes a UDP socket a socket rather than a DNS-reply reader.
+    pub fn receive_udp_at(&mut self, local_port: u16, out: &mut [u8]) -> Result<usize, NetError> {
+        self.receive_udp_matching(0, local_port, out)
+    }
+
+    /// Receive one UDP datagram matching `source_port` and `destination_port`.
+    ///
+    /// A zero source or destination port means "any" for that endpoint.
+    fn receive_udp_matching(
+        &mut self,
+        source_port: u16,
+        destination_port: u16,
+        out: &mut [u8],
+    ) -> Result<usize, NetError> {
         let mut frame = [0u8; MAX_FRAME_BYTES];
         for _ in 0..LOOKUP_ATTEMPTS {
             let frame_length = self.receive_frame(&mut frame)?;
@@ -489,7 +1043,17 @@ impl VirtioNet {
             let Some(datagram) = parse_udp(packet.payload) else {
                 continue;
             };
-            if datagram.source_port != port {
+            klog!(
+                Level::Info,
+                "virtio-net: udp src {} dst {} len {}",
+                datagram.source_port,
+                datagram.destination_port,
+                datagram.payload.len()
+            );
+            if source_port != 0 && datagram.source_port != source_port {
+                continue;
+            }
+            if destination_port != 0 && datagram.destination_port != destination_port {
                 continue;
             }
             if datagram.payload.len() > out.len() {
@@ -562,6 +1126,7 @@ impl VirtioNet {
                 continue;
             }
             if let Some(address) = parse_dns_a_record(datagram.payload) {
+                klog!(Level::Info, "virtio-net: dns {:#x}", address.as_u32());
                 return Ok(address);
             }
             if attempt + 1 < LOOKUP_ATTEMPTS {
@@ -640,6 +1205,7 @@ impl VirtioNet {
             self.rx.rewind();
             self.tx.rewind();
         }
+        self.rx_primed = false;
 
         let wanted = super::Features {
             low: (1 << FEATURE_NET_MAC) | (1 << FEATURE_NET_STATUS),

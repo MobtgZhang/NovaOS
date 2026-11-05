@@ -24,10 +24,10 @@
 
 use core::cell::UnsafeCell;
 
-use nova_net::Ipv4Addr;
+use nova_net::{DhcpReply, Ipv4Addr};
 
 use crate::drivers::pci;
-use crate::drivers::virtio::net::{LinkInfo, NetError, VirtioNet};
+use crate::drivers::virtio::net::{LinkInfo, NetError, TcpConnection, VirtioNet};
 use crate::klog;
 use crate::logger::Level;
 
@@ -178,6 +178,75 @@ pub fn send_udp(destination: Ipv4Addr, port: u16, payload: &[u8]) -> Result<(), 
 /// Receive one UDP datagram whose source port is `port`.
 pub fn receive_udp(port: u16, out: &mut [u8]) -> Result<usize, NetError> {
     let result = with_net(|device| device.receive_udp(port, out))?;
+    result
+}
+
+/// Receive one UDP datagram addressed to `local_port`.
+pub fn receive_udp_at(local_port: u16, out: &mut [u8]) -> Result<usize, NetError> {
+    let result = with_net(|device| device.receive_udp_at(local_port, out))?;
+    result
+}
+
+/// Send one UDP datagram from a chosen source port.
+pub fn send_udp_from(
+    source_port: u16,
+    destination: Ipv4Addr,
+    destination_port: u16,
+    payload: &[u8],
+) -> Result<(), NetError> {
+    let result = with_net(|device| device.send_udp_from(source_port, destination, destination_port, payload))?;
+    result
+}
+
+/// Open a TCP connection.
+pub fn connect_tcp(destination: Ipv4Addr, port: u16) -> Result<TcpConnection, NetError> {
+    let result = with_net(|device| device.connect_tcp(destination, port))?;
+    result
+}
+
+/// Open a TCP connection from a chosen local port.
+pub fn connect_tcp_from(
+    destination: Ipv4Addr,
+    port: u16,
+    local_port: u16,
+) -> Result<TcpConnection, NetError> {
+    let result = with_net(|device| device.connect_tcp_from(destination, port, local_port))?;
+    result
+}
+
+/// Send bytes on a TCP connection.
+pub fn send_tcp(connection: &mut TcpConnection, payload: &[u8]) -> Result<(), NetError> {
+    let result = with_net(|device| device.send_tcp(connection, payload))?;
+    result
+}
+
+/// Receive bytes from a TCP connection.
+pub fn receive_tcp(connection: &mut TcpConnection, out: &mut [u8]) -> Result<usize, NetError> {
+    let result = with_net(|device| device.receive_tcp(connection, out))?;
+    result
+}
+
+/// Close a TCP connection.
+pub fn close_tcp(connection: &mut TcpConnection) -> Result<(), NetError> {
+    let result = with_net(|device| device.close_tcp(connection))?;
+    result
+}
+
+/// Send an ICMP echo request and return the reply payload.
+pub fn icmp_echo(
+    destination: Ipv4Addr,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Result<usize, NetError> {
+    let result = with_net(|device| device.icmp_echo(destination, identifier, sequence, payload, out))?;
+    result
+}
+
+/// Acquire an IPv4 lease from the emulated DHCP server.
+pub fn dhcp_acquire() -> Result<DhcpReply, NetError> {
+    let result = with_net(|device| device.dhcp_acquire())?;
     result
 }
 

@@ -439,6 +439,342 @@ pub fn parse_dns_a_record(response: &[u8]) -> Option<Ipv4Addr> {
     None
 }
 
+/// IP protocol number for TCP.
+pub const IP_PROTOCOL_TCP: u8 = 6;
+
+/// IP protocol number for ICMP.
+pub const IP_PROTOCOL_ICMP: u8 = 1;
+
+/// Bytes in a TCP header without options.
+pub const TCP_HEADER_BYTES: usize = 20;
+
+/// Bytes in an ICMP echo header.
+pub const ICMP_HEADER_BYTES: usize = 8;
+
+/// TCP control flags. The flags field is six bits; the data offset is the high
+/// nibble of the same 16-bit word.
+pub const TCP_FIN: u16 = 0x01;
+pub const TCP_SYN: u16 = 0x02;
+pub const TCP_RST: u16 = 0x04;
+pub const TCP_PSH: u16 = 0x08;
+pub const TCP_ACK: u16 = 0x10;
+
+/// DHCP wire constants.
+pub const DHCP_MAGIC_COOKIE: u32 = 0x6382_5363;
+pub const DHCP_CLIENT_PORT: u16 = 68;
+pub const DHCP_SERVER_PORT: u16 = 67;
+
+/// One parsed TCP segment.
+#[derive(Clone, Copy, Debug)]
+pub struct TcpSegment<'a> {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub sequence: u32,
+    pub acknowledgement: u32,
+    pub flags: u16,
+    pub payload: &'a [u8],
+}
+
+impl TcpSegment<'_> {
+    /// Whether the segment carries `flag`.
+    pub const fn has(self, flag: u16) -> bool {
+        self.flags & flag != 0
+    }
+}
+
+/// Build a TCP segment into `out`.
+///
+/// The checksum covers the IPv4 pseudo-header (source, destination, protocol,
+/// and segment length) plus the TCP header and payload. The caller supplies the
+/// source and destination addresses because the pseudo-header is not part of
+/// the segment itself.
+pub fn build_tcp(
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    source_port: u16,
+    destination_port: u16,
+    sequence: u32,
+    acknowledgement: u32,
+    flags: u16,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let total = TCP_HEADER_BYTES + payload.len();
+    if total > out.len() || total > 65535 {
+        return None;
+    }
+
+    out[0..2].copy_from_slice(&source_port.to_be_bytes());
+    out[2..4].copy_from_slice(&destination_port.to_be_bytes());
+    out[4..8].copy_from_slice(&sequence.to_be_bytes());
+    out[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+    out[12..14].copy_from_slice(&((5u16 << 12) | (flags & 0x3f)).to_be_bytes());
+    out[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+    out[16..18].copy_from_slice(&0u16.to_be_bytes());
+    out[18..20].copy_from_slice(&0u16.to_be_bytes());
+    out[TCP_HEADER_BYTES..total].copy_from_slice(payload);
+
+    let checksum = pseudo_checksum(source, destination, IP_PROTOCOL_TCP, &out[..total]);
+    out[16..18].copy_from_slice(&checksum.to_be_bytes());
+    Some(total)
+}
+
+/// Parse a TCP segment and verify its pseudo-header checksum.
+///
+/// A segment is accepted with TCP options: the data offset in the header says
+/// how many 32-bit words precede the payload. The checksum covers the options
+/// too, so skipping them is a parse of the same bytes, not a truncation.
+/// Options are not interpreted, only skipped. That matters because a SYN-ACK
+/// from a real stack commonly carries an MSS option, and a parser that insists
+/// on a bare 20-byte header would reject the reply without saying why.
+pub fn parse_tcp(
+    segment: &[u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+) -> Option<TcpSegment<'_>> {
+    if segment.len() < TCP_HEADER_BYTES {
+        return None;
+    }
+    let offset_and_flags = read_u16(segment, 12)?;
+    let header_bytes = (offset_and_flags >> 12) as usize * 4;
+    if header_bytes < TCP_HEADER_BYTES || header_bytes > segment.len() {
+        return None;
+    }
+    if pseudo_checksum(source, destination, IP_PROTOCOL_TCP, segment) != 0 {
+        return None;
+    }
+
+    Some(TcpSegment {
+        source_port: read_u16(segment, 0)?,
+        destination_port: read_u16(segment, 2)?,
+        sequence: read_u32(segment, 4)?,
+        acknowledgement: read_u32(segment, 8)?,
+        flags: offset_and_flags & 0x3f,
+        payload: &segment[header_bytes..],
+    })
+}
+
+/// One parsed ICMP echo reply.
+#[derive(Clone, Copy, Debug)]
+pub struct IcmpEchoReply<'a> {
+    pub identifier: u16,
+    pub sequence: u16,
+    pub payload: &'a [u8],
+}
+
+/// Build an ICMP echo request.
+pub fn build_icmp_echo_request(
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    let total = ICMP_HEADER_BYTES + payload.len();
+    if total > out.len() || total > 65535 {
+        return None;
+    }
+    out[0] = 8; // echo request
+    out[1] = 0;
+    out[2..4].copy_from_slice(&0u16.to_be_bytes());
+    out[4..6].copy_from_slice(&identifier.to_be_bytes());
+    out[6..8].copy_from_slice(&sequence.to_be_bytes());
+    out[ICMP_HEADER_BYTES..total].copy_from_slice(payload);
+    let checksum = checksum(&out[..total]);
+    out[2..4].copy_from_slice(&checksum.to_be_bytes());
+    Some(total)
+}
+
+/// Parse an ICMP echo reply.
+pub fn parse_icmp_echo_reply(packet: &[u8]) -> Option<IcmpEchoReply<'_>> {
+    if packet.len() < ICMP_HEADER_BYTES {
+        return None;
+    }
+    if packet[0] != 0 || packet[1] != 0 {
+        return None;
+    }
+    if checksum(packet) != 0 {
+        return None;
+    }
+    Some(IcmpEchoReply {
+        identifier: read_u16(packet, 4)?,
+        sequence: read_u16(packet, 6)?,
+        payload: &packet[ICMP_HEADER_BYTES..],
+    })
+}
+
+/// One parsed DHCP reply.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DhcpReply {
+    pub address: Ipv4Addr,
+    pub server: Option<Ipv4Addr>,
+    pub message_type: u8,
+}
+
+/// Build a DHCP DISCOVER message.
+pub fn build_dhcp_discover(mac: MacAddr, xid: u32, out: &mut [u8]) -> Option<usize> {
+    build_dhcp_base(mac, xid, out)?;
+    let mut position = 240;
+    // Message type 53 = DISCOVER (1).
+    out[position] = 53;
+    out[position + 1] = 1;
+    out[position + 2] = 1;
+    position += 3;
+    out[position] = 255; // end
+    position += 1;
+    Some(position)
+}
+
+/// Build a DHCP REQUEST message for `requested` and `server`.
+pub fn build_dhcp_request(
+    mac: MacAddr,
+    xid: u32,
+    requested: Ipv4Addr,
+    server: Ipv4Addr,
+    out: &mut [u8],
+) -> Option<usize> {
+    build_dhcp_base(mac, xid, out)?;
+    let mut position = 240;
+    // Message type 53 = REQUEST (3).
+    out[position] = 53;
+    out[position + 1] = 1;
+    out[position + 2] = 3;
+    position += 3;
+    // Requested IP address, option 50.
+    out[position] = 50;
+    out[position + 1] = 4;
+    out[position + 2..position + 6].copy_from_slice(&requested.octets());
+    position += 6;
+    // Server identifier, option 54.
+    out[position] = 54;
+    out[position + 1] = 4;
+    out[position + 2..position + 6].copy_from_slice(&server.octets());
+    position += 6;
+    out[position] = 255;
+    position += 1;
+    Some(position)
+}
+
+/// Build the fixed DHCP header and magic cookie.
+fn build_dhcp_base(mac: MacAddr, xid: u32, out: &mut [u8]) -> Option<usize> {
+    if out.len() < 240 {
+        return None;
+    }
+    out[0] = 1; // BOOTREQUEST
+    out[1] = 1; // Ethernet
+    out[2] = 6; // hardware address length
+    out[3] = 0;
+    out[4..8].copy_from_slice(&xid.to_be_bytes());
+    out[8..10].copy_from_slice(&0u16.to_be_bytes());
+    out[10..12].copy_from_slice(&0u16.to_be_bytes());
+    out[12..16].copy_from_slice(&[0u8; 4]);
+    out[16..20].copy_from_slice(&[0u8; 4]);
+    out[20..24].copy_from_slice(&[0u8; 4]);
+    out[24..28].copy_from_slice(&[0u8; 4]);
+    out[28..34].copy_from_slice(&mac.octets());
+    out[34..44].copy_from_slice(&[0u8; 10]);
+    out[44..108].copy_from_slice(&[0u8; 64]);
+    out[108..236].copy_from_slice(&[0u8; 128]);
+    out[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE.to_be_bytes());
+    Some(240)
+}
+
+/// Parse a DHCP OFFER or ACK.
+pub fn parse_dhcp_reply(packet: &[u8]) -> Option<DhcpReply> {
+    if packet.len() < 240 {
+        return None;
+    }
+    let op = packet[0];
+    if op != 2 && op != 5 {
+        return None;
+    }
+    if packet[236] != 0x63 || packet[237] != 0x82 || packet[238] != 0x53 || packet[239] != 0x63 {
+        return None;
+    }
+
+    let mut address = [0u8; 4];
+    address.copy_from_slice(&packet[16..20]);
+    let address = Ipv4Addr(address);
+    if address.as_u32() == 0 {
+        return None;
+    }
+
+    let mut message_type = 0u8;
+    let mut server = None;
+    let mut position = 240;
+    while position < packet.len() {
+        let code = packet[position];
+        position += 1;
+        if code == 255 {
+            break;
+        }
+        if position >= packet.len() {
+            return None;
+        }
+        let length = packet[position] as usize;
+        position += 1;
+        if position + length > packet.len() {
+            return None;
+        }
+        if code == 53 && length == 1 {
+            message_type = packet[position];
+        } else if code == 54 && length == 4 {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&packet[position..position + 4]);
+            server = Some(Ipv4Addr(bytes));
+        }
+        position += length;
+    }
+
+    if message_type == 0 {
+        return None;
+    }
+    Some(DhcpReply {
+        address,
+        server,
+        message_type,
+    })
+}
+
+/// The one's-complement checksum of an IPv4 pseudo-header plus `data`.
+fn pseudo_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    sum += ((source.0[0] as u32) << 8) | (source.0[1] as u32);
+    sum += ((source.0[2] as u32) << 8) | (source.0[3] as u32);
+    sum += ((destination.0[0] as u32) << 8) | (destination.0[1] as u32);
+    sum += ((destination.0[2] as u32) << 8) | (destination.0[3] as u32);
+    // The pseudo-header is: source, destination, a zero byte, the protocol,
+    // and the segment length. The protocol is the low byte of a big-endian
+    // 16-bit word, so the word is `0x0006`, not `0x0600`.
+    sum += protocol as u32;
+    sum += data.len() as u32;
+
+    let mut index = 0usize;
+    while index + 1 < data.len() {
+        sum += ((data[index] as u32) << 8) | (data[index + 1] as u32);
+        index += 2;
+    }
+    if index < data.len() {
+        sum += (data[index] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Read a big-endian `u32` at `offset`.
+fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 > data.len() {
+        return None;
+    }
+    Some(
+        ((data[offset] as u32) << 24)
+            | ((data[offset + 1] as u32) << 16)
+            | ((data[offset + 2] as u32) << 8)
+            | (data[offset + 3] as u32),
+    )
+}
+
 /// Skip a DNS name at `position`, returning the offset after it.
 fn skip_dns_name(data: &[u8], position: usize) -> Option<usize> {
     if position >= data.len() {
@@ -501,9 +837,13 @@ fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
 mod tests {
     use super::{
         ARP_REPLY, BROADCAST_MAC, DNS_CLASS_IN, DNS_TYPE_A, ETHERNET_HEADER_BYTES, ETHERTYPE_ARP,
-        ETHERTYPE_IPV4, IPV4_HEADER_BYTES, Ipv4Addr, MacAddr, build_arp_request, build_dns_query,
-        build_ethernet, build_ipv4, build_udp, parse_arp_reply, parse_dns_a_record, parse_ethernet,
-        parse_ipv4, parse_udp,
+        ETHERTYPE_IPV4, ICMP_HEADER_BYTES, IP_PROTOCOL_TCP, IPV4_HEADER_BYTES, Ipv4Addr, MacAddr,
+        TCP_ACK, TCP_FIN,
+        TCP_PSH, TCP_SYN, TCP_HEADER_BYTES, build_arp_request, build_dhcp_discover,
+        build_dhcp_request, build_dns_query, build_ethernet, build_icmp_echo_request,
+        build_ipv4, build_tcp, build_udp, parse_arp_reply, parse_dhcp_reply, parse_dns_a_record,
+        parse_ethernet, parse_icmp_echo_reply, parse_ipv4, parse_tcp, parse_udp,
+        pseudo_checksum,
     };
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -731,5 +1071,188 @@ mod tests {
         position += 2;
 
         assert_eq!(parse_dns_a_record(&response[..position]), None);
+    }
+
+    #[test]
+    fn tcp_segment_round_trips_and_checks_its_pseudo_header() {
+        let source = ip(10, 0, 2, 15);
+        let destination = ip(93, 184, 216, 34);
+        let payload = b"GET / HTTP/1.1\r\n";
+        let mut buffer = [0u8; 128];
+
+        let length = build_tcp(
+            source,
+            destination,
+            49153,
+            80,
+            1,
+            1,
+            TCP_ACK | TCP_PSH,
+            payload,
+            &mut buffer,
+        )
+        .expect("the segment fits");
+        assert_eq!(length, TCP_HEADER_BYTES + payload.len());
+        // The pseudo-header's protocol word is `0x0006`, not `0x0600`.
+        assert_eq!(
+            ((buffer[16] as u16) << 8) | buffer[17] as u16,
+            0xdbe8
+        );
+
+        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        assert_eq!(segment.source_port, 49153);
+        assert_eq!(segment.destination_port, 80);
+        assert_eq!(segment.sequence, 1);
+        assert_eq!(segment.acknowledgement, 1);
+        assert!(segment.has(TCP_ACK));
+        assert!(segment.has(TCP_PSH));
+        assert_eq!(segment.payload, payload);
+
+        let mut corrupt = buffer;
+        corrupt[16] ^= 0xff;
+        assert!(parse_tcp(&corrupt[..length], source, destination).is_none());
+    }
+
+    #[test]
+    fn tcp_syn_ack_with_an_mss_option_is_accepted() {
+        let source = ip(10, 0, 2, 100);
+        let destination = ip(10, 0, 2, 15);
+        let mut buffer = [0u8; 64];
+
+        // A bare 20-byte header, then an MSS option (type 2, length 4, 1460).
+        let length = build_tcp(
+            source,
+            destination,
+            80,
+            49153,
+            0x2222_2222,
+            0x1234_5679,
+            TCP_SYN | TCP_ACK,
+            &[],
+            &mut buffer,
+        )
+        .expect("the bare segment fits");
+        assert_eq!(length, TCP_HEADER_BYTES);
+
+        buffer[TCP_HEADER_BYTES..TCP_HEADER_BYTES + 4]
+            .copy_from_slice(&[2, 4, 0x05, 0xb4]);
+        let total = TCP_HEADER_BYTES + 4;
+        buffer[12..14].copy_from_slice(&(((6u16 << 12) | (TCP_SYN | TCP_ACK)).to_be_bytes()));
+        buffer[16..18].copy_from_slice(&0u16.to_be_bytes());
+        let checksum = pseudo_checksum(source, destination, IP_PROTOCOL_TCP, &buffer[..total]);
+        buffer[16..18].copy_from_slice(&checksum.to_be_bytes());
+
+        let segment = parse_tcp(&buffer[..total], source, destination).expect("options parse");
+        assert!(segment.has(TCP_SYN));
+        assert!(segment.has(TCP_ACK));
+        assert_eq!(segment.sequence, 0x2222_2222);
+        assert_eq!(segment.acknowledgement, 0x1234_5679);
+        assert!(segment.payload.is_empty());
+    }
+
+    #[test]
+    fn tcp_syn_and_fin_flags_are_distinct() {
+        let source = ip(10, 0, 2, 15);
+        let destination = ip(10, 0, 2, 2);
+        let mut buffer = [0u8; 64];
+        let length = build_tcp(source, destination, 49153, 80, 0, 0, TCP_SYN, &[], &mut buffer)
+            .expect("the segment fits");
+        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        assert!(segment.has(TCP_SYN));
+        assert!(!segment.has(TCP_ACK));
+
+        let length = build_tcp(source, destination, 49153, 80, 1, 1, TCP_FIN, &[], &mut buffer)
+            .expect("the segment fits");
+        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        assert!(segment.has(TCP_FIN));
+        assert!(!segment.has(TCP_PSH));
+    }
+
+    #[test]
+    fn icmp_echo_request_and_reply_round_trip() {
+        let payload = [1, 2, 3, 4];
+        let mut buffer = [0u8; 64];
+        let length = build_icmp_echo_request(0x1234, 1, &payload, &mut buffer)
+            .expect("the request fits");
+        assert_eq!(length, ICMP_HEADER_BYTES + payload.len());
+        assert_eq!(buffer[0], 8);
+
+        // Turn the request into a reply by changing the type and recomputing.
+        let mut reply = buffer;
+        reply[0] = 0;
+        reply[2..4].copy_from_slice(&0u16.to_be_bytes());
+        let checksum = super::checksum(&reply[..length]);
+        reply[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let parsed = parse_icmp_echo_reply(&reply[..length]).expect("the reply parses");
+        assert_eq!(parsed.identifier, 0x1234);
+        assert_eq!(parsed.sequence, 1);
+        assert_eq!(parsed.payload, &payload);
+
+        let mut corrupt = reply;
+        corrupt[2] ^= 0xff;
+        assert!(parse_icmp_echo_reply(&corrupt[..length]).is_none());
+    }
+
+    #[test]
+    fn dhcp_discover_and_request_have_the_expected_options() {
+        let mac = mac(0x52, 0x54, 0x00, 0x12, 0x34, 0x56);
+        let mut buffer = [0u8; 512];
+
+        let length = build_dhcp_discover(mac, 0x12345678, &mut buffer).expect("the discover fits");
+        assert_eq!(length, 244);
+        assert_eq!(buffer[0], 1);
+        assert_eq!(buffer[1], 1);
+        assert_eq!(buffer[2], 6);
+        assert_eq!(buffer[4..8], 0x12345678u32.to_be_bytes());
+        assert_eq!(buffer[28..34], mac.octets());
+        assert_eq!(buffer[236], 0x63);
+        assert_eq!(buffer[237], 0x82);
+        assert_eq!(buffer[238], 0x53);
+        assert_eq!(buffer[239], 0x63);
+        assert_eq!(buffer[240], 53);
+        assert_eq!(buffer[241], 1);
+        assert_eq!(buffer[242], 1);
+
+        let requested = ip(10, 0, 2, 15);
+        let server = ip(10, 0, 2, 2);
+        let length = build_dhcp_request(mac, 0x12345678, requested, server, &mut buffer)
+            .expect("the request fits");
+        assert_eq!(buffer[240], 53);
+        assert_eq!(buffer[242], 3);
+        assert_eq!(buffer[243], 50);
+        assert_eq!(buffer[244], 4);
+        assert_eq!(buffer[245..249], requested.octets());
+        assert_eq!(buffer[249], 54);
+        assert_eq!(buffer[250], 4);
+        assert_eq!(buffer[251..255], server.octets());
+        assert_eq!(buffer[255], 255);
+        assert_eq!(length, 256);
+    }
+
+    #[test]
+    fn dhcp_offer_is_parsed() {
+        let mac = mac(0x52, 0x54, 0x00, 0x12, 0x34, 0x56);
+        let mut buffer = [0u8; 512];
+        let length = build_dhcp_discover(mac, 1, &mut buffer).expect("the discover fits");
+
+        // Make a synthetic OFFER: op 2, yiaddr 10.0.2.15, type 2, server 10.0.2.2.
+        let mut offer = buffer;
+        offer[0] = 2;
+        offer[16..20].copy_from_slice(&ip(10, 0, 2, 15).octets());
+        offer[240] = 53;
+        offer[241] = 1;
+        offer[242] = 2;
+        offer[243] = 54;
+        offer[244] = 4;
+        offer[245..249].copy_from_slice(&ip(10, 0, 2, 2).octets());
+        offer[249] = 255;
+
+        let reply = parse_dhcp_reply(&offer[..250]).expect("the offer parses");
+        assert_eq!(reply.address, ip(10, 0, 2, 15));
+        assert_eq!(reply.server, Some(ip(10, 0, 2, 2)));
+        assert_eq!(reply.message_type, 2);
+
+        assert_eq!(parse_dhcp_reply(&offer[..length]), None, "a DISCOVER is not a reply");
     }
 }
