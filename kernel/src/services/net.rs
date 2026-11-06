@@ -39,17 +39,15 @@ use nova_protocols::negotiate;
 use nova_protocols::net::{
     NET_DHCP_REPLY_SIZE, NET_DHCP_REQUEST_SIZE, NET_ICMP_REPLY_SIZE, NET_ICMP_REQUEST_SIZE,
     NET_LINK_REPLY_SIZE, NET_LINK_REQUEST_SIZE, NET_MAX_DATAGRAM, NET_MAX_ICMP_PAYLOAD,
-    NET_MAX_ICMP_REPLY, NET_MAX_NAME, NET_MAX_RECV, NET_MAX_SOCKET_PAYLOAD,
-    NET_MAX_SOCKET_RECV, NET_OP_DHCP, NET_OP_ICMP_ECHO, NET_OP_LINK_QUERY, NET_OP_RECV,
-    NET_OP_RESOLVE, NET_OP_SEND, NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT,
-    NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV, NET_OP_SOCKET_SEND, NET_RECV_REPLY_SIZE,
-    NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE, NET_RESOLVE_REQUEST_SIZE,
-    NET_SEND_REPLY_SIZE, NET_SEND_REQUEST_SIZE, NET_SOCKET_CLOSE_REPLY_SIZE,
-    NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE,
-    NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
-    NET_SOCKET_OPEN_REQUEST_SIZE, NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE,
-    NET_SOCKET_SEND_REPLY_SIZE, NET_SOCKET_SEND_REQUEST_SIZE, NET_SOCKET_TCP, NET_SOCKET_UDP,
-    NET_VERSION,
+    NET_MAX_ICMP_REPLY, NET_MAX_NAME, NET_MAX_RECV, NET_MAX_SOCKET_PAYLOAD, NET_MAX_SOCKET_RECV,
+    NET_OP_DHCP, NET_OP_ICMP_ECHO, NET_OP_LINK_QUERY, NET_OP_RECV, NET_OP_RESOLVE, NET_OP_SEND,
+    NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT, NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV,
+    NET_OP_SOCKET_SEND, NET_RECV_REPLY_SIZE, NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE,
+    NET_RESOLVE_REQUEST_SIZE, NET_SEND_REPLY_SIZE, NET_SEND_REQUEST_SIZE,
+    NET_SOCKET_CLOSE_REPLY_SIZE, NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE,
+    NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE, NET_SOCKET_OPEN_REQUEST_SIZE,
+    NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE, NET_SOCKET_SEND_REPLY_SIZE,
+    NET_SOCKET_SEND_REQUEST_SIZE, NET_SOCKET_TCP, NET_SOCKET_UDP, NET_VERSION,
 };
 
 use crate::drivers::net as driver;
@@ -367,7 +365,10 @@ impl NetService {
         }
 
         let Some(slot) = self.socket_slot(socket_id, task_slot) else {
-            return reply_error(NET_SOCKET_CONNECT_REPLY_SIZE, socket_error(socket_id, task_slot));
+            return reply_error(
+                NET_SOCKET_CONNECT_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
         };
 
         let destination = ipv4(destination);
@@ -382,9 +383,7 @@ impl NetService {
                             socket.tcp = Some(connection);
                             socket_reply(NET_SOCKET_CONNECT_REPLY_SIZE, socket_id)
                         }
-                        Err(error) => {
-                            reply_error(NET_SOCKET_CONNECT_REPLY_SIZE, error_code(error))
-                        }
+                        Err(error) => reply_error(NET_SOCKET_CONNECT_REPLY_SIZE, error_code(error)),
                     }
                 } else if socket.kind == NET_SOCKET_UDP {
                     if socket.udp_destination.is_some() {
@@ -426,14 +425,16 @@ impl NetService {
         }
 
         let length = length as usize;
-        if length > NET_MAX_SOCKET_PAYLOAD
-            || payload.len() != NET_SOCKET_SEND_REQUEST_SIZE + length
+        if length > NET_MAX_SOCKET_PAYLOAD || payload.len() != NET_SOCKET_SEND_REQUEST_SIZE + length
         {
             return reply_error(NET_SOCKET_SEND_REPLY_SIZE, ErrorCode::Invalid);
         }
 
         let Some(slot) = self.socket_slot(socket_id, task_slot) else {
-            return reply_error(NET_SOCKET_SEND_REPLY_SIZE, socket_error(socket_id, task_slot));
+            return reply_error(
+                NET_SOCKET_SEND_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
         };
 
         let data = &payload[NET_SOCKET_SEND_REQUEST_SIZE..NET_SOCKET_SEND_REQUEST_SIZE + length];
@@ -493,7 +494,10 @@ impl NetService {
         }
 
         let Some(slot) = self.socket_slot(socket_id, task_slot) else {
-            return reply_error(NET_SOCKET_RECV_REPLY_SIZE, socket_error(socket_id, task_slot));
+            return reply_error(
+                NET_SOCKET_RECV_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
         };
 
         let mut data = [0u8; NET_MAX_SOCKET_RECV];
@@ -545,7 +549,10 @@ impl NetService {
         }
 
         let Some(slot) = self.socket_slot(socket_id, task_slot) else {
-            return reply_error(NET_SOCKET_CLOSE_REPLY_SIZE, socket_error(socket_id, task_slot));
+            return reply_error(
+                NET_SOCKET_CLOSE_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
         };
 
         if let Some(socket) = self.sockets[slot].as_mut() {
@@ -671,13 +678,16 @@ impl NetService {
             return None;
         }
         let slot = (socket_id as usize) - 1;
-        self.sockets.get(slot).and_then(|entry| entry.as_ref()).and_then(|socket| {
-            if socket.task_slot == task_slot {
-                Some(slot)
-            } else {
-                None
-            }
-        })
+        self.sockets
+            .get(slot)
+            .and_then(|entry| entry.as_ref())
+            .and_then(|socket| {
+                if socket.task_slot == task_slot {
+                    Some(slot)
+                } else {
+                    None
+                }
+            })
     }
 }
 

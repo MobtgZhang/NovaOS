@@ -838,12 +838,11 @@ mod tests {
     use super::{
         ARP_REPLY, BROADCAST_MAC, DNS_CLASS_IN, DNS_TYPE_A, ETHERNET_HEADER_BYTES, ETHERTYPE_ARP,
         ETHERTYPE_IPV4, ICMP_HEADER_BYTES, IP_PROTOCOL_TCP, IPV4_HEADER_BYTES, Ipv4Addr, MacAddr,
-        TCP_ACK, TCP_FIN,
-        TCP_PSH, TCP_SYN, TCP_HEADER_BYTES, build_arp_request, build_dhcp_discover,
-        build_dhcp_request, build_dns_query, build_ethernet, build_icmp_echo_request,
-        build_ipv4, build_tcp, build_udp, parse_arp_reply, parse_dhcp_reply, parse_dns_a_record,
-        parse_ethernet, parse_icmp_echo_reply, parse_ipv4, parse_tcp, parse_udp,
-        pseudo_checksum,
+        TCP_ACK, TCP_FIN, TCP_HEADER_BYTES, TCP_PSH, TCP_SYN, build_arp_request,
+        build_dhcp_discover, build_dhcp_request, build_dns_query, build_ethernet,
+        build_icmp_echo_request, build_ipv4, build_tcp, build_udp, parse_arp_reply,
+        parse_dhcp_reply, parse_dns_a_record, parse_ethernet, parse_icmp_echo_reply, parse_ipv4,
+        parse_tcp, parse_udp, pseudo_checksum,
     };
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
@@ -1094,12 +1093,10 @@ mod tests {
         .expect("the segment fits");
         assert_eq!(length, TCP_HEADER_BYTES + payload.len());
         // The pseudo-header's protocol word is `0x0006`, not `0x0600`.
-        assert_eq!(
-            ((buffer[16] as u16) << 8) | buffer[17] as u16,
-            0xdbe8
-        );
+        assert_eq!(((buffer[16] as u16) << 8) | buffer[17] as u16, 0xdbe8);
 
-        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        let segment =
+            parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
         assert_eq!(segment.source_port, 49153);
         assert_eq!(segment.destination_port, 80);
         assert_eq!(segment.sequence, 1);
@@ -1134,8 +1131,7 @@ mod tests {
         .expect("the bare segment fits");
         assert_eq!(length, TCP_HEADER_BYTES);
 
-        buffer[TCP_HEADER_BYTES..TCP_HEADER_BYTES + 4]
-            .copy_from_slice(&[2, 4, 0x05, 0xb4]);
+        buffer[TCP_HEADER_BYTES..TCP_HEADER_BYTES + 4].copy_from_slice(&[2, 4, 0x05, 0xb4]);
         let total = TCP_HEADER_BYTES + 4;
         buffer[12..14].copy_from_slice(&(((6u16 << 12) | (TCP_SYN | TCP_ACK)).to_be_bytes()));
         buffer[16..18].copy_from_slice(&0u16.to_be_bytes());
@@ -1155,15 +1151,37 @@ mod tests {
         let source = ip(10, 0, 2, 15);
         let destination = ip(10, 0, 2, 2);
         let mut buffer = [0u8; 64];
-        let length = build_tcp(source, destination, 49153, 80, 0, 0, TCP_SYN, &[], &mut buffer)
-            .expect("the segment fits");
-        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        let length = build_tcp(
+            source,
+            destination,
+            49153,
+            80,
+            0,
+            0,
+            TCP_SYN,
+            &[],
+            &mut buffer,
+        )
+        .expect("the segment fits");
+        let segment =
+            parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
         assert!(segment.has(TCP_SYN));
         assert!(!segment.has(TCP_ACK));
 
-        let length = build_tcp(source, destination, 49153, 80, 1, 1, TCP_FIN, &[], &mut buffer)
-            .expect("the segment fits");
-        let segment = parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
+        let length = build_tcp(
+            source,
+            destination,
+            49153,
+            80,
+            1,
+            1,
+            TCP_FIN,
+            &[],
+            &mut buffer,
+        )
+        .expect("the segment fits");
+        let segment =
+            parse_tcp(&buffer[..length], source, destination).expect("the segment parses");
         assert!(segment.has(TCP_FIN));
         assert!(!segment.has(TCP_PSH));
     }
@@ -1172,8 +1190,8 @@ mod tests {
     fn icmp_echo_request_and_reply_round_trip() {
         let payload = [1, 2, 3, 4];
         let mut buffer = [0u8; 64];
-        let length = build_icmp_echo_request(0x1234, 1, &payload, &mut buffer)
-            .expect("the request fits");
+        let length =
+            build_icmp_echo_request(0x1234, 1, &payload, &mut buffer).expect("the request fits");
         assert_eq!(length, ICMP_HEADER_BYTES + payload.len());
         assert_eq!(buffer[0], 8);
 
@@ -1253,6 +1271,10 @@ mod tests {
         assert_eq!(reply.server, Some(ip(10, 0, 2, 2)));
         assert_eq!(reply.message_type, 2);
 
-        assert_eq!(parse_dhcp_reply(&offer[..length]), None, "a DISCOVER is not a reply");
+        assert_eq!(
+            parse_dhcp_reply(&offer[..length]),
+            None,
+            "a DISCOVER is not a reply"
+        );
     }
 }

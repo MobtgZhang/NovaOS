@@ -76,10 +76,12 @@ pub const NET_SOCKET_UDP: u32 = 2;
 pub const NET_SOCKET_ICMP: u32 = 3;
 
 /// Maximum bytes one socket send or receive can carry.
-pub const NET_MAX_SOCKET_PAYLOAD: usize = nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_SOCKET_SEND_REQUEST_SIZE;
+pub const NET_MAX_SOCKET_PAYLOAD: usize =
+    nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_SOCKET_SEND_REQUEST_SIZE;
 
 /// Maximum bytes one socket receive reply can carry.
-pub const NET_MAX_SOCKET_RECV: usize = nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_SOCKET_RECV_REPLY_SIZE;
+pub const NET_MAX_SOCKET_RECV: usize =
+    nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_SOCKET_RECV_REPLY_SIZE;
 
 /// Maximum bytes one ICMP request can carry.
 pub const NET_MAX_ICMP_PAYLOAD: usize = nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_ICMP_REQUEST_SIZE;
@@ -507,36 +509,19 @@ const _: () = assert!(core::mem::offset_of!(NetSendRequest, port) == 12);
 const _: () = assert!(core::mem::offset_of!(NetRecvRequest, port) == 8);
 const _: () = assert!(core::mem::offset_of!(NetRecvRequest, max_len) == 10);
 
-const _: () = assert!(
-    core::mem::size_of::<NetSocketOpenRequest>() == NET_SOCKET_OPEN_REQUEST_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketOpenReply>() == NET_SOCKET_OPEN_REPLY_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketConnectRequest>() == NET_SOCKET_CONNECT_REQUEST_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketConnectReply>() == NET_SOCKET_CONNECT_REPLY_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketSendRequest>() == NET_SOCKET_SEND_REQUEST_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketSendReply>() == NET_SOCKET_SEND_REPLY_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketRecvRequest>() == NET_SOCKET_RECV_REQUEST_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketRecvReply>() == NET_SOCKET_RECV_REPLY_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketCloseRequest>() == NET_SOCKET_CLOSE_REQUEST_SIZE
-);
-const _: () = assert!(
-    core::mem::size_of::<NetSocketCloseReply>() == NET_SOCKET_CLOSE_REPLY_SIZE
-);
+const _: () = assert!(core::mem::size_of::<NetSocketOpenRequest>() == NET_SOCKET_OPEN_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketOpenReply>() == NET_SOCKET_OPEN_REPLY_SIZE);
+const _: () =
+    assert!(core::mem::size_of::<NetSocketConnectRequest>() == NET_SOCKET_CONNECT_REQUEST_SIZE);
+const _: () =
+    assert!(core::mem::size_of::<NetSocketConnectReply>() == NET_SOCKET_CONNECT_REPLY_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketSendRequest>() == NET_SOCKET_SEND_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketSendReply>() == NET_SOCKET_SEND_REPLY_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketRecvRequest>() == NET_SOCKET_RECV_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketRecvReply>() == NET_SOCKET_RECV_REPLY_SIZE);
+const _: () =
+    assert!(core::mem::size_of::<NetSocketCloseRequest>() == NET_SOCKET_CLOSE_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketCloseReply>() == NET_SOCKET_CLOSE_REPLY_SIZE);
 const _: () = assert!(core::mem::size_of::<NetIcmpRequest>() == NET_ICMP_REQUEST_SIZE);
 const _: () = assert!(core::mem::size_of::<NetIcmpReply>() == NET_ICMP_REPLY_SIZE);
 const _: () = assert!(core::mem::size_of::<NetDhcpRequest>() == NET_DHCP_REQUEST_SIZE);
@@ -573,14 +558,14 @@ mod tests {
         NET_MAX_SOCKET_RECV, NET_RECV_REPLY_SIZE, NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE,
         NET_RESOLVE_REQUEST_SIZE, NET_SEND_REPLY_SIZE, NET_SEND_REQUEST_SIZE,
         NET_SOCKET_CLOSE_REPLY_SIZE, NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE,
-        NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
-        NET_SOCKET_OPEN_REQUEST_SIZE, NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE,
-        NET_SOCKET_SEND_REPLY_SIZE, NET_SOCKET_SEND_REQUEST_SIZE, NET_VERSION,
-        NetDhcpReply, NetDhcpRequest, NetIcmpReply, NetIcmpRequest, NetLinkReply, NetLinkRequest,
-        NetRecvReply, NetRecvRequest, NetResolveReply, NetResolveRequest, NetSendReply,
-        NetSendRequest, NetSocketCloseReply, NetSocketCloseRequest, NetSocketConnectReply,
-        NetSocketConnectRequest, NetSocketOpenReply, NetSocketOpenRequest, NetSocketRecvReply,
-        NetSocketRecvRequest, NetSocketSendReply, NetSocketSendRequest,
+        NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE, NET_SOCKET_OPEN_REQUEST_SIZE,
+        NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE, NET_SOCKET_SEND_REPLY_SIZE,
+        NET_SOCKET_SEND_REQUEST_SIZE, NET_VERSION, NetDhcpReply, NetDhcpRequest, NetIcmpReply,
+        NetIcmpRequest, NetLinkReply, NetLinkRequest, NetRecvReply, NetRecvRequest,
+        NetResolveReply, NetResolveRequest, NetSendReply, NetSendRequest, NetSocketCloseReply,
+        NetSocketCloseRequest, NetSocketConnectReply, NetSocketConnectRequest, NetSocketOpenReply,
+        NetSocketOpenRequest, NetSocketRecvReply, NetSocketRecvRequest, NetSocketSendReply,
+        NetSocketSendRequest,
     };
     use crate::ProtocolVersion;
 
@@ -681,9 +666,15 @@ mod tests {
             core::mem::size_of::<NetSocketCloseReply>(),
             NET_SOCKET_CLOSE_REPLY_SIZE
         );
-        assert_eq!(core::mem::size_of::<NetIcmpRequest>(), NET_ICMP_REQUEST_SIZE);
+        assert_eq!(
+            core::mem::size_of::<NetIcmpRequest>(),
+            NET_ICMP_REQUEST_SIZE
+        );
         assert_eq!(core::mem::size_of::<NetIcmpReply>(), NET_ICMP_REPLY_SIZE);
-        assert_eq!(core::mem::size_of::<NetDhcpRequest>(), NET_DHCP_REQUEST_SIZE);
+        assert_eq!(
+            core::mem::size_of::<NetDhcpRequest>(),
+            NET_DHCP_REQUEST_SIZE
+        );
         assert_eq!(core::mem::size_of::<NetDhcpReply>(), NET_DHCP_REPLY_SIZE);
     }
 

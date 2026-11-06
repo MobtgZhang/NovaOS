@@ -194,7 +194,9 @@ pub fn send_udp_from(
     destination_port: u16,
     payload: &[u8],
 ) -> Result<(), NetError> {
-    let result = with_net(|device| device.send_udp_from(source_port, destination, destination_port, payload))?;
+    let result = with_net(|device| {
+        device.send_udp_from(source_port, destination, destination_port, payload)
+    })?;
     result
 }
 
@@ -240,7 +242,8 @@ pub fn icmp_echo(
     payload: &[u8],
     out: &mut [u8],
 ) -> Result<usize, NetError> {
-    let result = with_net(|device| device.icmp_echo(destination, identifier, sequence, payload, out))?;
+    let result =
+        with_net(|device| device.icmp_echo(destination, identifier, sequence, payload, out))?;
     result
 }
 
