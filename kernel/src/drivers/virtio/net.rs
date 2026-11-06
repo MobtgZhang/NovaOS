@@ -41,12 +41,12 @@ use crate::klog;
 use crate::logger::Level;
 use crate::mm::{direct_map, frame_allocator};
 use nova_net::{
-    BROADCAST_MAC, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, ETHERTYPE_IPV4, IP_PROTOCOL_ICMP,
+    BROADCAST_MAC, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpReply, ETHERTYPE_IPV4, IP_PROTOCOL_ICMP,
     IP_PROTOCOL_TCP, IP_PROTOCOL_UDP, Ipv4Addr, MacAddr, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
-    build_arp_request, build_dhcp_discover, build_dhcp_request, build_dns_query, build_ethernet,
-    build_icmp_echo_request, build_ipv4, build_tcp, build_udp, parse_arp_reply, parse_dhcp_reply,
-    parse_dns_a_record, parse_ethernet, parse_icmp_echo_reply, parse_ipv4, parse_tcp, parse_udp,
-    DhcpReply, TcpSegment,
+    TcpSegment, build_arp_request, build_dhcp_discover, build_dhcp_request, build_dns_query,
+    build_ethernet, build_icmp_echo_request, build_ipv4, build_tcp, build_udp, parse_arp_reply,
+    parse_dhcp_reply, parse_dns_a_record, parse_ethernet, parse_icmp_echo_reply, parse_ipv4,
+    parse_tcp, parse_udp,
 };
 
 /// `VIRTIO_NET_F_MAC`: the device configuration structure carries a MAC.
@@ -526,7 +526,13 @@ impl VirtioNet {
     ) -> Result<(), NetError> {
         let destination_mac = self.resolve_destination_mac(destination)?;
         self.prime_receive()?;
-        self.send_udp_to(destination, destination_mac, source_port, destination_port, payload)
+        self.send_udp_to(
+            destination,
+            destination_mac,
+            source_port,
+            destination_port,
+            payload,
+        )
     }
 
     /// Send one UDP datagram to a known destination MAC.
@@ -600,7 +606,11 @@ impl VirtioNet {
     }
 
     /// Open a TCP connection with a SYN / SYN-ACK / ACK handshake.
-    pub fn connect_tcp(&mut self, destination: Ipv4Addr, port: u16) -> Result<TcpConnection, NetError> {
+    pub fn connect_tcp(
+        &mut self,
+        destination: Ipv4Addr,
+        port: u16,
+    ) -> Result<TcpConnection, NetError> {
         self.connect_tcp_from(destination, port, TCP_SOURCE_PORT)
     }
 
@@ -641,7 +651,8 @@ impl VirtioNet {
         let mut buffer = [0u8; MAX_FRAME_BYTES];
         for attempt in 0..LOOKUP_ATTEMPTS {
             let frame_length = self.poll_receive(&mut buffer)?;
-            let Some(segment) = self.parse_tcp_frame(&buffer[..frame_length], port, local_port) else {
+            let Some(segment) = self.parse_tcp_frame(&buffer[..frame_length], port, local_port)
+            else {
                 if attempt + 1 < LOOKUP_ATTEMPTS {
                     self.prime_receive()?;
                 }
@@ -691,7 +702,11 @@ impl VirtioNet {
     }
 
     /// Send bytes on an already-connected TCP connection.
-    pub fn send_tcp(&mut self, connection: &mut TcpConnection, payload: &[u8]) -> Result<(), NetError> {
+    pub fn send_tcp(
+        &mut self,
+        connection: &mut TcpConnection,
+        payload: &[u8],
+    ) -> Result<(), NetError> {
         let mut tcp = [0u8; MAX_FRAME_BYTES];
         let tcp_length = build_tcp(
             LINK_ADDRESS,
@@ -795,14 +810,9 @@ impl VirtioNet {
         tcp: &[u8],
     ) -> Result<(), NetError> {
         let mut packet = [0u8; MAX_FRAME_BYTES];
-        let packet_length = build_ipv4(
-            LINK_ADDRESS,
-            destination,
-            IP_PROTOCOL_TCP,
-            tcp,
-            &mut packet,
-        )
-        .ok_or(NetError::FrameTooLong)?;
+        let packet_length =
+            build_ipv4(LINK_ADDRESS, destination, IP_PROTOCOL_TCP, tcp, &mut packet)
+                .ok_or(NetError::FrameTooLong)?;
 
         let mut frame = [0u8; MAX_FRAME_BYTES];
         let frame_length = build_ethernet(
@@ -859,21 +869,39 @@ impl VirtioNet {
         for attempt in 0..LOOKUP_ATTEMPTS {
             let length = self.poll_receive(&mut buffer)?;
             let Some(ethernet) = parse_ethernet(&buffer[..length]) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             };
             if ethernet.ethertype != ETHERTYPE_IPV4 {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             }
             let Some(packet) = parse_ipv4(ethernet.payload) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             };
             if packet.protocol != IP_PROTOCOL_ICMP || packet.source != destination {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             }
             let Some(reply) = parse_icmp_echo_reply(packet.payload) else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             };
             if reply.identifier != identifier || reply.sequence != sequence {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
                 continue;
             }
             if reply.payload.len() > out.len() {
@@ -890,16 +918,21 @@ impl VirtioNet {
         let xid = 0x1234_5678u32;
 
         let mut discover = [0u8; MAX_FRAME_BYTES];
-        let discover_length = build_dhcp_discover(self.mac, xid, &mut discover)
-            .ok_or(NetError::FrameTooLong)?;
+        let discover_length =
+            build_dhcp_discover(self.mac, xid, &mut discover).ok_or(NetError::FrameTooLong)?;
         self.prime_receive()?;
-        self.send_udp_broadcast(DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &discover[..discover_length])?;
+        self.send_udp_broadcast(
+            DHCP_CLIENT_PORT,
+            DHCP_SERVER_PORT,
+            &discover[..discover_length],
+        )?;
 
         let mut buffer = [0u8; MAX_FRAME_BYTES];
         let mut offer = None;
         for attempt in 0..LOOKUP_ATTEMPTS {
             let length = self.poll_receive(&mut buffer)?;
-            let Some(datagram) = self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
+            let Some(datagram) =
+                self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
             else {
                 if attempt + 1 < LOOKUP_ATTEMPTS {
                     self.prime_receive()?;
@@ -929,12 +962,19 @@ impl VirtioNet {
         let request_length = build_dhcp_request(self.mac, xid, offer.address, server, &mut request)
             .ok_or(NetError::FrameTooLong)?;
         self.prime_receive()?;
-        self.send_udp_to(server, server_mac, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, &request[..request_length])?;
+        self.send_udp_to(
+            server,
+            server_mac,
+            DHCP_CLIENT_PORT,
+            DHCP_SERVER_PORT,
+            &request[..request_length],
+        )?;
 
         let mut buffer = [0u8; MAX_FRAME_BYTES];
         for attempt in 0..LOOKUP_ATTEMPTS {
             let length = self.poll_receive(&mut buffer)?;
-            let Some(datagram) = self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
+            let Some(datagram) =
+                self.parse_udp_frame(&buffer[..length], DHCP_SERVER_PORT, DHCP_CLIENT_PORT)
             else {
                 if attempt + 1 < LOOKUP_ATTEMPTS {
                     self.prime_receive()?;
@@ -1000,7 +1040,6 @@ impl VirtioNet {
         }
         Some(datagram.payload)
     }
-
 
     /// Receive one UDP datagram whose source port is `port`.
     pub fn receive_udp(&mut self, port: u16, out: &mut [u8]) -> Result<usize, NetError> {
