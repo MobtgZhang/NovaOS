@@ -76,7 +76,7 @@ sequenceDiagram
 | Main language | **Rust** (`no_std` in the kernel, plus minimal assembly where needed) |
 | CPU architecture | **x86-64** first; AArch64 in the future |
 | Development platform | **QEMU** with UEFI/OVMF |
-| Boot protocol | **Limine** |
+| Boot protocol | **Limine** (`make run`, current); **NovaBoot** UEFI menu layer (protocol crate implemented, kernel hand-off planned) |
 | Executable format | **ELF64** and a NovaOS-specific ABI |
 | Initial device targets | Serial, timers, framebuffer, and VirtIO |
 | Tooling | Cargo, `make`, QEMU, GDB, and the `xtask` workflow |
@@ -109,6 +109,8 @@ NovaOS/
 │   ├── nova-abi/         # Shared syscall and ABI definitions
 │   ├── nova-ipc/         # User-space IPC library
 │   ├── nova-cap/         # Typed capability handles
+│   ├── nova-boot/        # NovaBoot unified boot protocol (protocol snapshot + bounded boot menu)
+│   ├── nova-boot-menu/   # UEFI application rendering the NovaBoot boot menu (x86_64-unknown-uefi)
 │   ├── nova-net/         # Host-testable Ethernet, ARP, IPv4, UDP, DNS formats
 │   ├── nova-protocols/   # Versioned service wire contracts
 │   └── nova-async/       # Async runtime
@@ -191,6 +193,19 @@ The SMP phase is a tested foundation, not a claim that the whole system is concu
 - The APIC timer uses periodic mode; its handler acknowledges the interrupt on the delivering CPU and accounts that CPU's own scheduler tick.
 - The timer's no-current-thread path restores the saved `r15..rax` register file before returning, rather than resuming through the frame alone.
 - `make run` and `cargo xtask run` both boot with `-smp 4`; the `smp_cpu_state` suite checks processor capture, AP online state, separate idle pools, per-CPU stacks/TSS, and per-AP scheduler ticks.
+
+### UEFI boot menu (NovaBoot protocol) — planned
+
+A separate UEFI boot-menu layer is implemented on top of the [`nova-boot`] protocol crate. It is **not** yet wired to hand control to the kernel, so `make run` (Limine) remains the only verified boot path; this section documents the design boundary rather than a shipped feature.
+
+- `crates/nova-boot` defines the architecture-neutral [`BootProtocol`] snapshot (magic, version, target architecture, kernel entry/load address, CPU table, memory map, framebuffer) and a bounded [`BootMenu`] model, all validated on the host.
+- `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that reads a menu config from the ESP, renders the menu through the UEFI text console, navigates it with the keyboard, and on selection loads the chosen kernel ELF and prints its entry point.
+- The menu covers four target families (`x86_64`, `aarch64`, `riscv64`, `loongarch64`) in the protocol model, but only x86-64 has a kernel backend today; the other entries are placeholders.
+- The missing piece to actually boot through the menu is the kernel-side consumer: reading and validating the `BootProtocol` snapshot (instead of Limine's exported symbols) and transferring control at the entry point. That hand-off is deliberately not claimed here.
+
+[`nova-boot`]: crates/nova-boot
+[`BootProtocol`]: crates/nova-boot#the-snapshot-a-bootloader-publishes-to-the-kernel
+[`BootMenu`]: crates/nova-boot#a-bounded-menu-model
 
 ### Quality gates
 

@@ -17,7 +17,7 @@ nova-run = "run --package xtask --"
 # it today (its manifest sets `test = false`), but `cargo clippy --all-targets`
 # does, and it fails there — so the exclusion is kept explicit rather than
 # relying on the manifest's current setting.
-nova-test-host = "test --workspace --exclude nova-kernel --exclude nova-rt --exclude xtask"
+nova-test-host = "test --workspace --exclude nova-kernel --exclude nova-rt --exclude xtask --exclude nova-boot-menu"
 
 # The quality gates, as one word each.
 #
@@ -32,8 +32,12 @@ nova-test-host = "test --workspace --exclude nova-kernel --exclude nova-rt --exc
 # where it is a real program. It is not part of `nova-clippy` because a
 # `--target` cannot be combined with `--workspace`, and the two need different
 # targets.
+#
+# `nova-boot-menu` is also excluded: it is a UEFI application (`no_std` /
+# `no_main`, `uefi::entry`) that only builds for a UEFI target such as
+# `x86_64-unknown-uefi`, never for the host.
 nova-fmt = "fmt --all -- --check"
-nova-clippy = "clippy --workspace --exclude nova-kernel --exclude nova-rt --all-targets -- -D warnings"
+nova-clippy = "clippy --workspace --exclude nova-kernel --exclude nova-rt --exclude nova-boot-menu --all-targets -- -D warnings"
 nova-clippy-kernel = "clippy --package nova-kernel --package nova-rt --target x86_64-unknown-none -- -D warnings"
 
 # The bare-metal build, for both binaries the ISO carries.

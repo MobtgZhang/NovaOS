@@ -1,0 +1,12 @@
+[package]
+name = "nova-boot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Architecture-neutral NovaBoot protocol and boot menu model"
+
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

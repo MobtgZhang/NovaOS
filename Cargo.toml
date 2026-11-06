@@ -7,6 +7,8 @@ resolver = "3"
 members = [
     "kernel",
     "crates/nova-abi",
+    "crates/nova-boot",
+    "crates/nova-boot-menu",
     "crates/nova-cap",
     "crates/nova-core",
     "crates/nova-elf",
@@ -39,6 +41,7 @@ members = [
 # deliberate sweep — it is only the *implicit* default that changes.
 default-members = [
     "crates/nova-abi",
+    "crates/nova-boot",
     "crates/nova-cap",
     "crates/nova-core",
     "crates/nova-elf",

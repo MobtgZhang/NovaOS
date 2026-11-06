@@ -20,6 +20,7 @@ records of the same kind of thing, and both are written to be argued with.
 | [0003-address-layout.md](0003-address-layout.md) | A derived address layout, frozen in one document | Accepted |
 | [0004-x86-64-exception-frame.md](0004-x86-64-exception-frame.md) | The measured x86-64 exception-frame layout, and the uniformised frame | Accepted |
 | [0005-smp.md](0005-smp.md) | A per-CPU SMP foundation with bootstrap-owned services | Accepted |
+| [0006-uefi-boot-menu.md](0006-uefi-boot-menu.md) | A UEFI boot menu layer over the NovaBoot unified boot protocol | Accepted |
 
 ## What each one is about
 
@@ -55,6 +56,13 @@ cause.
 TSS, and APIC state are real and verified, while user processes, services, and
 drivers stay bootstrap-owned. It also records why CPUID leaf 1, rather than the
 xAPIC ID register, is the CPU identity on the tested QEMU platform.
+
+**0006** records the NovaBoot unified boot protocol and a UEFI boot-menu
+application. It decides that the protocol crate and the menu are real and
+QEMU-verifiable, but that transferring control to the kernel through this path
+is deferred: `make run` keeps booting through Limine, and the menu halts after
+printing the selected entry's details until a kernel-side `BootProtocol`
+consumer exists.
 
 ## Reading order
 
