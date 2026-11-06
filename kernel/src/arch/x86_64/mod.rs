@@ -152,3 +152,21 @@ pub unsafe fn arch_init() {
     // before the IDT: an IRQ arriving in between would land on a zeroed gate.
     intr::init();
 }
+
+/// Install per-CPU tables on an application processor.
+///
+/// The shared IDT is already filled by the bootstrap processor; the AP only
+/// loads it into its own register. The AP's own GDT/TSS are installed so its
+/// timer interrupts use its own stack.
+///
+/// # Safety
+///
+/// Must run on the AP, with interrupts masked, after it has switched to its own
+/// kernel stack and after the bootstrap processor's IDT exists.
+pub unsafe fn init_cpu(cpu: usize) {
+    // SAFETY: delegated to this function's contract.
+    unsafe {
+        gdt::init_cpu(cpu);
+        idt::load();
+    }
+}

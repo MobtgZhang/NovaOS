@@ -19,6 +19,7 @@ records of the same kind of thing, and both are written to be argued with.
 | [0002-stable-vs-nightly.md](0002-stable-vs-nightly.md) | Nightly Rust, pinned in `rust-toolchain.toml` | Accepted |
 | [0003-address-layout.md](0003-address-layout.md) | A derived address layout, frozen in one document | Accepted |
 | [0004-x86-64-exception-frame.md](0004-x86-64-exception-frame.md) | The measured x86-64 exception-frame layout, and the uniformised frame | Accepted |
+| [0005-smp.md](0005-smp.md) | A per-CPU SMP foundation with bootstrap-owned services | Accepted |
 
 ## What each one is about
 
@@ -50,13 +51,19 @@ every error-code-carrying vector. It is also the longest, because the
 failure it exists to prevent produced symptoms that pointed nowhere near the
 cause.
 
+**0005** records the SMP foundation. It decides that per-CPU scheduler, stack,
+TSS, and APIC state are real and verified, while user processes, services, and
+drivers stay bootstrap-owned. It also records why CPUID leaf 1, rather than the
+xAPIC ID register, is the CPU identity on the tested QEMU platform.
+
 ## Reading order
 
 The records are not independent. 0001 and 0002 decide what the kernel is
-built from and with; 0003 and 0004 decide what it looks like once running.
-A reader new to the tree should read 0003 and 0004 first — they describe the
-machine the kernel actually programs — and then 0001 and 0002, which explain
-how it got here.
+built from and with; 0003 and 0004 decide what it looks like once running;
+0005 decides how far that machine is allowed to run concurrently. A reader new
+to the tree should read 0003 and 0004 first — they describe the machine the
+kernel actually programs — then 0001 and 0002, which explain how it got here,
+and 0005, which states what SMP currently does and does not claim.
 
 ## Adding a record
 

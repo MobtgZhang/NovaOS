@@ -155,11 +155,7 @@ fn qemu_command(
         "q35,accel=tcg".to_string(),
     ));
     command.extend(device("-cpu", "qemu64".to_string()));
-    command.extend(device("-smp", "1".to_string()));
-    command.push("-d".to_string());
-    command.push("trace:apic_local_deliver".to_string());
-    command.push("-d".to_string());
-    command.push("trace:apic_register_write".to_string());
+    command.extend(device("-smp", "4".to_string()));
     command.extend(device("-m", format!("{}M", crate::qemu::MEMORY_MIB)));
 
     // Two pflash drives: a read-only firmware and a writable variable store.
@@ -589,7 +585,7 @@ mod tests {
             joined.contains("accel=tcg"),
             "no KVM in the reference environment"
         );
-        assert!(joined.contains("-smp 1"), "single CPU");
+        assert!(joined.contains("-smp 4"), "four CPUs");
         assert!(joined.contains("-m 256M"), "memory size");
         assert!(joined.contains("if=pflash"), "OVMF needs pflash, not -bios");
         assert!(

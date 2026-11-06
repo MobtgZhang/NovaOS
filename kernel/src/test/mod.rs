@@ -36,6 +36,7 @@ pub mod m34;
 pub mod m5;
 pub mod m6;
 pub mod m7;
+pub mod smp;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -99,6 +100,8 @@ pub const SUITE_NAMES: &[&str] = &[
     "net_icmp_echo",
     "net_dhcp_lease",
     "net_socket_api",
+    // M8: SMP bring-up.
+    "smp_cpu_state",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

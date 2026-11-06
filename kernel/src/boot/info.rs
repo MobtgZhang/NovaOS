@@ -28,6 +28,13 @@ pub const MAX_MEMMAP_ENTRIES: usize = 128;
 /// before the kernel panics.
 pub const MAX_PROBLEMS: usize = 12;
 
+/// The largest number of processors the kernel can bring up.
+///
+/// This is a storage bound, not a hardware claim: every per-CPU state table is a
+/// static array, so a machine reporting more processors than this is refused at
+/// boot instead of having its later CPUs silently ignored.
+pub const MAX_CPUS: usize = 8;
+
 /// Length of the fixed buffers holding bootloader name and version.
 const NAME_LEN: usize = 32;
 
@@ -82,6 +89,12 @@ pub enum Problem {
     NoRegions,
     /// Regions were present but none were allocatable.
     NoUsableRegions,
+    /// The bootloader reported no processor information.
+    NoCpuInformation,
+    /// More processors were reported than the kernel's static tables hold.
+    TooManyCpus,
+    /// Two processors were reported with the same local APIC identifier.
+    DuplicateCpuId,
 }
 
 impl Problem {
@@ -98,6 +111,9 @@ impl Problem {
             Problem::TooManyEntries => "memory map exceeded the inline capacity",
             Problem::NoRegions => "memory map reports no regions at all",
             Problem::NoUsableRegions => "memory map reports zero allocatable bytes",
+            Problem::NoCpuInformation => "bootloader reported no processor information",
+            Problem::TooManyCpus => "processor count exceeds the kernel's static CPU table",
+            Problem::DuplicateCpuId => "two processors report the same local APIC identifier",
         }
     }
 }
@@ -204,10 +220,26 @@ pub struct BootInfo {
     /// here because the bootloader may reclaim its own pages the moment
     /// control transfers — this snapshot is the only copy that survives.
     pub framebuffer: Option<FramebufferInfo>,
+    /// The number of processors the bootloader handed over.
+    ///
+    /// This includes the bootstrap processor. A bootloader with no MP support
+    /// reports one CPU, so a single-processor boot is still a valid snapshot.
+    pub cpu_count: usize,
+    /// Local APIC identifiers, bootstrap processor first.
+    ///
+    /// The bootloader's own `MpInfo` pointers are not retained: this is the
+    /// kernel-owned copy, and it is what ties a running CPU back to its
+    /// per-CPU state.
+    pub cpu_ids: [u32; MAX_CPUS],
+    /// The bootstrap processor's local APIC identifier.
+    pub bsp_lapic_id: u32,
 }
 
 impl BootInfo {
-    /// An all-zero snapshot, used to initialise the storage before capture.
+    /// An unpopulated snapshot, used to initialise the storage before capture.
+    ///
+    /// It describes one processor with identifier zero so validation of the
+    /// storage shape is coherent before the bootloader reports the real CPUs.
     pub const fn empty() -> Self {
         Self {
             protocol_revision: 0,
@@ -221,6 +253,9 @@ impl BootInfo {
             }; MAX_MEMMAP_ENTRIES],
             memmap_len: 0,
             framebuffer: None,
+            cpu_count: 1,
+            cpu_ids: [0; MAX_CPUS],
+            bsp_lapic_id: 0,
         }
     }
 
@@ -253,6 +288,33 @@ impl BootInfo {
     /// The bootloader version as a NUL-trimmed string, or `"unknown"`.
     pub fn bootloader_version(&self) -> &str {
         trimmed(&self.bootloader_version)
+    }
+
+    /// The number of captured processors.
+    pub fn processor_count(&self) -> usize {
+        self.cpu_count.min(MAX_CPUS)
+    }
+
+    /// The captured local APIC identifier at `index`.
+    pub fn processor_id(&self, index: usize) -> Option<u32> {
+        if index < self.processor_count() {
+            Some(self.cpu_ids[index])
+        } else {
+            None
+        }
+    }
+
+    /// The per-CPU slot whose local APIC identifier is `lapic_id`.
+    ///
+    /// The kernel uses this to turn the hardware's APIC ID into the index of
+    /// its own per-CPU scheduler, GDT, TSS, stack, and thread pool.
+    pub fn cpu_index_of_lapic_id(&self, lapic_id: u32) -> Option<usize> {
+        for index in 0..self.processor_count() {
+            if self.cpu_ids[index] == lapic_id {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// The firmware framebuffer, when one was captured.
@@ -334,6 +396,23 @@ impl BootInfo {
 
         if self.memmap_len > 0 && !has_usable {
             record(&mut result, Problem::NoUsableRegions);
+        }
+
+        // Processor information is part of the boot snapshot. A count outside
+        // the static table, or duplicate APIC identifiers, would make the
+        // hardware-to-CPU-index lookup ambiguous and later table accesses wrong.
+        if self.cpu_count == 0 {
+            record(&mut result, Problem::NoCpuInformation);
+        }
+        if self.cpu_count > MAX_CPUS {
+            record(&mut result, Problem::TooManyCpus);
+        }
+        for index in 0..self.cpu_count.min(MAX_CPUS) {
+            for other in 0..index {
+                if self.cpu_ids[index] == self.cpu_ids[other] {
+                    record(&mut result, Problem::DuplicateCpuId);
+                }
+            }
         }
 
         result

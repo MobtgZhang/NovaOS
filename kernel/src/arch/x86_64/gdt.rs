@@ -9,6 +9,7 @@ use core::cell::UnsafeCell;
 use core::ptr::{addr_of, addr_of_mut};
 
 use crate::arch::capabilities::{ByteSink, Console};
+use crate::boot::info::MAX_CPUS;
 use crate::klog;
 use crate::logger::Level;
 
@@ -553,6 +554,32 @@ static mut GDT: Gdt = Gdt {
 #[unsafe(no_mangle)]
 pub static mut nova_kernel_tss: TaskStateSegment = TaskStateSegment::zeroed();
 
+/// Per-application-processor GDTs.
+///
+/// Slot 0 is left unused because the bootstrap processor's global table owns
+/// slot zero; the AP tables are indexed by their CPU slot, including a slot for
+/// the bootstrap processor that is never installed. The layout inside each table
+/// is identical, so the IDT's numeric selectors work on every processor.
+static mut AP_GDT: [Gdt; MAX_CPUS] = [const {
+    Gdt {
+        entries: [0; GDT_SLOTS],
+    }
+}; MAX_CPUS];
+
+/// Per-application-processor TSSs.
+///
+/// The bootstrap processor keeps [`nova_kernel_tss`] because the syscall entry
+/// stub names it directly. APs get their own TSS through `ltr`, which is what
+/// makes their timer interrupts land on their own stacks.
+static mut AP_TSS: [TaskStateSegment; MAX_CPUS] = [const { TaskStateSegment::zeroed() }; MAX_CPUS];
+
+/// Per-application-processor GDT pseudo-descriptors.
+///
+/// Kept separate so two APs initializing at the same time cannot overwrite one
+/// another's `lgdt` operand.
+static mut AP_GDT_DESCRIPTORS: [AlignedPseudoDescriptor; MAX_CPUS] =
+    [const { AlignedPseudoDescriptor([0; 10]) }; MAX_CPUS];
+
 /// A stack buffer the CPU may load as a stack pointer.
 ///
 /// The `align(16)` goes on the *type*, not the static: `#[repr(align(..))]` is a
@@ -735,6 +762,40 @@ pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
     }
 }
 
+/// Move an application processor onto its own kernel stack and continue its
+/// startup path.
+///
+/// The CPU number is passed in the SysV first argument register so the
+/// continuation can select the AP's per-CPU tables. The calling frame on the
+/// bootloader's stack is abandoned and must never be unwound.
+///
+/// # Safety
+///
+/// Called only from Limine's AP entry, with interrupts masked, after the AP's
+/// readiness gate has opened.
+pub unsafe fn switch_to_kernel_stack_for_cpu_and_continue(cpu: usize) -> ! {
+    assert!(cpu < MAX_CPUS, "CPU index exceeds the static stack table");
+    let top = kernel_stack_top_for_cpu(cpu);
+    assert!(
+        top % 16 == 0,
+        "the AP kernel stack top is not 16-byte aligned; the CPU faults on use"
+    );
+
+    // SAFETY: delegated to this function's contract. `top` is the AP's own
+    // stack top, and `rdi` carries the CPU index to the continuation.
+    unsafe {
+        asm!(
+            "mov rsp, {top}",
+            "mov rdi, {cpu}",
+            "jmp {continuation}",
+            top = in(reg) top,
+            cpu = in(reg) cpu,
+            continuation = sym crate::boot_after_ap_stack_switch,
+            options(nomem, noreturn),
+        )
+    }
+}
+
 /// The dedicated stack that exceptions arriving from ring 3 land on.
 ///
 /// A separate stack is mandatory, not a convenience: if a user thread overflowed
@@ -754,6 +815,18 @@ pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
 /// loads from the TSS, and `AlignedStack`'s `UnsafeCell` is what makes that
 /// sound without claiming Rust-level mutation.
 static FAULT_STACK: AlignedStack<FAULT_STACK_SIZE> = AlignedStack::new();
+
+/// Per-application-processor boot stacks.
+///
+/// Each AP enters on the bootloader's handover stack, then switches here before
+/// installing its own tables. The stack is what the AP's idle thread and its
+/// early startup code run on.
+static AP_KERNEL_STACKS: [AlignedStack<KERNEL_STACK_SIZE>; MAX_CPUS] =
+    [const { AlignedStack::new() }; MAX_CPUS];
+
+/// Per-application-processor fault stacks.
+static AP_FAULT_STACKS: [AlignedStack<FAULT_STACK_SIZE>; MAX_CPUS] =
+    [const { AlignedStack::new() }; MAX_CPUS];
 
 /// Borrow the TSS.
 ///
@@ -784,6 +857,70 @@ pub unsafe fn set_privilege_stack(rsp0: u64) {
     // field happens to be aligned.
     unsafe {
         (&raw mut (*addr_of_mut!(nova_kernel_tss)).privilege_stack_table[0]).write(rsp0);
+    }
+}
+
+/// Set the ring 0 stack pointer for a specific CPU.
+///
+/// CPU zero uses the bootstrap processor's TSS; an AP uses `AP_TSS[cpu]`.
+/// The scheduler calls this before resuming a thread, so the CPU's next
+/// privilege transition lands on that thread's stack.
+///
+/// # Safety
+///
+/// `rsp0` must be a valid, 16-byte-aligned stack top in kernel space.
+pub unsafe fn set_privilege_stack_for_cpu(cpu: usize, rsp0: u64) {
+    if cpu == 0 {
+        // SAFETY: delegated to this function's contract.
+        unsafe { set_privilege_stack(rsp0) }
+        return;
+    }
+
+    assert!(cpu < MAX_CPUS, "CPU index exceeds the static TSS table");
+
+    // SAFETY: delegated to this function's contract. The TSS is packed, so the
+    // write goes through a raw pointer to its fixed `RSP0` field.
+    unsafe {
+        (&raw mut (*addr_of_mut!(AP_TSS[cpu])).privilege_stack_table[0]).write(rsp0);
+    }
+}
+
+/// The `RSP0` currently installed for a CPU.
+pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
+    // SAFETY: the TSS tables are boot-installed and then read by the scheduler.
+    unsafe {
+        let tss = if cpu == 0 {
+            addr_of!(nova_kernel_tss) as *const TaskStateSegment
+        } else if cpu < MAX_CPUS {
+            addr_of!(AP_TSS[cpu]) as *const TaskStateSegment
+        } else {
+            return 0;
+        };
+        // `privilege_stack_table` is at offset 8; the first entry is one word
+        // into the structure.
+        core::ptr::read_unaligned(tss.cast::<u64>().add(1))
+    }
+}
+
+/// The kernel boot-stack top for a CPU.
+pub fn kernel_stack_top_for_cpu(cpu: usize) -> u64 {
+    if cpu == 0 {
+        KERNEL_STACK.top()
+    } else if cpu < MAX_CPUS {
+        AP_KERNEL_STACKS[cpu].top()
+    } else {
+        0
+    }
+}
+
+/// The fault-stack top for a CPU.
+pub fn fault_stack_top_for_cpu(cpu: usize) -> u64 {
+    if cpu == 0 {
+        FAULT_STACK.top()
+    } else if cpu < MAX_CPUS {
+        AP_FAULT_STACKS[cpu].top()
+    } else {
+        0
     }
 }
 
@@ -957,6 +1094,99 @@ pub unsafe fn init() {
             KERNEL_STACK.top(),
             FAULT_STACK.top(),
         );
+    }
+}
+
+/// Install the bootstrap processor's tables, or an application processor's.
+///
+/// # Safety
+///
+/// `cpu` must be within the static CPU table. CPU zero uses the bootstrap
+/// processor's global GDT/TSS; an AP uses its own arrays and must be running on
+/// its own kernel stack.
+pub unsafe fn init_cpu(cpu: usize) {
+    if cpu == 0 {
+        // SAFETY: the bootstrap path is the original one-time installation.
+        unsafe { init() }
+    } else {
+        // SAFETY: delegated to `init_ap`'s contract.
+        unsafe { init_ap(cpu) }
+    }
+}
+
+/// Install an application processor's GDT and TSS.
+///
+/// The table layout and selectors are the same as the bootstrap processor's, so
+/// the single IDT can be used unchanged. The difference is the TSS descriptor:
+/// it points at `AP_TSS[cpu]`, because the AP's timer interrupts must land on
+/// the AP's own stack.
+///
+/// # Safety
+///
+/// Must run on the AP, with interrupts masked, after the AP has switched to its
+/// own kernel stack. Must not run on CPU zero.
+unsafe fn init_ap(cpu: usize) {
+    assert!(cpu > 0, "CPU zero uses the bootstrap processor's GDT");
+    assert!(cpu < MAX_CPUS, "CPU index exceeds the static table");
+
+    // SAFETY: delegated to this function's contract.
+    unsafe {
+        let gdt_base = addr_of_mut!(AP_GDT[cpu]);
+
+        write_slot(gdt_base, 0, encode(null_descriptor()));
+        write_slot(
+            gdt_base,
+            1,
+            encode(code_segment(KERNEL_CODE_SELECTOR, DPL_RING0)),
+        );
+        write_slot(
+            gdt_base,
+            2,
+            encode(data_segment(KERNEL_DATA_SELECTOR, DPL_RING0)),
+        );
+        write_slot(
+            gdt_base,
+            USER_CODE_INDEX,
+            encode(code_segment(USER_CODE_SELECTOR, DPL_RING3)),
+        );
+        write_slot(
+            gdt_base,
+            USER_DATA_INDEX,
+            encode(data_segment(USER_DATA_SELECTOR, DPL_RING3)),
+        );
+
+        let tss = addr_of_mut!(AP_TSS[cpu]);
+        let kernel_top = AP_KERNEL_STACKS[cpu].top();
+        let fault_top = AP_FAULT_STACKS[cpu].top();
+
+        assert!(
+            kernel_top % 16 == 0,
+            "the AP ring 0 stack top is not 16-byte aligned",
+        );
+        assert!(
+            fault_top % 16 == 0,
+            "the AP IST1 fault stack top is not 16-byte aligned",
+        );
+
+        (&raw mut (*tss).privilege_stack_table[0]).write(kernel_top);
+        (&raw mut (*tss).interrupt_stack_table_index).write(FAULT_IST_INDEX);
+        (&raw mut (*tss).interrupt_stack_table[FAULT_IST_INDEX as usize - IST_ARRAY_OFFSET])
+            .write(fault_top);
+
+        let tss_base = tss as u64;
+        let tss_limit = (size_of::<TaskStateSegment>() - 1) as u16;
+        write_tss_descriptor(gdt_base, TSS_SLOT, tss_base, tss_limit);
+
+        let descriptor = &mut *addr_of_mut!(AP_GDT_DESCRIPTORS[cpu]);
+        *descriptor = AlignedPseudoDescriptor::new(
+            (size_of::<Gdt>() - 1) as u16,
+            addr_of!(AP_GDT[cpu]) as u64,
+        );
+
+        load_gdt(&descriptor);
+        reload_data_segments();
+        load_tss(KERNEL_TSS_SELECTOR);
+        reload_code_segment_and_return();
     }
 }
 

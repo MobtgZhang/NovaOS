@@ -20,10 +20,10 @@
 //!
 //! IPv6, TLS, connection multiplexing, or unbounded stream payloads are not
 //! implemented. The service's inline payload is bounded by the IPC ABI, and
-//! larger buffers must use shared memory objects. Full SMP is likewise not
-//! implemented: the kernel is still single-CPU with interrupts masked, and the
-//! QEMU command still boots one CPU. Those limits are documented rather than
-//! hidden behind a passing suite.
+//! larger buffers must use shared memory objects. The SMP foundation is
+//! implemented, but service and driver state remain bootstrap-owned: the APs run
+//! their own kernel-only idle threads rather than concurrent network handlers.
+//! Those limits are documented rather than hidden behind a passing suite.
 //!
 //! # Named failures
 //!
@@ -49,13 +49,11 @@ use nova_protocols::ProtocolVersion;
 use nova_protocols::net::{
     NET_DHCP_REPLY_SIZE, NET_DHCP_REQUEST_SIZE, NET_ICMP_REPLY_SIZE, NET_ICMP_REQUEST_SIZE,
     NET_LINK_REPLY_SIZE, NET_LINK_REQUEST_SIZE, NET_MAX_DATAGRAM, NET_MAX_ICMP_PAYLOAD,
-    NET_MAX_NAME, NET_MAX_SOCKET_PAYLOAD, NET_MAX_SOCKET_RECV, NET_OP_DHCP,
-    NET_OP_ICMP_ECHO,
-    NET_OP_LINK_QUERY, NET_OP_RESOLVE, NET_OP_SEND, NET_OP_SOCKET_CLOSE,
-    NET_OP_SOCKET_CONNECT, NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV, NET_OP_SOCKET_SEND,
-    NET_RESOLVE_REQUEST_SIZE, NET_SEND_REQUEST_SIZE, NET_SOCKET_CLOSE_REPLY_SIZE,
-    NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE,
-    NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
+    NET_MAX_NAME, NET_MAX_SOCKET_PAYLOAD, NET_MAX_SOCKET_RECV, NET_OP_DHCP, NET_OP_ICMP_ECHO,
+    NET_OP_LINK_QUERY, NET_OP_RESOLVE, NET_OP_SEND, NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT,
+    NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV, NET_OP_SOCKET_SEND, NET_RESOLVE_REQUEST_SIZE,
+    NET_SEND_REQUEST_SIZE, NET_SOCKET_CLOSE_REPLY_SIZE, NET_SOCKET_CLOSE_REQUEST_SIZE,
+    NET_SOCKET_CONNECT_REPLY_SIZE, NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
     NET_SOCKET_OPEN_REQUEST_SIZE, NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE,
     NET_SOCKET_SEND_REPLY_SIZE, NET_SOCKET_SEND_REQUEST_SIZE, NET_SOCKET_TCP, NET_SOCKET_UDP,
     NET_VERSION,
@@ -168,7 +166,10 @@ pub static M7_SUITES: &[TestSuite] = &[
         name: "net_dhcp_lease",
         cases: &[
             ("dhcp_returns_a_guest_address", dhcp_returns_a_guest_address),
-            ("dhcp_returns_an_acknowledgement", dhcp_returns_an_acknowledgement),
+            (
+                "dhcp_returns_an_acknowledgement",
+                dhcp_returns_an_acknowledgement,
+            ),
         ],
     },
     TestSuite {
@@ -662,13 +663,7 @@ fn open_tcp_socket(
     let mut reply = [0u8; 64];
     for _ in 0..reserved_slots {
         let dummy = socket_open_request(NET_VERSION, 0, NET_SOCKET_UDP);
-        let length = ask(
-            state,
-            slot,
-            NET_OP_SOCKET_OPEN,
-            &dummy,
-            &mut reply,
-        )?;
+        let length = ask(state, slot, NET_OP_SOCKET_OPEN, &dummy, &mut reply)?;
         if length != NET_SOCKET_OPEN_REPLY_SIZE || reply_status(&reply) != Some(0) {
             return Err("a reserved socket did not open");
         }
@@ -676,13 +671,7 @@ fn open_tcp_socket(
 
     let request = socket_open_request(NET_VERSION, 0, NET_SOCKET_TCP);
     let mut reply = [0u8; 64];
-    let length = ask(
-        state,
-        slot,
-        NET_OP_SOCKET_OPEN,
-        &request,
-        &mut reply,
-    )?;
+    let length = ask(state, slot, NET_OP_SOCKET_OPEN, &request, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE {
         return Err("the socket-open reply was not the protocol's fixed size");
     }
@@ -701,21 +690,9 @@ fn connect_forwarded_tcp(
     reserved_slots: usize,
 ) -> Result<(u16, u16), &'static str> {
     let (socket, port) = open_tcp_socket(state, slot, reserved_slots)?;
-    let request = socket_connect_request(
-        NET_VERSION,
-        0,
-        socket,
-        TCP_TEST_PORT,
-        TCP_TEST_SERVER,
-    );
+    let request = socket_connect_request(NET_VERSION, 0, socket, TCP_TEST_PORT, TCP_TEST_SERVER);
     let mut reply = [0u8; 64];
-    let length = ask(
-        state,
-        slot,
-        NET_OP_SOCKET_CONNECT,
-        &request,
-        &mut reply,
-    )?;
+    let length = ask(state, slot, NET_OP_SOCKET_CONNECT, &request, &mut reply)?;
     if length != NET_SOCKET_CONNECT_REPLY_SIZE {
         return Err("the socket-connect reply was not the protocol's fixed size");
     }
@@ -729,20 +706,10 @@ fn connect_forwarded_tcp(
 }
 
 /// Close one socket and verify the fixed close reply.
-fn close_socket(
-    state: &mut KernelState,
-    slot: usize,
-    socket: u16,
-) -> Result<(), &'static str> {
+fn close_socket(state: &mut KernelState, slot: usize, socket: u16) -> Result<(), &'static str> {
     let close = socket_close_request(NET_VERSION, 0, socket);
     let mut reply = [0u8; 64];
-    let length = ask(
-        state,
-        slot,
-        NET_OP_SOCKET_CLOSE,
-        &close,
-        &mut reply,
-    )?;
+    let length = ask(state, slot, NET_OP_SOCKET_CLOSE, &close, &mut reply)?;
     if length != NET_SOCKET_CLOSE_REPLY_SIZE {
         return Err("the socket-close reply was not the protocol's fixed size");
     }
@@ -781,7 +748,9 @@ fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
     if reply_status(&send_reply) != Some(0) {
         return Err("the TCP request was not sent");
     }
-    let sent = send_reply.get(8..10).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let sent = send_reply
+        .get(8..10)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]));
     if sent != Some(payload.len() as u16) {
         return Err("the socket-send reply did not report the payload length");
     }
@@ -789,13 +758,7 @@ fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
     // The forwarded `/bin/cat` echoes the stream bytes back to the socket.
     let recv = socket_recv_request(NET_VERSION, 0, socket, NET_MAX_SOCKET_RECV as u16);
     let mut recv_reply = [0u8; 64];
-    let length = ask(
-        state,
-        slot,
-        NET_OP_SOCKET_RECV,
-        &recv,
-        &mut recv_reply,
-    )?;
+    let length = ask(state, slot, NET_OP_SOCKET_RECV, &recv, &mut recv_reply)?;
     if length < NET_SOCKET_RECV_REPLY_SIZE {
         return Err("the socket-receive reply was shorter than its header");
     }
@@ -809,9 +772,8 @@ fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
     if payload_length != payload.len() as u16 {
         return Err("the echoed payload had the wrong length");
     }
-    let echoed = &recv_reply[
-        NET_SOCKET_RECV_REPLY_SIZE..NET_SOCKET_RECV_REPLY_SIZE + payload_length as usize
-    ];
+    let echoed = &recv_reply
+        [NET_SOCKET_RECV_REPLY_SIZE..NET_SOCKET_RECV_REPLY_SIZE + payload_length as usize];
     if echoed != payload {
         return Err("the echoed payload was not the request bytes");
     }
@@ -828,13 +790,7 @@ fn a_tcp_socket_closes_cleanly() -> Result<(), &'static str> {
 
     let close = socket_close_request(NET_VERSION, 0, socket);
     let mut close_reply = [0u8; 64];
-    let length = ask(
-        state,
-        slot,
-        NET_OP_SOCKET_CLOSE,
-        &close,
-        &mut close_reply,
-    )?;
+    let length = ask(state, slot, NET_OP_SOCKET_CLOSE, &close, &mut close_reply)?;
     if length != NET_SOCKET_CLOSE_REPLY_SIZE {
         return Err("the socket-close reply was not the protocol's fixed size");
     }
@@ -855,14 +811,7 @@ fn an_icmp_echo_reaches_the_gateway() -> Result<(), &'static str> {
     let state = fresh_state();
     let slot = task_slot(state)?;
     let payload = b"nova";
-    let request = icmp_request(
-        NET_VERSION,
-        0,
-        LINK_GATEWAY.octets(),
-        7,
-        3,
-        payload,
-    );
+    let request = icmp_request(NET_VERSION, 0, LINK_GATEWAY.octets(), 7, 3, payload);
 
     let mut reply = [0u8; 64];
     let length = ask(
@@ -898,14 +847,7 @@ fn an_icmp_echo_reports_the_service_version() -> Result<(), &'static str> {
     let state = fresh_state();
     let slot = task_slot(state)?;
     let payload = b"nova";
-    let request = icmp_request(
-        NET_VERSION,
-        0,
-        LINK_GATEWAY.octets(),
-        7,
-        3,
-        payload,
-    );
+    let request = icmp_request(NET_VERSION, 0, LINK_GATEWAY.octets(), 7, 3, payload);
 
     let mut reply = [0u8; 64];
     let length = ask(
@@ -995,9 +937,8 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
     // longer public name like `example.com` can carry additional records that
     // exceed `NET_MAX_SOCKET_RECV`.
     let mut query = [0u8; 512];
-    let query_length =
-        nova_net::build_dns_query(b"localhost", 0x1234, &mut query)
-            .ok_or("the DNS query did not fit")?;
+    let query_length = nova_net::build_dns_query(b"localhost", 0x1234, &mut query)
+        .ok_or("the DNS query did not fit")?;
     let send = socket_send_request(NET_VERSION, 0, socket, &query[..query_length]);
     let length = ask(
         state,
@@ -1026,8 +967,10 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
     if payload_length == 0 {
         return Err("the UDP socket received an empty reply");
     }
-    let payload = &recv_reply[NET_SOCKET_RECV_REPLY_SIZE..NET_SOCKET_RECV_REPLY_SIZE + payload_length as usize];
-    let address = nova_net::parse_dns_a_record(payload).ok_or("the socket reply was not a DNS A record")?;
+    let payload = &recv_reply
+        [NET_SOCKET_RECV_REPLY_SIZE..NET_SOCKET_RECV_REPLY_SIZE + payload_length as usize];
+    let address =
+        nova_net::parse_dns_a_record(payload).ok_or("the socket reply was not a DNS A record")?;
     if address.as_u32() == 0 {
         return Err("the socket reply carried a zero address");
     }
@@ -1047,15 +990,15 @@ fn a_socket_is_not_usable_by_another_task() -> Result<(), &'static str> {
     }
     let socket = reply_socket(&reply).ok_or("the socket-open reply had no identifier")?;
 
-    let connect = socket_connect_request(
-        NET_VERSION,
-        0,
-        socket,
-        80,
-        LINK_GATEWAY.octets(),
-    );
+    let connect = socket_connect_request(NET_VERSION, 0, socket, 80, LINK_GATEWAY.octets());
     let mut foreign_reply = [0u8; 64];
-    let length = ask(state, second, NET_OP_SOCKET_CONNECT, &connect, &mut foreign_reply)?;
+    let length = ask(
+        state,
+        second,
+        NET_OP_SOCKET_CONNECT,
+        &connect,
+        &mut foreign_reply,
+    )?;
     if length != NET_SOCKET_CONNECT_REPLY_SIZE {
         return Err("the refusal reply was not the protocol's fixed size");
     }
@@ -1098,12 +1041,7 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
     }
 
     // Receive limit above the protocol's budget.
-    let recv = socket_recv_request(
-        NET_VERSION,
-        0,
-        1,
-        NET_MAX_SOCKET_RECV as u16 + 1,
-    );
+    let recv = socket_recv_request(NET_VERSION, 0, 1, NET_MAX_SOCKET_RECV as u16 + 1);
     let length = ask(state, slot, NET_OP_SOCKET_RECV, &recv, &mut reply)?;
     if length != NET_SOCKET_RECV_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Invalid.code())

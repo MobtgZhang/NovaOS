@@ -81,6 +81,20 @@ pub unsafe fn init() {
     unsafe { arch_init() };
 }
 
+/// Bring up per-CPU table state on an application processor.
+///
+/// The bootstrap processor has already installed the shared IDT and its own
+/// GDT/TSS. This installs the AP's own GDT/TSS and loads the shared IDT.
+///
+/// # Safety
+///
+/// Must run on the AP, with interrupts masked, after it has switched to its own
+/// kernel stack.
+pub unsafe fn init_cpu(cpu: usize) {
+    // SAFETY: delegated to this function's contract.
+    unsafe { x86_64::init_cpu(cpu) }
+}
+
 /// Bring up the console. Safe to call more than once.
 pub fn console_init() {
     console().init();

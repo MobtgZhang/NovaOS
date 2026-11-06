@@ -173,7 +173,7 @@ cp "$OVMF_VARS_TEMPLATE" "$VARS_COPY"
 set -- \
     -machine q35,accel=tcg \
     -cpu qemu64 \
-    -smp 1 \
+    -smp 4 \
     -m "${MEMORY_MIB}M" \
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,unit=1,file=$VARS_COPY" \
@@ -182,7 +182,7 @@ set -- \
     -device "virtio-blk-pci,drive=nova0" \
     -drive "file=$DISK_RO,format=raw,if=none,id=nova1,readonly=on" \
     -device "virtio-blk-pci,drive=nova1" \
-    -netdev "user,id=novanet,guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:8080" \
+    -netdev "user,id=novanet,guestfwd=tcp:10.0.2.100:80-cmd:/bin/cat" \
     -device "virtio-net-pci,netdev=novanet" \
     -device "isa-debug-exit,iobase=$DEBUG_EXIT_IOBASE,iosize=0x04" \
     -no-reboot

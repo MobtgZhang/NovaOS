@@ -54,6 +54,7 @@
 use core::cell::UnsafeCell;
 use core::mem::size_of;
 
+use crate::boot::info::MAX_CPUS;
 use crate::mm::address_space;
 
 use crate::klog;
@@ -68,16 +69,6 @@ use crate::task::{self, Context, Entry, Thread, ThreadState};
 /// is observed to be preempted promptly.
 pub const DEFAULT_TIMESLICE: u64 = 4;
 
-/// The number of times the scheduler has switched threads.
-///
-/// Exposed for the tests: a scheduler that claims to round-robin but never
-/// switches is indistinguishable from one that works, unless the switch count
-/// is observable.
-static mut SWITCH_COUNT: u64 = 0;
-
-/// The number of timer ticks the kernel has seen.
-static mut TICK_COUNT: u64 = 0;
-
 /// The five words an interrupt or syscall return path restores with `iretq`.
 #[repr(C)]
 struct IretFrame {
@@ -88,133 +79,204 @@ struct IretFrame {
     ss: u64,
 }
 
-/// The scheduler's policy state machine.
+/// Every piece of scheduler state a single CPU owns.
 ///
-/// The pure half — queue order, timeslice accounting, exit and reap — lives
-/// in `nova_core::scheduler::Scheduler` and is host-tested there. This is the
-/// instance the kernel runs.
-///
-/// It lives behind an [`UnsafeCell`] rather than as a bare `static mut`
-/// because the scheduler is a state machine that is read and written in
-/// pieces: `tick` needs to read the current thread's remaining quantum and
-/// write the tick counter, `schedule` needs to mutate the queue, and the
-/// tests need to *read* the queue order while no switch is in flight.
-/// A `static mut` cannot lend a `&mut` to any of those without the borrow
-/// checker (correctly) objecting that a shared reference to a mutable
-/// static is undefined behaviour.
-struct SchedulerCell(UnsafeCell<nova_core::scheduler::Scheduler>);
+/// The policy state machine, the current pool slot, and the tick/switch
+/// counters are per-CPU because two processors must not share a queue or a
+/// current thread. The counters are still exposed for diagnostics.
+struct CpuSchedulerState {
+    scheduler: nova_core::scheduler::Scheduler,
+    current_slot: Option<usize>,
+    switch_count: u64,
+    tick_count: u64,
+}
 
-// SAFETY: the scheduler's state is only read or written with interrupts
-// masked, which is the kernel's discipline for every access to shared state.
-// A tick, a schedule, and a test's read of the queue order never overlap,
-// because the scheduler runs on a single CPU and a context switch happens
-// only from the scheduler's own code.
+/// One CPU's scheduler state, under an [`UnsafeCell`].
+///
+/// A state machine is read and written in pieces: `tick` reads the current
+/// thread's quantum and writes the tick counter, `schedule` mutates the queue,
+/// and tests read the queue order while no switch is in flight. A bare
+/// `static mut` cannot lend a `&mut` to any of those without the borrow checker
+/// correctly objecting that a shared reference to a mutable static is undefined
+/// behaviour.
+struct SchedulerCell(UnsafeCell<CpuSchedulerState>);
+
+// SAFETY: each CPU's state is read or written only by that CPU, with interrupts
+// masked. The bootstrap processor never mutates an AP's scheduler; it only reads
+// diagnostic atomics published by the AP.
 unsafe impl Sync for SchedulerCell {}
 
-/// The scheduler's policy state machine.
-///
-/// The pure half — queue order, timeslice accounting, exit and reap — lives
-/// in `nova_core::scheduler::Scheduler` and is host-tested there. This is the
-/// instance the kernel runs.
-static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(
-    nova_core::scheduler::Scheduler::new(DEFAULT_TIMESLICE),
-));
+/// Per-CPU scheduler state.
+static SCHEDULERS: [SchedulerCell; MAX_CPUS] = [const {
+    SchedulerCell(UnsafeCell::new(CpuSchedulerState {
+        scheduler: nova_core::scheduler::Scheduler::new(DEFAULT_TIMESLICE),
+        current_slot: None,
+        switch_count: 0,
+        tick_count: 0,
+    }))
+}; MAX_CPUS];
 
-/// The pool slot of the thread that is running.
+/// The scheduler state of one CPU.
+/// # Safety
 ///
-/// `None` before the scheduler has switched to anything, and `None` again
-/// while the *boot* thread is running — the boot thread is not in the pool,
-/// because it exists before the pool does.
-static mut CURRENT_SLOT: Option<usize> = None;
+/// Must only be accessed by that CPU with interrupts masked.
+unsafe fn state_for_cpu(cpu: usize) -> &'static mut CpuSchedulerState {
+    assert!(
+        cpu < MAX_CPUS,
+        "CPU index exceeds the static scheduler table"
+    );
+    // SAFETY: delegated to this function's contract. The cell is owned by this
+    // CPU and no other CPU writes it.
+    unsafe { &mut *SCHEDULERS[cpu].0.get() }
+}
 
-/// Bring the scheduler up.
+/// Bring the bootstrap processor's scheduler up.
 ///
 /// # Safety
 ///
 /// Must be called once, with interrupts masked, after the thread pool exists.
 pub unsafe fn init() {
-    // SAFETY: delegated to this function's contract. The scheduler's state is
+    unsafe { init_for_cpu(0) }
+}
+
+/// Bring a specific CPU's scheduler up.
+///
+/// # Safety
+///
+/// Must be called on that CPU, with interrupts masked, after its thread pool
+/// exists.
+pub unsafe fn init_for_cpu(cpu: usize) {
+    // SAFETY: delegated to this function's contract. The scheduler state is
     // written only here, before any reader exists.
     unsafe {
-        // SAFETY: the scheduler cell is not read anywhere else yet.
-        *SCHEDULER.0.get() = nova_core::scheduler::Scheduler::new(DEFAULT_TIMESLICE);
-        SWITCH_COUNT = 0;
-        TICK_COUNT = 0;
-        CURRENT_SLOT = None;
+        *state_for_cpu(cpu) = CpuSchedulerState {
+            scheduler: nova_core::scheduler::Scheduler::new(DEFAULT_TIMESLICE),
+            current_slot: None,
+            switch_count: 0,
+            tick_count: 0,
+        };
     }
 
-    klog!(
-        Level::Info,
-        "sched: round-robin, timeslice {DEFAULT_TIMESLICE} ticks"
-    );
+    // Only the bootstrap processor's scheduler line is boot information. An AP
+    // would repeat the same fact and interleave with the boot log while the
+    // bootstrap processor is still bringing devices up.
+    if cpu == 0 {
+        klog!(
+            Level::Info,
+            "sched: cpu {cpu} round-robin, timeslice {DEFAULT_TIMESLICE} ticks"
+        );
+    }
 }
 
-/// How many times the scheduler has switched threads.
+/// How many times the bootstrap processor's scheduler has switched threads.
 pub fn switch_count() -> u64 {
-    // SAFETY: reading the counter is safe with interrupts masked.
-    unsafe { SWITCH_COUNT }
+    switch_count_for_cpu(0)
 }
 
-/// How many timer ticks the kernel has seen.
+/// How many times a specific CPU's scheduler has switched threads.
+pub fn switch_count_for_cpu(cpu: usize) -> u64 {
+    // SAFETY: reading the counter is safe with interrupts masked.
+    unsafe { state_for_cpu(cpu).switch_count }
+}
+
+/// How many timer ticks the bootstrap processor has seen.
 pub fn tick_count() -> u64 {
-    // SAFETY: reading the counter is safe with interrupts masked.
-    unsafe { TICK_COUNT }
+    tick_count_for_cpu(0)
 }
 
-/// The pool slot of the running thread.
+/// How many timer ticks a specific CPU has seen.
+pub fn tick_count_for_cpu(cpu: usize) -> u64 {
+    // SAFETY: reading the counter is safe with interrupts masked.
+    unsafe { state_for_cpu(cpu).tick_count }
+}
+
+/// The pool slot of the running thread on the bootstrap processor.
 ///
 /// `None` when the boot thread is running — it is not in the pool.
 pub fn current_slot() -> Option<usize> {
-    // SAFETY: reading the scheduler's state is safe with interrupts masked.
-    unsafe { CURRENT_SLOT }
+    current_slot_for_cpu(0)
 }
 
-/// The identifier of the running thread, if any.
+/// The pool slot of the running thread on a specific CPU.
+pub fn current_slot_for_cpu(cpu: usize) -> Option<usize> {
+    // SAFETY: reading the scheduler's state is safe with interrupts masked.
+    unsafe { state_for_cpu(cpu).current_slot }
+}
+
+/// The identifier of the running thread on the bootstrap processor, if any.
 pub fn current_thread_id() -> Option<u32> {
-    // SAFETY: reading the scheduler is safe with interrupts masked.
+    current_thread_id_for_cpu(0)
+}
+
+/// The identifier of the running thread on a specific CPU, if any.
+pub fn current_thread_id_for_cpu(cpu: usize) -> Option<u32> {
+    // SAFETY: reading the scheduler and thread pool is safe with interrupts masked.
     unsafe {
-        CURRENT_SLOT
-            .and_then(|slot| task::thread_in_slot(slot))
+        current_slot_for_cpu(cpu)
+            .and_then(|slot| task::thread_in_slot_for_cpu(cpu, slot))
             .map(|thread| thread.id)
     }
 }
 
-/// The state of the running thread.
+/// The state of the running thread on the bootstrap processor.
 pub fn current_state() -> Option<ThreadState> {
-    // SAFETY: reading the scheduler is safe with interrupts masked.
+    current_state_for_cpu(0)
+}
+
+/// The state of the running thread on a specific CPU.
+pub fn current_state_for_cpu(cpu: usize) -> Option<ThreadState> {
+    // SAFETY: reading the scheduler and thread pool is safe with interrupts masked.
     unsafe {
-        CURRENT_SLOT
-            .and_then(|slot| task::thread_in_slot(slot))
+        current_slot_for_cpu(cpu)
+            .and_then(|slot| task::thread_in_slot_for_cpu(cpu, slot))
             .map(|thread| thread.state)
     }
 }
 
-/// Whether the scheduler has a runnable thread to switch to.
+/// Whether the bootstrap processor's scheduler has a runnable thread.
 pub fn has_runnable_thread() -> bool {
-    // SAFETY: the scheduler is only read with interrupts masked, which is the
-    // boot path's discipline.
-    unsafe { (*SCHEDULER.0.get()).next_runnable().is_some() }
+    has_runnable_thread_for_cpu(0)
 }
 
-/// The number of threads the scheduler tracks.
+/// Whether a specific CPU's scheduler has a runnable thread.
+pub fn has_runnable_thread_for_cpu(cpu: usize) -> bool {
+    // SAFETY: the scheduler is only read with interrupts masked, on that CPU.
+    unsafe { state_for_cpu(cpu).scheduler.next_runnable().is_some() }
+}
+
+/// The number of threads the bootstrap processor's scheduler tracks.
 pub fn thread_count() -> usize {
-    // SAFETY: reading the scheduler is safe with interrupts masked.
-    unsafe { (*SCHEDULER.0.get()).thread_count() }
+    thread_count_for_cpu(0)
 }
 
-/// The runnable threads, in queue order.
+/// The number of threads a specific CPU's scheduler tracks.
+pub fn thread_count_for_cpu(cpu: usize) -> usize {
+    // SAFETY: reading the scheduler is safe with interrupts masked.
+    unsafe { state_for_cpu(cpu).scheduler.thread_count() }
+}
+
+/// The bootstrap processor's runnable threads, in queue order.
 pub fn runnable_order() -> impl Iterator<Item = u32> + 'static {
+    runnable_order_for_cpu(0)
+}
+
+/// A specific CPU's runnable threads, in queue order.
+pub fn runnable_order_for_cpu(cpu: usize) -> impl Iterator<Item = u32> + 'static {
     // SAFETY: the scheduler state is only mutated with interrupts masked, and
     // the iterator borrows it immutably for the duration of the call.
-    let scheduler = unsafe { &*SCHEDULER.0.get() };
+    let scheduler = unsafe { &state_for_cpu(cpu).scheduler };
     scheduler.runnable_order()
 }
 
-/// The scheduler's policy state machine, for the tests.
+/// The bootstrap processor's policy state machine, for the tests.
 pub fn scheduler() -> &'static mut nova_core::scheduler::Scheduler {
-    // SAFETY: the scheduler is only mutated with interrupts masked, and the
-    // tests call this while nothing else is running.
-    unsafe { &mut *SCHEDULER.0.get() }
+    scheduler_for_cpu(0)
+}
+
+/// A specific CPU's policy state machine.
+pub fn scheduler_for_cpu(cpu: usize) -> &'static mut nova_core::scheduler::Scheduler {
+    // SAFETY: the scheduler is only mutated with interrupts masked by its CPU.
+    unsafe { &mut state_for_cpu(cpu).scheduler }
 }
 
 /// Mark the running thread as exited.
@@ -223,22 +285,32 @@ pub fn scheduler() -> &'static mut nova_core::scheduler::Scheduler {
 ///
 /// Must be called with interrupts masked, from the scheduler's own context.
 pub unsafe fn exit_current_thread() {
+    unsafe { exit_current_thread_for_cpu(0) }
+}
+
+/// Mark the running thread on a specific CPU as exited.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, from the scheduler's own
+/// context.
+pub unsafe fn exit_current_thread_for_cpu(cpu: usize) {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        let Some(slot) = CURRENT_SLOT else {
+        let Some(slot) = state_for_cpu(cpu).current_slot else {
             return;
         };
-        let Some(thread) = task::thread_in_slot(slot) else {
+        let Some(thread) = task::thread_in_slot_for_cpu(cpu, slot) else {
             return;
         };
 
         let mut thread = thread;
         thread.state = ThreadState::Exited;
         thread.exit_status = task::take_exit_status();
-        task::update_thread(slot, thread);
+        task::update_thread_for_cpu(cpu, slot, thread);
 
-        // SAFETY: the scheduler is only mutated with interrupts masked.
-        let _ = (*SCHEDULER.0.get()).exit(thread.id);
+        // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+        let _ = state_for_cpu(cpu).scheduler.exit(thread.id);
     }
 }
 
@@ -248,31 +320,51 @@ pub unsafe fn exit_current_thread() {
 ///
 /// Must only be called from the exception dispatch path, with interrupts
 /// masked, while the faulting user thread is still the scheduler's current
-/// thread.
+/// thread. User threads are owned by the bootstrap processor.
 pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
+    unsafe { fault_current_user_and_switch_for_cpu(0, fault_address) }
+}
+
+/// Kill the current user thread on one CPU after an unhandled ring-3 fault.
+///
+/// # Safety
+///
+/// Must only be called on that CPU from the exception dispatch path, with
+/// interrupts masked, while the faulting user thread is still the scheduler's
+/// current thread.
+pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u64) -> ! {
     // SAFETY: exception entry masks interrupts and this is the scheduler path.
     unsafe {
-        let Some(slot) = CURRENT_SLOT else {
+        let Some(slot) = state_for_cpu(cpu).current_slot else {
             klog!(Level::Error, "sched: user fault without current thread");
             crate::arch::exit(crate::EXIT_PANIC)
         };
 
-        let Some(mut thread) = task::thread_in_slot(slot) else {
+        let Some(mut thread) = task::thread_in_slot_for_cpu(cpu, slot) else {
             klog!(Level::Error, "sched: user fault has no thread record");
             crate::arch::exit(crate::EXIT_PANIC)
         };
 
         thread.fault_address = fault_address;
-        task::update_thread(slot, thread);
+        task::update_thread_for_cpu(cpu, slot, thread);
 
         let process = thread.process;
-        exit_current_thread();
+        exit_current_thread_for_cpu(cpu);
         crate::services::process::retire_task(process);
-        switch_to_next()
+        switch_to_next_for_cpu(cpu)
     }
 }
 
-/// Reap exited threads that can no longer be using their kernel stacks.
+/// Reap exited threads on the bootstrap processor.
+///
+/// # Safety
+///
+/// Must only be called from the scheduler path, with interrupts masked.
+pub unsafe fn reap_exited_threads() {
+    unsafe { reap_exited_threads_for_cpu(0) }
+}
+
+/// Reap exited threads on a specific CPU.
 ///
 /// The exiting thread is still running on its stack until the context switch
 /// returns to another thread, so that thread is deliberately skipped here. It
@@ -280,17 +372,17 @@ pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
 ///
 /// # Safety
 ///
-/// Must only be called from the scheduler path, with interrupts masked.
-pub unsafe fn reap_exited_threads() {
+/// Must only be called from that CPU's scheduler path, with interrupts masked.
+pub unsafe fn reap_exited_threads_for_cpu(cpu: usize) {
     // SAFETY: scheduler and thread-pool access are serialised by this contract.
     unsafe {
-        let current_slot = CURRENT_SLOT;
+        let current_slot = state_for_cpu(cpu).current_slot;
         for slot in 0..task::MAX_THREADS {
             if Some(slot) == current_slot {
                 continue;
             }
 
-            let Some(thread) = task::thread_in_slot(slot) else {
+            let Some(thread) = task::thread_in_slot_for_cpu(cpu, slot) else {
                 continue;
             };
             if thread.state != ThreadState::Exited {
@@ -298,8 +390,8 @@ pub unsafe fn reap_exited_threads() {
             }
 
             let thread_id = thread.id;
-            task::reap_thread(slot);
-            let _ = (*SCHEDULER.0.get()).reap(thread_id);
+            task::reap_thread_for_cpu(cpu, slot);
+            let _ = state_for_cpu(cpu).scheduler.reap(thread_id);
         }
     }
 }
@@ -312,9 +404,25 @@ pub unsafe fn reap_exited_threads() {
 ///
 /// Must be called from the timer interrupt handler, with interrupts masked.
 pub unsafe fn tick() -> bool {
+    unsafe { tick_for_cpu(0) }
+}
+
+/// Account one timer tick on a specific CPU and preempt if the timeslice
+/// expired.
+///
+/// Returns `true` when the running thread should be preempted.
+///
+/// # Safety
+///
+/// Must be called from that CPU's timer interrupt handler, with interrupts
+/// masked.
+pub unsafe fn tick_for_cpu(cpu: usize) -> bool {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        TICK_COUNT += 1;
+        state_for_cpu(cpu).tick_count += 1;
+        if cpu > 0 {
+            crate::boot::smp::record_scheduler_tick(cpu);
+        }
 
         // A syscall may have asked for a state change that the scheduler has
         // to honour before the timeslice is even consulted. An exit is the
@@ -322,29 +430,29 @@ pub unsafe fn tick() -> bool {
         // expired is meaningless.
         match task::take_syscall_effect() {
             task::ThreadEffect::Exit => {
-                exit_current_thread();
+                exit_current_thread_for_cpu(cpu);
                 return true;
             }
             task::ThreadEffect::Yield => {
                 // The thread gave up the rest of its quantum. It goes back to
                 // the queue and the next thread runs.
-                // SAFETY: the scheduler is only mutated with interrupts masked.
-                let _ = (*SCHEDULER.0.get()).yield_current();
+                // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+                let _ = state_for_cpu(cpu).scheduler.yield_current();
                 return true;
             }
             task::ThreadEffect::Block => {
                 // A blocked thread cannot run. It leaves the queue.
-                // SAFETY: the scheduler is only mutated with interrupts masked.
-                if let Some(id) = (*SCHEDULER.0.get()).current() {
-                    let _ = (*SCHEDULER.0.get()).block(id);
+                // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+                if let Some(id) = state_for_cpu(cpu).scheduler.current() {
+                    let _ = state_for_cpu(cpu).scheduler.block(id);
                 }
                 return true;
             }
             task::ThreadEffect::Continue => {}
         }
 
-        // SAFETY: the scheduler is only mutated with interrupts masked.
-        (*SCHEDULER.0.get()).tick()
+        // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+        state_for_cpu(cpu).scheduler.tick()
     }
 }
 
@@ -353,10 +461,25 @@ pub unsafe fn tick() -> bool {
 /// # Safety
 ///
 /// Must be called from an interrupt or syscall return path, with interrupts
-/// masked, and with `CURRENT_SLOT` naming the thread being interrupted. The
-/// register pointer must address fifteen valid words and the frame pointer
+/// masked, and with the CPU's current slot naming the thread being interrupted.
+/// The register pointer must address fifteen valid words and the frame pointer
 /// must address the CPU's five-word interrupt frame.
 pub unsafe fn save_running_context(registers: &UserRegisters, frame: &IretFrame) {
+    unsafe { save_running_context_for_cpu(0, registers, frame) }
+}
+
+/// Save a specific CPU's running thread.
+///
+/// # Safety
+///
+/// Must be called on that CPU from an interrupt or syscall return path, with
+/// interrupts masked, and with that CPU's current slot naming the thread being
+/// interrupted.
+pub unsafe fn save_running_context_for_cpu(
+    cpu: usize,
+    registers: &UserRegisters,
+    frame: &IretFrame,
+) {
     let context = Context {
         rax: registers.rax,
         rbx: registers.rbx,
@@ -380,11 +503,11 @@ pub unsafe fn save_running_context(registers: &UserRegisters, frame: &IretFrame)
         ss: frame.ss,
     };
 
-    if let Some(slot) = unsafe { CURRENT_SLOT }
-        && let Some(mut thread) = unsafe { task::thread_in_slot(slot) }
+    if let Some(slot) = unsafe { state_for_cpu(cpu).current_slot }
+        && let Some(mut thread) = unsafe { task::thread_in_slot_for_cpu(cpu, slot) }
     {
         thread.context = context;
-        unsafe { task::update_thread(slot, thread) };
+        unsafe { task::update_thread_for_cpu(cpu, slot, thread) };
     }
 }
 
@@ -423,11 +546,11 @@ pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
         ss: crate::arch::x86_64::gdt::USER_DATA_SELECTOR as u64,
     };
 
-    if let Some(slot) = unsafe { CURRENT_SLOT }
-        && let Some(mut thread) = unsafe { task::thread_in_slot(slot) }
+    if let Some(slot) = unsafe { state_for_cpu(0).current_slot }
+        && let Some(mut thread) = unsafe { task::thread_in_slot_for_cpu(0, slot) }
     {
         thread.context = context;
-        unsafe { task::update_thread(slot, thread) };
+        unsafe { task::update_thread_for_cpu(0, slot, thread) };
     }
 }
 
@@ -438,46 +561,59 @@ pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
 /// Must be called with interrupts masked, after the outgoing thread's complete
 /// context has been saved.
 pub unsafe fn switch_to_next() -> ! {
-    // SAFETY: the scheduler is only mutated with interrupts masked.
-    unsafe { reap_exited_threads() };
-    let next_id = unsafe { (*SCHEDULER.0.get()).schedule() };
+    unsafe { switch_to_next_for_cpu(0) }
+}
+
+/// Choose the next runnable thread on a specific CPU and resume it.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, after the outgoing
+/// thread's complete context has been saved.
+pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
+    // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+    unsafe { reap_exited_threads_for_cpu(cpu) };
+    let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
     let Some(next_id) = next_id else {
-        klog!(Level::Error, "sched: no runnable thread");
+        klog!(Level::Error, "sched: cpu {cpu} no runnable thread");
         unsafe { crate::arch::exit(crate::EXIT_PANIC) }
     };
 
-    unsafe { resume_thread(next_id) }
+    unsafe { resume_thread_for_cpu(cpu, next_id) }
 }
 
 /// Resume a scheduler-selected thread by its pool slot.
 ///
 /// # Safety
 ///
-/// Must be called with interrupts masked, after the outgoing thread's complete
-/// context has been saved and after the policy state machine has already set
-/// `next_id` as its current thread.
-unsafe fn resume_thread(next_id: u32) -> ! {
-    let Some(slot) = (unsafe { task::slot_of_thread(next_id) }) else {
-        klog!(Level::Error, "sched: scheduler id has no thread slot");
+/// Must be called on that CPU with interrupts masked, after the outgoing
+/// thread's complete context has been saved and after the policy state machine
+/// has already set `next_id` as its current thread.
+unsafe fn resume_thread_for_cpu(cpu: usize, next_id: u32) -> ! {
+    let Some(slot) = (unsafe { task::slot_of_thread_for_cpu(cpu, next_id) }) else {
+        klog!(
+            Level::Error,
+            "sched: cpu {cpu} scheduler id has no thread slot"
+        );
         unsafe { crate::arch::exit(crate::EXIT_PANIC) }
     };
 
-    // SAFETY: the scheduler state and thread records are only mutated with
-    // interrupts masked.
+    // SAFETY: this CPU's scheduler state and thread records are only mutated
+    // with interrupts masked.
     unsafe {
-        CURRENT_SLOT = Some(slot);
-        SWITCH_COUNT += 1;
+        state_for_cpu(cpu).current_slot = Some(slot);
+        state_for_cpu(cpu).switch_count += 1;
 
-        let Some(mut next) = task::thread_in_slot(slot) else {
-            klog!(Level::Error, "sched: selected slot is empty");
+        let Some(mut next) = task::thread_in_slot_for_cpu(cpu, slot) else {
+            klog!(Level::Error, "sched: cpu {cpu} selected slot is empty");
             crate::arch::exit(crate::EXIT_PANIC)
         };
 
         next.state = ThreadState::Running;
-        task::update_thread(slot, next);
+        task::update_thread_for_cpu(cpu, slot, next);
 
         address_space::activate(&next.space);
-        crate::arch::x86_64::gdt::set_privilege_stack(task::kernel_stack_top(&next));
+        crate::arch::x86_64::gdt::set_privilege_stack_for_cpu(cpu, task::kernel_stack_top(&next));
         let block = task::build_resume_block(&next);
         task::resume_from_block(block)
     }
@@ -490,21 +626,37 @@ unsafe fn resume_thread(next_id: u32) -> ! {
 /// Must be called with interrupts masked, after the current thread's complete
 /// context has been saved.
 pub unsafe fn resume_current() -> ! {
-    let Some(slot) = (unsafe { CURRENT_SLOT }) else {
-        klog!(Level::Error, "sched: resume without a current thread");
+    unsafe { resume_current_for_cpu(0) }
+}
+
+/// Resume the already-selected current thread on a specific CPU.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, after the current
+/// thread's complete context has been saved.
+pub unsafe fn resume_current_for_cpu(cpu: usize) -> ! {
+    let Some(slot) = (unsafe { state_for_cpu(cpu).current_slot }) else {
+        klog!(
+            Level::Error,
+            "sched: cpu {cpu} resume without a current thread"
+        );
         unsafe { crate::arch::exit(crate::EXIT_PANIC) }
     };
 
     // SAFETY: the current thread and its stack are still live, and the saved
     // context was written into the thread record before this call.
     unsafe {
-        let Some(current) = task::thread_in_slot(slot) else {
-            klog!(Level::Error, "sched: current slot is empty");
+        let Some(current) = task::thread_in_slot_for_cpu(cpu, slot) else {
+            klog!(Level::Error, "sched: cpu {cpu} current slot is empty");
             crate::arch::exit(crate::EXIT_PANIC)
         };
 
         address_space::activate(&current.space);
-        crate::arch::x86_64::gdt::set_privilege_stack(task::kernel_stack_top(&current));
+        crate::arch::x86_64::gdt::set_privilege_stack_for_cpu(
+            cpu,
+            task::kernel_stack_top(&current),
+        );
         let block = task::build_resume_block(&current);
         task::resume_from_block(block)
     }
@@ -517,13 +669,26 @@ pub unsafe fn resume_current() -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn yield_current_and_switch() -> ! {
-    // SAFETY: the scheduler is only mutated with interrupts masked.
-    unsafe {
-        let next_id = (*SCHEDULER.0.get()).yield_current();
-        klog!(Level::Info, "debug: yield next={next_id:?}");
+    unsafe { yield_current_and_switch_for_cpu(0) }
+}
 
-        if next_id.is_none() && (*SCHEDULER.0.get()).current().is_none() {
-            klog!(Level::Error, "sched: yield without a current thread");
+/// Yield the current thread on a specific CPU and immediately schedule another.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, from the current thread's
+/// syscall or interrupt path after its context has been saved.
+pub unsafe fn yield_current_and_switch_for_cpu(cpu: usize) -> ! {
+    // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
+    unsafe {
+        let next_id = state_for_cpu(cpu).scheduler.yield_current();
+        klog!(Level::Info, "debug: cpu {cpu} yield next={next_id:?}");
+
+        if next_id.is_none() && state_for_cpu(cpu).scheduler.current().is_none() {
+            klog!(
+                Level::Error,
+                "sched: cpu {cpu} yield without a current thread"
+            );
             crate::arch::exit(crate::EXIT_PANIC)
         }
 
@@ -531,8 +696,8 @@ pub unsafe fn yield_current_and_switch() -> ! {
         // current. Rescheduling again would enqueue that new current thread
         // and select a different one, breaking the requested switch.
         match next_id {
-            Some(next_id) => resume_thread(next_id),
-            None => resume_current(),
+            Some(next_id) => resume_thread_for_cpu(cpu, next_id),
+            None => resume_current_for_cpu(cpu),
         }
     }
 }
@@ -544,15 +709,28 @@ pub unsafe fn yield_current_and_switch() -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn block_current_and_switch() -> ! {
-    // SAFETY: the scheduler is only mutated with interrupts masked.
+    unsafe { block_current_and_switch_for_cpu(0) }
+}
+
+/// Block the current thread on a specific CPU and immediately schedule another.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, from the current thread's
+/// syscall or interrupt path after its context has been saved.
+pub unsafe fn block_current_and_switch_for_cpu(cpu: usize) -> ! {
+    // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
     unsafe {
-        let Some(current) = (*SCHEDULER.0.get()).current() else {
-            klog!(Level::Error, "sched: block without a current thread");
+        let Some(current) = state_for_cpu(cpu).scheduler.current() else {
+            klog!(
+                Level::Error,
+                "sched: cpu {cpu} block without a current thread"
+            );
             crate::arch::exit(crate::EXIT_PANIC)
         };
-        let _ = (*SCHEDULER.0.get()).block(current);
-        klog!(Level::Info, "debug: block current={current}");
-        switch_to_next()
+        let _ = state_for_cpu(cpu).scheduler.block(current);
+        klog!(Level::Info, "debug: cpu {cpu} block current={current}");
+        switch_to_next_for_cpu(cpu)
     }
 }
 
@@ -563,11 +741,21 @@ pub unsafe fn block_current_and_switch() -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn exit_current_and_switch() -> ! {
-    // SAFETY: the scheduler and thread records are only mutated with
+    unsafe { exit_current_and_switch_for_cpu(0) }
+}
+
+/// Exit the current thread on a specific CPU and immediately schedule another.
+///
+/// # Safety
+///
+/// Must be called on that CPU with interrupts masked, from the current thread's
+/// syscall or interrupt path after its context has been saved.
+pub unsafe fn exit_current_and_switch_for_cpu(cpu: usize) -> ! {
+    // SAFETY: this CPU's scheduler and thread records are only mutated with
     // interrupts masked.
     unsafe {
-        exit_current_thread();
-        switch_to_next()
+        exit_current_thread_for_cpu(cpu);
+        switch_to_next_for_cpu(cpu)
     }
 }
 
@@ -579,6 +767,31 @@ pub unsafe fn exit_current_and_switch() -> ! {
 /// The register pointer must address fifteen valid words and the frame pointer
 /// must address the CPU's five-word interrupt frame.
 pub unsafe fn handle_timer_interrupt(registers: *const UserRegisters) -> ! {
+    unsafe { handle_timer_interrupt_for_cpu(0, registers) }
+}
+
+/// Save the interrupted thread on a specific CPU and act on one timer tick.
+///
+/// # Safety
+///
+/// Must be called from that CPU's timer interrupt handler, with interrupts
+/// masked. The register pointer must address fifteen valid words and the frame
+/// pointer must address the CPU's five-word interrupt frame.
+pub unsafe fn handle_timer_interrupt_for_cpu(cpu: usize, registers: *const UserRegisters) -> ! {
+    // A timer can fire while the boot thread is still running, before the
+    // scheduler has switched to any pool thread. In that window there is no
+    // current slot to save or resume, so the interrupt must return to the
+    // interrupted boot code. It cannot resume through the frame alone: the
+    // timer stub pushed `r15..rax` below that frame, and `iretq` does not pop
+    // them. The saved register file has the same layout as a resume block's
+    // leading words, so the trampoline restores the registers and the frame.
+    if unsafe { state_for_cpu(cpu).current_slot.is_none() } {
+        // SAFETY: the timer stub saves fifteen register words followed by the
+        // interrupt frame; the trampoline restores the registers and pops the
+        // frame from the same stack region.
+        unsafe { task::resume_from_block(registers as u64) }
+    }
+
     // The CPU frame sits above the saved register file because the stack
     // grows down and the stub pushes the register file first.
     //
@@ -589,19 +802,18 @@ pub unsafe fn handle_timer_interrupt(registers: *const UserRegisters) -> ! {
         unsafe { &*(registers.cast::<u8>().add(size_of::<UserRegisters>()) as *const IretFrame) };
 
     // SAFETY: delegated to this function's contract.
-    unsafe { save_running_context(&*registers, frame) };
+    unsafe { save_running_context_for_cpu(cpu, &*registers, frame) };
 
-    // SAFETY: the scheduler is only mutated from the timer or syscall path,
-    // both of which run with interrupts masked.
-    let preempt = unsafe { tick() };
-    klog!(Level::Info, "debug: timer preempt={preempt}");
+    // SAFETY: this CPU's scheduler is only mutated from its timer or syscall
+    // path, both of which run with interrupts masked.
+    let preempt = unsafe { tick_for_cpu(cpu) };
     if preempt {
         // SAFETY: the outgoing context has already been saved.
-        unsafe { switch_to_next() }
+        unsafe { switch_to_next_for_cpu(cpu) }
     } else {
         // SAFETY: the running thread's context is the one just saved; resume it
         // without disturbing the policy state machine's round-robin order.
-        unsafe { resume_current() }
+        unsafe { resume_current_for_cpu(cpu) }
     }
 }
 
@@ -616,6 +828,18 @@ pub unsafe fn handle_timer_interrupt(registers: *const UserRegisters) -> ! {
 ///
 /// Must be called with interrupts masked, and the thread must own a stack.
 pub unsafe fn spawn(thread: &mut Thread) {
+    unsafe { spawn_for_cpu(thread.cpu, thread) }
+}
+
+/// Prepare a thread's first context and register it with its CPU's scheduler.
+///
+/// # Safety
+///
+/// Must be called on the thread's CPU with interrupts masked, and the thread
+/// must own a stack.
+pub unsafe fn spawn_for_cpu(cpu: usize, thread: &mut Thread) {
+    assert_eq!(thread.cpu, cpu, "thread belongs to a different CPU");
+
     // SAFETY: delegated to this function's contract. The thread owns a kernel
     // stack, and the entry describes a valid destination.
     unsafe {
@@ -625,20 +849,22 @@ pub unsafe fn spawn(thread: &mut Thread) {
     // `prepare_initial_context` mutates the caller's copy of the thread. Write
     // that initial context back into the pool; otherwise the scheduler can
     // select a thread whose saved state is still the pool's zeroed default.
-    let thread_slot = unsafe { task::slot_of_thread(thread.id) };
+    let thread_slot = unsafe { task::slot_of_thread_for_cpu(cpu, thread.id) };
     if let Some(thread_slot) = thread_slot {
         unsafe {
-            task::update_thread(thread_slot, *thread);
+            task::update_thread_for_cpu(cpu, thread_slot, *thread);
         }
     }
 
     let process = thread.process;
     let thread_id = thread.id;
 
-    // SAFETY: delegated to this function's contract. The scheduler is only
-    // mutated with interrupts masked.
+    // SAFETY: delegated to this function's contract. This CPU's scheduler is
+    // only mutated with interrupts masked.
     unsafe {
-        let _ = (*SCHEDULER.0.get()).adopt_thread(thread_id, process as u32, 0);
+        let _ = state_for_cpu(cpu)
+            .scheduler
+            .adopt_thread(thread_id, process as u32, 0);
     }
 }
 

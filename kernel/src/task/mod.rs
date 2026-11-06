@@ -74,6 +74,7 @@ use core::cell::UnsafeCell;
 use crate::arch::x86_64::gdt::{
     KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR,
 };
+use crate::boot::info::MAX_CPUS;
 use crate::klog;
 use crate::logger::Level;
 use crate::mm::address_space::AddressSpace;
@@ -403,8 +404,13 @@ struct StackPoolCell(UnsafeCell<StackPool>);
 // is the running one.
 unsafe impl Sync for StackPoolCell {}
 
-/// The kernel's stack pool.
-static STACKS: StackPoolCell = StackPoolCell(UnsafeCell::new(StackPool::new()));
+/// Per-CPU stack pools.
+///
+/// Each processor owns its own pool. A thread's stack slot is therefore
+/// meaningful only together with its CPU index, and no two processors can claim
+/// the same slot.
+static STACKS: [StackPoolCell; MAX_CPUS] =
+    [const { StackPoolCell(UnsafeCell::new(StackPool::new())) }; MAX_CPUS];
 
 /// A thread.
 ///
@@ -418,7 +424,9 @@ pub struct Thread {
     pub process: usize,
     /// The address space the thread runs in.
     pub space: AddressSpace,
-    /// The thread's kernel stack slot in the pool.
+    /// The CPU that owns this thread's pool and stack.
+    pub cpu: usize,
+    /// The thread's kernel stack slot in the CPU's pool.
     pub stack_slot: usize,
     /// The thread's saved machine state.
     pub context: Context,
@@ -453,11 +461,14 @@ struct ThreadPoolCell(UnsafeCell<[Option<Thread>; MAX_THREADS]>);
 // single CPU, so a read of a thread's record never overlaps a write of it.
 unsafe impl Sync for ThreadPoolCell {}
 
-/// The kernel's thread pool.
+/// Per-CPU thread pools.
 ///
-/// A static array rather than an allocator: the kernel has no general-purpose
-/// allocator for objects.
-static THREADS: ThreadPoolCell = ThreadPoolCell(UnsafeCell::new([None; MAX_THREADS]));
+/// The pool is partitioned by processor rather than shared: user processes are
+/// created on the bootstrap processor, and each AP's kernel-only idle thread
+/// lives in that AP's own pool. This keeps thread identity and stack ownership
+/// unambiguous while the service layer remains bootstrap-only.
+static THREADS: [ThreadPoolCell; MAX_CPUS] =
+    [const { ThreadPoolCell(UnsafeCell::new([None; MAX_THREADS])) }; MAX_CPUS];
 
 /// What the current syscall did to the calling thread.
 ///
@@ -474,16 +485,23 @@ pub enum ThreadEffect {
     Block,
 }
 
-/// The thread pool, as a raw slice.
+/// The thread pool of one CPU, as a raw slice.
 ///
 /// # Safety
 ///
-/// Must only be accessed with interrupts masked.
-unsafe fn thread_pool() -> &'static mut [Option<Thread>; MAX_THREADS] {
+/// Must only be accessed with interrupts masked, and `cpu` must be the CPU that
+/// owns the pool.
+unsafe fn thread_pool(cpu: usize) -> &'static mut [Option<Thread>; MAX_THREADS] {
+    assert!(cpu < MAX_CPUS, "CPU index exceeds the static thread table");
     // SAFETY: delegated to this function's contract. The pool is a static
     // whose only writer is the kernel, and every access is made with
     // interrupts masked.
-    unsafe { &mut *THREADS.0.get() }
+    unsafe { &mut *THREADS[cpu].0.get() }
+}
+
+/// The CPU slot of the processor running this code.
+fn current_cpu() -> usize {
+    crate::arch::x86_64::apic::cpu_index()
 }
 
 /// The effect the most recent syscall asked for.
@@ -580,34 +598,51 @@ pub fn current_syscall_context() -> crate::services::dispatch::SyscallContext {
 /// Returns `None` when no thread is running — which happens on the boot
 /// thread, before the scheduler has been given anything to switch to.
 pub fn current_thread_space() -> Option<AddressSpace> {
-    // SAFETY: reading the pool is safe with interrupts masked, which is the
-    // kernel's discipline for every access to shared state. The thread's
-    // `space` is a `Copy` handle to a table the kernel owns.
+    // SAFETY: the bootstrap processor is the only CPU that dispatches a user
+    // syscall. Its current slot is read while interrupts are masked, and the
+    // thread's `space` is a `Copy` handle to a table the kernel owns.
     unsafe {
         crate::sched::current_slot()
-            .and_then(|slot| (unsafe { thread_pool() }).get(slot).copied().flatten())
+            .and_then(|slot| (unsafe { thread_pool(0) }).get(slot).copied().flatten())
             .map(|thread| thread.space)
     }
 }
 
-/// Create a thread with a given identifier.
+/// Create a thread on the bootstrap processor.
+///
+/// User processes are owned by the bootstrap processor in this SMP phase, so
+/// the existing callers keep this CPU-zero convenience form.
+pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
+    create_thread_for_cpu(0, id, process, space, entry)
+}
+
+/// Create a thread on a specific CPU.
 ///
 /// # Errors
 ///
-/// Returns `None` when the thread pool or the stack pool is exhausted.
-pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
-    // SAFETY: `create_thread` is called from the kernel with interrupts
-    // masked, and it is the only writer of `THREADS`.
+/// Returns `None` when that CPU's thread pool or stack pool is exhausted.
+pub fn create_thread_for_cpu(
+    cpu: usize,
+    id: u32,
+    process: usize,
+    space: AddressSpace,
+    entry: Entry,
+) -> Option<Thread> {
+    assert!(cpu < MAX_CPUS, "CPU index exceeds the static thread table");
+
+    // SAFETY: creation runs with interrupts masked on the owning CPU, and it
+    // is the only writer of that CPU's pool and stack pool.
     unsafe {
-        let slot = (unsafe { thread_pool() })
+        let slot = (unsafe { thread_pool(cpu) })
             .iter()
             .position(|entry| entry.is_none())?;
-        let stack_slot = unsafe { (*STACKS.0.get()).acquire()? };
+        let stack_slot = unsafe { (*STACKS[cpu].0.get()).acquire()? };
 
         let thread = Thread {
             id,
             process,
             space,
+            cpu,
             stack_slot,
             context: Context::default(),
             state: ThreadState::Runnable,
@@ -618,21 +653,31 @@ pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry)
             fault_address: 0,
         };
 
-        (unsafe { thread_pool() })[slot] = Some(thread);
+        (unsafe { thread_pool(cpu) })[slot] = Some(thread);
         Some(thread)
     }
 }
 
-/// Look up a thread by identifier.
+/// Look up a thread by identifier on the bootstrap processor.
 ///
 /// # Safety
 ///
 /// Must only be called with interrupts masked, and must not be called while
 /// a `&mut` to a thread is live.
 pub unsafe fn thread_by_id(id: u32) -> Option<Thread> {
+    unsafe { thread_by_id_for_cpu(0, id) }
+}
+
+/// Look up a thread by identifier on a specific CPU.
+///
+/// # Safety
+///
+/// Must only be called with interrupts masked, and must not be called while
+/// a `&mut` to a thread is live.
+pub unsafe fn thread_by_id_for_cpu(cpu: usize, id: u32) -> Option<Thread> {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        (unsafe { thread_pool() })
+        (unsafe { thread_pool(cpu) })
             .iter()
             .flatten()
             .find(|thread| thread.id == id)
@@ -640,63 +685,102 @@ pub unsafe fn thread_by_id(id: u32) -> Option<Thread> {
     }
 }
 
-/// The thread in a pool slot.
+/// The thread in a pool slot on the bootstrap processor.
 ///
 /// # Safety
 ///
 /// Must only be called with interrupts masked.
 pub unsafe fn thread_in_slot(slot: usize) -> Option<Thread> {
-    // SAFETY: delegated to this function's contract.
-    unsafe { (thread_pool()).get(slot).copied().flatten() }
+    unsafe { thread_in_slot_for_cpu(0, slot) }
 }
 
-/// Replace a thread's record.
+/// The thread in a pool slot on a specific CPU.
+///
+/// # Safety
+///
+/// Must only be called with interrupts masked.
+pub unsafe fn thread_in_slot_for_cpu(cpu: usize, slot: usize) -> Option<Thread> {
+    // SAFETY: delegated to this function's contract.
+    unsafe { (thread_pool(cpu)).get(slot).copied().flatten() }
+}
+
+/// Replace a thread's record on the bootstrap processor.
 ///
 /// # Safety
 ///
 /// Must only be called with interrupts masked, and the slot must hold a live
 /// thread.
 pub unsafe fn update_thread(slot: usize, thread: Thread) {
+    unsafe { update_thread_for_cpu(0, slot, thread) }
+}
+
+/// Replace a thread's record on a specific CPU.
+///
+/// # Safety
+///
+/// Must only be called with interrupts masked, and the slot must hold a live
+/// thread.
+pub unsafe fn update_thread_for_cpu(cpu: usize, slot: usize, thread: Thread) {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        (unsafe { thread_pool() })[slot] = Some(thread);
+        (unsafe { thread_pool(cpu) })[slot] = Some(thread);
     }
 }
 
-/// The pool slot a thread's identifier lives in.
+/// The pool slot a thread's identifier lives in on the bootstrap processor.
 pub fn slot_of(id: u32) -> Option<usize> {
+    slot_of_for_cpu(0, id)
+}
+
+/// The pool slot a thread's identifier lives in on a specific CPU.
+pub fn slot_of_for_cpu(cpu: usize, id: u32) -> Option<usize> {
     // SAFETY: reading the pool is safe with interrupts masked.
     unsafe {
-        (unsafe { thread_pool() })
+        (unsafe { thread_pool(cpu) })
             .iter()
             .position(|entry| entry.is_some_and(|thread| thread.id == id))
     }
 }
 
-/// The number of live threads.
+/// The number of live threads on the bootstrap processor.
 pub fn thread_count() -> usize {
-    // SAFETY: reading the pool is safe with interrupts masked, which is the
-    // kernel's discipline for every access to shared state.
-    unsafe { (thread_pool()).iter().flatten().count() }
+    thread_count_for_cpu(0)
 }
 
-/// Reap a thread, releasing its stack slot.
+/// The number of live threads on a specific CPU.
+pub fn thread_count_for_cpu(cpu: usize) -> usize {
+    // SAFETY: reading the pool is safe with interrupts masked, which is the
+    // kernel's discipline for every access to shared state.
+    unsafe { (thread_pool(cpu)).iter().flatten().count() }
+}
+
+/// Reap a thread on the bootstrap processor, releasing its stack slot.
 ///
 /// # Safety
 ///
 /// Must only be called with interrupts masked, and the thread must have
 /// exited.
 pub unsafe fn reap_thread(slot: usize) {
+    unsafe { reap_thread_for_cpu(0, slot) }
+}
+
+/// Reap a thread on a specific CPU, releasing its stack slot.
+///
+/// # Safety
+///
+/// Must only be called with interrupts masked, and the thread must have
+/// exited.
+pub unsafe fn reap_thread_for_cpu(cpu: usize, slot: usize) {
     // SAFETY: delegated to this function's contract. The thread is not
     // running, so its stack slot is not in use.
     unsafe {
-        if let Some(thread) = (unsafe { thread_pool() })
+        if let Some(thread) = (unsafe { thread_pool(cpu) })
             .get_mut(slot)
             .and_then(|entry| *entry)
             && thread.state == ThreadState::Exited
         {
-            unsafe { (*STACKS.0.get()).release(thread.stack_slot) };
-            (unsafe { thread_pool() })[slot] = None;
+            unsafe { (*STACKS[cpu].0.get()).release(thread.stack_slot) };
+            (unsafe { thread_pool(cpu) })[slot] = None;
         }
     }
 }
@@ -707,9 +791,10 @@ pub unsafe fn reap_thread(slot: usize) {
 /// from "an interrupt arrived on the scheduler's stack". The distinction
 /// matters: only the former is a preemption of the current thread.
 pub fn stack_bounds(thread: &Thread) -> (u64, u64) {
-    // SAFETY: the pool hands each thread its own slot, and a slot is not
-    // released until the thread is reaped, so the slot is still the thread's.
-    let pool = unsafe { &*STACKS.0.get() };
+    // SAFETY: the per-CPU pool hands each thread its own slot, and a slot is
+    // not released until the thread is reaped, so the slot is still the
+    // thread's. `thread.cpu` names the pool that owns it.
+    let pool = unsafe { &*STACKS[thread.cpu].0.get() };
     (
         pool.base_of(thread.stack_slot),
         pool.top_of(thread.stack_slot),
@@ -728,10 +813,10 @@ pub fn stack_contains(thread: &Thread, address: u64) -> bool {
 /// the CPU uses it to land an interrupt, and the syscall entry path uses it
 /// to switch to the kernel stack.
 pub fn kernel_stack_top(thread: &Thread) -> u64 {
-    // SAFETY: `STACKS` is a static pool whose slots are claimed exclusively
-    // by one thread each. A thread's slot is not released until the thread is
+    // SAFETY: the per-CPU stack pool's slots are claimed exclusively by one
+    // thread each. A thread's slot is not released until the thread is
     // reaped, so the slot is still the thread's while the thread exists.
-    let pool = unsafe { &*STACKS.0.get() };
+    let pool = unsafe { &*STACKS[thread.cpu].0.get() };
     pool.top_of(thread.stack_slot)
 }
 
@@ -744,10 +829,19 @@ pub fn kernel_stack_top(thread: &Thread) -> u64 {
 ///
 /// Must only be accessed with interrupts masked.
 pub unsafe fn slot_of_thread(id: u32) -> Option<usize> {
-    // SAFETY: delegated to this function's contract. The single-CPU kernel
-    // accesses the pool only from serialised scheduler or syscall paths.
+    unsafe { slot_of_thread_for_cpu(0, id) }
+}
+
+/// The pool slot of the thread with `id` on a specific CPU.
+///
+/// # Safety
+///
+/// Must only be accessed with interrupts masked.
+pub unsafe fn slot_of_thread_for_cpu(cpu: usize, id: u32) -> Option<usize> {
+    // SAFETY: delegated to this function's contract. The per-CPU pool is
+    // accessed only from that CPU's serialised scheduler or syscall paths.
     unsafe {
-        thread_pool()
+        thread_pool(cpu)
             .iter()
             .position(|entry| entry.as_ref().is_some_and(|thread| thread.id == id))
     }
@@ -929,8 +1023,19 @@ pub fn describe_threads() {
     );
 }
 
-/// The number of stack slots still free.
+/// The number of stack slots still free on the bootstrap processor.
 pub fn free_stack_slots() -> usize {
+    free_stack_slots_for_cpu(0)
+}
+
+/// The number of stack slots still free on a specific CPU.
+pub fn free_stack_slots_for_cpu(cpu: usize) -> usize {
     // SAFETY: reading the pool is safe with interrupts masked.
-    unsafe { (*STACKS.0.get()).used.iter().filter(|used| !**used).count() }
+    unsafe {
+        (*STACKS[cpu].0.get())
+            .used
+            .iter()
+            .filter(|used| !**used)
+            .count()
+    }
 }

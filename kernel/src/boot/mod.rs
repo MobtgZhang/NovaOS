@@ -17,8 +17,9 @@
 
 pub mod info;
 pub mod limine;
+pub mod smp;
 
-pub use info::{BootInfo, MAX_PHYSICAL_ADDRESS, PAGE_SIZE};
+pub use info::{BootInfo, MAX_CPUS, MAX_PHYSICAL_ADDRESS, PAGE_SIZE};
 
 pub use limine::{boot_info_is_ready, capture, check_protocol_revision, initramfs, read_boot_info};
 

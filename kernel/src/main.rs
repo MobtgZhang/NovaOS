@@ -207,6 +207,12 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         syscall::init();
         sched::init();
         arch::x86_64::apic::init(boot::read_boot_info().direct_map_offset);
+
+        // The APs have been waiting on this gate since `boot::capture` handed
+        // them over. Everything they need — the kernel address space, the shared
+        // IDT, the per-CPU scheduler and stack tables, and the mapped APIC — now
+        // exists, so they can enter their own startup paths.
+        boot::smp::mark_ready();
     }
 
     // Devices, then the filesystems that sit on them. This runs after `mm`
@@ -282,11 +288,85 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         nova_abi::nr::ALL.len()
     );
 
+    klog!(
+        Level::Info,
+        "smp: {} processors, bsp lapic id {}",
+        boot_info.processor_count(),
+        boot_info.bsp_lapic_id
+    );
+    for cpu in 1..boot_info.processor_count() {
+        klog!(
+            Level::Info,
+            "smp: cpu {} lapic id {} online={} scheduler_threads={} ticks={}",
+            cpu,
+            boot_info.cpu_ids[cpu],
+            boot::smp::is_online(cpu),
+            boot::smp::scheduler_threads(cpu),
+            boot::smp::tick_count(cpu)
+        );
+    }
+
+    // Wait for the AP startup paths before the suites assert on them. This is a
+    // bounded spin rather than an unbounded block: a machine whose APs fail to
+    // start reports a failed SMP suite instead of hanging the boot forever.
+    if !boot::smp::wait_for_aps(10_000_000) {
+        klog!(
+            Level::Error,
+            "smp: application processors did not reach their startup path"
+        );
+    }
+
     // `run_all` is `-> !`: it terminates the machine via `arch::exit`, so there is
     // deliberately no epilogue here. An `arch::exit` fallback would be dead code
     // that the compiler correctly rejects to write, which is the better outcome —
     // it forces the harness's exit path to stay the single terminating branch.
     test::harness::run_all();
+}
+
+/// Continue an application processor on its own kernel stack.
+///
+/// # Safety
+///
+/// Reached only from [`crate::arch::x86_64::gdt::switch_to_kernel_stack_for_cpu_and_continue`],
+/// with interrupts masked, after the bootstrap processor published `SMP_READY`.
+/// The AP abandons the bootloader-provided frame and never unwinds it.
+pub unsafe fn boot_after_ap_stack_switch(cpu: usize) -> ! {
+    // SAFETY: delegated to this function's contract. The AP needs the kernel's
+    // address space, its own tables, its own APIC timer, and its own scheduler.
+    unsafe {
+        crate::mm::address_space::activate(&crate::mm::address_space::kernel_space());
+        crate::arch::init_cpu(cpu);
+        crate::boot::smp::record_tss_rsp0(
+            cpu,
+            crate::arch::x86_64::gdt::privilege_stack_for_cpu(cpu),
+        );
+        crate::arch::x86_64::apic::init_for_cpu(
+            cpu,
+            crate::boot::read_boot_info().direct_map_offset,
+        );
+        crate::sched::init_for_cpu(cpu);
+
+        let space = crate::mm::address_space::kernel_space();
+        let entry = crate::boot::smp::ap_idle_entry as *const () as u64;
+        let Some(mut thread) = crate::task::create_thread_for_cpu(
+            cpu,
+            crate::boot::smp::ap_thread_id(cpu),
+            0,
+            space,
+            crate::sched::kernel_entry(entry),
+        ) else {
+            crate::klog!(
+                Level::Error,
+                "smp: cpu {cpu} could not create an idle thread"
+            );
+            crate::arch::exit(EXIT_PANIC)
+        };
+
+        crate::sched::spawn_for_cpu(cpu, &mut thread);
+        crate::boot::smp::record_scheduler_threads(cpu, crate::sched::thread_count_for_cpu(cpu));
+        crate::boot::smp::mark_online(cpu);
+        crate::sched::switch_to_next_for_cpu(cpu);
+    }
 }
 
 /// Render a byte count in binary units for the boot log.

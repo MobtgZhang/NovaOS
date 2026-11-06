@@ -64,13 +64,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use limine::framebuffer::{FRAMEBUFFER_RGB, Framebuffer};
 use limine::request::{
     BootloaderInfoRequest, FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest,
-    StackSizeRequest,
+    MpRequest, StackSizeRequest,
 };
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 
 use crate::arch::shared::exit::EXIT_PANIC;
 use crate::boot::info::{
-    BootInfo, FramebufferInfo, MAX_MEMMAP_ENTRIES, MAX_PHYSICAL_ADDRESS, PAGE_SIZE,
+    BootInfo, FramebufferInfo, MAX_CPUS, MAX_MEMMAP_ENTRIES, MAX_PHYSICAL_ADDRESS, PAGE_SIZE,
 };
 use crate::klog;
 use crate::logger::Level;
@@ -87,6 +87,13 @@ pub static LIMINE_REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 #[unsafe(no_mangle)]
 pub static LIMINE_BASE_REVISION: BaseRevision =
     BaseRevision::with_revision(crate::LIMINE_PROTOCOL_REVISION);
+
+/// Multi-processor handover.
+///
+/// Flags are zero: the kernel uses the architectural xAPIC path, not x2APIC.
+/// The response exposes the bootstrap processor and one record per processor.
+#[unsafe(no_mangle)]
+pub static LIMINE_MP: MpRequest = MpRequest::new(0);
 
 /// Bootloader identity, for the boot banner.
 #[unsafe(no_mangle)]
@@ -265,6 +272,52 @@ pub unsafe fn capture() -> &'static BootInfo {
                 .actual_revision()
                 .unwrap_or(crate::LIMINE_PROTOCOL_REVISION),
         );
+
+        // Capture the processors and start the application processors.
+        //
+        // The bootloader's `MpInfo` records are not retained. Their identifiers
+        // are copied into `BootInfo`, and the APs are handed over while the
+        // records are still valid. Each AP waits on `boot::smp`'s gate until the
+        // bootstrap processor has completed the scheduler, address-space, and
+        // APIC setup it needs.
+        if let Some(response) = LIMINE_MP.response() {
+            let bsp_lapic_id = response.bsp_lapic_id;
+            (&raw mut (*target).bsp_lapic_id).write(bsp_lapic_id);
+            (&raw mut (*target).cpu_ids[0]).write(bsp_lapic_id);
+
+            let mut stored = 1usize;
+            for processor in response.cpus() {
+                if processor.lapic_id == bsp_lapic_id {
+                    continue;
+                }
+                if stored >= MAX_CPUS {
+                    panic!(
+                        "limine: processor count exceeds the kernel's static CPU table ({MAX_CPUS})"
+                    );
+                }
+
+                (&raw mut (*target).cpu_ids[stored]).write(processor.lapic_id);
+                processor.bootstrap(crate::boot::smp::ap_entry, stored as u64);
+                stored += 1;
+            }
+
+            (&raw mut (*target).cpu_count).write(stored);
+            klog!(
+                Level::Debug,
+                "limine: {} processors, bsp lapic id {bsp_lapic_id}, {} APs handed over",
+                stored,
+                stored - 1
+            );
+        } else {
+            // A bootloader without MP support still describes one processor.
+            (&raw mut (*target).cpu_count).write(1);
+            (&raw mut (*target).bsp_lapic_id).write(0);
+            (&raw mut (*target).cpu_ids[0]).write(0);
+            klog!(
+                Level::Warn,
+                "limine: no multi-processor response; treating boot as single-CPU"
+            );
+        }
 
         if let Some(response) = LIMINE_MODULES.response() {
             for module in response.modules() {

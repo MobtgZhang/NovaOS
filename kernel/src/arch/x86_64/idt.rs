@@ -608,6 +608,13 @@ static mut IDT: Idt = Idt {
     }; IDT_ENTRIES],
 };
 
+/// The pseudo-descriptor installed on every CPU.
+///
+/// It is written once by the bootstrap processor's `init`, then loaded again on
+/// each AP. Keeping it global rather than rebuilding a descriptor per CPU makes
+/// the table identity unambiguous: every CPU uses the same IDT bytes.
+static mut IDT_DESCRIPTOR: IdtPseudoDescriptor = IdtPseudoDescriptor([0; 10]);
+
 /// Shared exception reporter.
 ///
 /// Every CPU exception lands here from a naked trampoline that has put the
@@ -1308,44 +1315,39 @@ unsafe extern "C" fn timer_stub() -> ! {
 /// installed IDT.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nova_kernel_timer_handler(registers: *const UserRegisters) -> ! {
-    crate::klog!(crate::logger::Level::Info, "debug: timer entered");
+    let cpu = super::apic::cpu_index();
+    if cpu != 0 {
+        crate::boot::smp::record_tick(cpu);
+    }
+
     // SAFETY: delegated to this function's contract. The EOI is only valid
     // while servicing the interrupt, which is exactly what this is.
     unsafe {
         super::apic::eoi();
     }
 
-    // The trusted input source polls the PS/2 controller here. A key is routed
-    // only to the compositor's focused surface; a pointer is routed by the
-    // compositor's hit test. The driver holds no client capability and cannot
-    // be reached from ring 3.
-    //
-    // SAFETY: the timer path has interrupts masked, the service state is
-    // installed, and the PS/2 ports are owned by this driver.
-    unsafe {
-        crate::drivers::input::poll();
+    // Only the bootstrap processor owns the input driver and the user-service
+    // state. Application processors run kernel-only idle threads, so polling
+    // PS/2 from an AP would be a concurrent write to a single-CPU driver.
+    if cpu == 0 {
+        // The trusted input source polls the PS/2 controller here. A key is
+        // routed only to the compositor's focused surface; a pointer is routed
+        // by the compositor's hit test. The driver holds no client capability
+        // and cannot be reached from ring 3.
+        //
+        // SAFETY: the timer path has interrupts masked, the service state is
+        // installed, and the PS/2 ports are owned by this driver.
+        unsafe {
+            crate::drivers::input::poll();
+        }
     }
 
-    // SAFETY: delegated to this function's contract. The scheduler switches
-    // threads with interrupts masked, and the tick accounting is a single
-    // writer.
+    // SAFETY: delegated to this function's contract. The scheduler restores the
+    // interrupted thread — or the boot thread when no scheduler slot exists —
+    // from the saved register file and frame, so this handler never returns
+    // through its own Rust stack.
     unsafe {
-        crate::sched::handle_timer_interrupt(registers);
-    }
-
-    // The scheduler did not switch, so the interrupted thread resumes. The
-    // `iretq` pops the frame the stub's uniformisation made: the error-code
-    // placeholder, `RIP`, `CS`, `RFLAGS`, `RSP` and `SS`.
-    //
-    // The frame the *stub* built is one word lower than the frame the CPU
-    // pushed, because the stub opened a slot for the placeholder. `iretq`
-    // starts at the frame's `RIP`, so the placeholder word has to be stepped
-    // over first.
-    //
-    // SAFETY: the CPU's frame is on the kernel stack, and the six words above
-    // are the ones `iretq` consumes.
-    unsafe {
-        core::arch::asm!("add rsp, 8", "iretq", options(noreturn),);
+        crate::sched::handle_timer_interrupt_for_cpu(cpu, registers);
     }
 }
 
@@ -1529,20 +1531,37 @@ pub unsafe fn init() {
         // A `static` removes the question, and the declared `align(8)` removes
         // the other one: `lidt` rejects an unaligned operand, and a local's
         // alignment is whatever the compiler's stack layout happens to give it.
-        static mut IDT_DESCRIPTOR: IdtPseudoDescriptor = IdtPseudoDescriptor([0; 10]);
-
         // SAFETY: `init` is the sole writer, called once from `_start`, and the
         // write happens-before the `lidt` that reads it in the same block.
         let descriptor = &mut *addr_of_mut!(IDT_DESCRIPTOR);
         *descriptor =
             IdtPseudoDescriptor::new((size_of::<Idt>() - 1) as u16, (&raw const IDT) as u64);
 
+        // SAFETY: delegated to this function's contract.
+        unsafe { load() };
+    }
+
+    klog!(Level::Debug, "idt: loaded {IDT_ENTRIES} entries");
+}
+
+/// Load the already-built IDT on a processor.
+///
+/// Used by an application processor after the bootstrap processor has filled
+/// and loaded the table. The IDT bytes are shared; each CPU only needs its own
+/// `lidt` because the register is per-CPU.
+///
+/// # Safety
+///
+/// Must run after `init` has filled the table, and before interrupts are
+/// unmasked on this CPU.
+pub unsafe fn load() {
+    // SAFETY: delegated to this function's contract. The descriptor is a
+    // boot-installed static with the alignment `lidt` requires.
+    unsafe {
         core::arch::asm!(
             "lidt [{descriptor}]",
             descriptor = in(reg) addr_of!(IDT_DESCRIPTOR),
             options(readonly, nostack, preserves_flags)
         );
     }
-
-    klog!(Level::Debug, "idt: loaded {IDT_ENTRIES} entries");
 }

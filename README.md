@@ -2,7 +2,7 @@
 
 **An experimental Rust-based desktop operating system featuring a lightweight microkernel, capability-based security, and modular user-space services.**
 
-> ✅ **Status: bootable in QEMU (M0–M7).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop and network paths. It is still an experimental system, not a production desktop: SMP, IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network, but full multi-CPU scheduling is not. The roadmap below marks what is actually built.
+> ✅ **Status: bootable in QEMU (M0–M8).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop, network, and SMP paths. It is still an experimental system, not a production desktop: IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network. SMP has a verified per-CPU foundation, but user processes, services, and drivers remain owned by the bootstrap processor, so concurrent service scheduling is not claimed. The roadmap below marks what is actually built.
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
 
@@ -83,7 +83,7 @@ sequenceDiagram
 
 ## Roadmap
 
-All listed milestones are engineering gates. The first seven are implemented in the repository; the later ones are not.
+All listed milestones are engineering gates. M0–M8 are implemented in the repository; the later ones are not.
 
 - [x] **M0 — Foundation:** Repository, Rust workspace, architecture decisions, and QEMU test harness.
 - [x] **M1 — Boot:** UEFI boot, serial logging, exception handling, and memory-map validation.
@@ -93,7 +93,8 @@ All listed milestones are engineering gates. The first seven are implemented in 
 - [x] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
 - [x] **M6 — Desktop Alpha:** Input system, window compositor, terminal, editor, and file manager.
 - [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, TCP, ICMP, DHCP, and a versioned bounded socket API. IPv6 and real-hardware networking are not implemented.
-- [ ] **M8+ — Expansion:** SMP, package management, audio, user accounts, security hardening, and selected real hardware.
+- [x] **M8 — SMP foundation:** per-CPU schedulers, thread pools and stacks, GDT/TSS pairs, local APIC timers, AP startup, and kernel-only AP idle threads. CPU identity is taken from CPUID leaf 1 `EBX[31:24]`. The bootstrap processor still owns user processes, services, and drivers; concurrent service/driver SMP scheduling is not claimed.
+- [ ] **M9+ — Expansion:** concurrent multi-CPU service scheduling, package management, audio, user accounts, security hardening, and selected real hardware.
 
 **First major architecture milestone:** two isolated Rust processes communicate through a capability-protected IPC endpoint.
 
@@ -177,7 +178,19 @@ The M7 network path is a bounded phase-one stack, not a general TCP/IP implement
 - DHCP acquisition returns a bounded lease and acknowledgement from the emulated server;
 - the network service protocol is versioned and bounds names, datagrams, socket payloads, ICMP payloads, and reply sizes; socket handles are owned by the caller's task slot.
 
-Deliberately not implemented or not asserted: IPv6, a blocking socket API, full SMP scheduling, arbitrary external-host TCP reachability, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
+Deliberately not implemented or not asserted: IPv6, a blocking socket API, concurrent service/driver SMP scheduling, arbitrary external-host TCP reachability, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
+
+### M8 SMP foundation
+
+The SMP phase is a tested foundation, not a claim that the whole system is concurrently scheduled:
+
+- Limine's MP handover captures the processor IDs; each AP waits on `SMP_READY` before entering its startup path.
+- Each AP gets its own kernel stack, fault stack, GDT/TSS pair, local APIC timer, scheduler, thread pool, and one kernel-only idle thread.
+- The bootstrap processor remains the only owner of user processes, services, and drivers. APs never enter ring 3 and never touch the network, file, or display service state.
+- CPU identity is read from CPUID leaf 1 `EBX[31:24]`, not from the xAPIC ID register. On QEMU the ID register reads as zero for every processor, while CPUID reports the captured IDs.
+- The APIC timer uses periodic mode; its handler acknowledges the interrupt on the delivering CPU and accounts that CPU's own scheduler tick.
+- The timer's no-current-thread path restores the saved `r15..rax` register file before returning, rather than resuming through the frame alone.
+- `make run` and `cargo xtask run` both boot with `-smp 4`; the `smp_cpu_state` suite checks processor capture, AP online state, separate idle pools, per-CPU stacks/TSS, and per-AP scheduler ticks.
 
 ### Quality gates
 
