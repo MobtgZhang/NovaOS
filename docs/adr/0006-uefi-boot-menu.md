@@ -37,16 +37,22 @@ host-testable:
 
 **`crates/nova-boot-menu`** — UEFI application, `x86_64-unknown-uefi` only:
 
-- Reads the menu config from the ESP (`\EFI\NOVA\menu.conf`, embedded defaults
-  as fallback).
-- Renders the menu through the UEFI text console; keyboard navigation
-  (arrows/digits/enter/escape).
-- On selection, loads the chosen kernel ELF and prints its entry point using
-  `nova_elf`.
+- Renders a **graphical** menu through the UEFI GOP framebuffer (no text
+  console): a centered panel with title bar, a highlighted selection bar, and a
+  hint row, drawn with an embedded 5x7 bitmap font (glyphs verified against a
+  rendered preview). Prefers 1024x768 and falls back to the best available mode.
+- Two entries ship compiled in: `1. Desktop` (default) and `2. Safe Terminal`.
+- Keyboard input is read through *every* `SimpleTextIn` handle the firmware
+  exposes — OVMF surfaces several and which one is wired to the real keyboard
+  varies, so waiting on all of them is the portable choice. Digits select,
+  Enter picks the default, Escape aborts.
 - Explicitly **does not** transfer control to the kernel: the kernel-side
   consumer (reading `BootProtocol` instead of Limine's symbols) does not exist
   yet, and jumping to the kernel's higher-half entry without the paging Limine
   sets up would fault.
+- Verified under QEMU/OVMF: the menu draws into the GOP framebuffer (confirmed
+  by monitor `screendump`), and a monitor-injected `sendkey 1` reaches the
+  menu, selects Desktop, and the reboot path prints its status to serial.
 
 This crate is built only for a UEFI target and is excluded from the host test
 and clippy sweeps (`nova-test-host`, `nova-clippy`).
@@ -66,8 +72,9 @@ and clippy sweeps (`nova-test-host`, `nova-clippy`).
 
 - `make run` and `cargo xtask run` keep booting through Limine and are
   unchanged; they remain the only verified boot path.
-- The UEFI menu displays and loads config under QEMU/OVMF, but it halts after
-  printing the selected entry's details. It does not start NovaOS.
+- The UEFI menu renders graphically under QEMU/OVMF and accepts keyboard
+  selection, but it halts after printing the selected entry's details. It does
+  not start NovaOS.
 - Four target families appear in the protocol model and the default menu, but
   only x86-64 has a kernel backend; the rest are placeholders.
 

@@ -610,7 +610,7 @@ mod tests {
             NET_MAX_RECV,
             nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_RECV_REPLY_SIZE
         );
-        assert!(NET_MAX_NAME > 0 && NET_MAX_DATAGRAM > 0 && NET_MAX_RECV > 0);
+        const { assert!(NET_MAX_NAME > 0 && NET_MAX_DATAGRAM > 0 && NET_MAX_RECV > 0) };
     }
 
     #[test]
@@ -696,6 +696,6 @@ mod tests {
             NET_MAX_ICMP_REPLY,
             nova_abi::ipc::MAX_INLINE_PAYLOAD - NET_ICMP_REPLY_SIZE
         );
-        assert!(NET_MAX_SOCKET_PAYLOAD > 0 && NET_MAX_ICMP_PAYLOAD > 0);
+        const { assert!(NET_MAX_SOCKET_PAYLOAD > 0 && NET_MAX_ICMP_PAYLOAD > 0) };
     }
 }

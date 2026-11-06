@@ -194,13 +194,13 @@ The SMP phase is a tested foundation, not a claim that the whole system is concu
 - The timer's no-current-thread path restores the saved `r15..rax` register file before returning, rather than resuming through the frame alone.
 - `make run` and `cargo xtask run` both boot with `-smp 4`; the `smp_cpu_state` suite checks processor capture, AP online state, separate idle pools, per-CPU stacks/TSS, and per-AP scheduler ticks.
 
-### UEFI boot menu (NovaBoot protocol) — planned
+### UEFI boot menu (NovaBoot protocol) — implemented, not yet a boot path
 
 A separate UEFI boot-menu layer is implemented on top of the [`nova-boot`] protocol crate. It is **not** yet wired to hand control to the kernel, so `make run` (Limine) remains the only verified boot path; this section documents the design boundary rather than a shipped feature.
 
 - `crates/nova-boot` defines the architecture-neutral [`BootProtocol`] snapshot (magic, version, target architecture, kernel entry/load address, CPU table, memory map, framebuffer) and a bounded [`BootMenu`] model, all validated on the host.
-- `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that reads a menu config from the ESP, renders the menu through the UEFI text console, navigates it with the keyboard, and on selection loads the chosen kernel ELF and prints its entry point.
-- The menu covers four target families (`x86_64`, `aarch64`, `riscv64`, `loongarch64`) in the protocol model, but only x86-64 has a kernel backend today; the other entries are placeholders.
+- `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that renders a **graphical** boot menu through the UEFI GOP (Graphics Output Protocol) framebuffer — no text console involved: a centered panel, a highlighted selection bar, and a hint row drawn with an embedded 5x7 bitmap font at 1024x768 (other modes fall back). Two entries ship compiled in: `1. Desktop (default)` and `2. Safe Terminal`. The keyboard is read through *every* `SimpleTextIn` handle the firmware exposes (OVMF surfaces several; the real keyboard may be any of them), so selection works on real firmware as well as under QEMU.
+- The menu covers four target families (`x86_64`, aarch64, riscv64, loongarch64) in the protocol model, but only x86-64 has a kernel backend today; the other entries are placeholders.
 - The missing piece to actually boot through the menu is the kernel-side consumer: reading and validating the `BootProtocol` snapshot (instead of Limine's exported symbols) and transferring control at the entry point. That hand-off is deliberately not claimed here.
 
 [`nova-boot`]: crates/nova-boot

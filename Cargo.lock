@@ -55,8 +55,6 @@ version = "0.1.0"
 name = "nova-boot-menu"
 version = "0.1.0"
 dependencies = [
- "nova-boot",
- "nova-elf",
  "uefi",
 ]
 

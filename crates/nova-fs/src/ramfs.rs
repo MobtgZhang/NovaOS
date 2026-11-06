@@ -365,8 +365,9 @@ impl RamFs {
     /// Find the child of `dir` with the given name.
     fn find_child(&self, dir: usize, name: &[u8]) -> Option<usize> {
         let inode = &self.inodes[dir];
-        for index in 0..usize::from(inode.child_count) {
-            let child = usize::from(inode.children[index]);
+        let count = usize::from(inode.child_count);
+        for &child in &inode.children[..count] {
+            let child = usize::from(child);
             let candidate = &self.inodes[child];
             if candidate.name_len as usize == name.len()
                 && &candidate.name[..usize::from(candidate.name_len)] == name
@@ -468,32 +469,31 @@ impl RamFs {
 
     /// Allocate an open-table entry for `inode`.
     fn alloc_handle(&mut self, inode: usize) -> Result<FileHandle, FsError> {
-        for slot in 0..MAX_OPEN_FILES {
-            if self.open[slot].in_use {
-                continue;
-            }
-            let generation = self.open[slot]
-                .generation
-                .checked_add(1)
-                .ok_or(FsError::Quota)?;
-            // The generation starts at 1 so that a zeroed handle is never a
-            // valid one, matching the capability table's "slot 0 is never
-            // valid" discipline.
-            if generation == 0 {
-                return Err(FsError::Quota);
-            }
-            self.open[slot] = OpenEntry {
-                inode: inode as u16,
-                offset: 0,
-                generation,
-                in_use: true,
-            };
-            return Ok(FileHandle {
-                slot: slot as u32,
-                generation,
-            });
+        let Some((slot, entry)) = self
+            .open
+            .iter_mut()
+            .enumerate()
+            .find(|(_, entry)| !entry.in_use)
+        else {
+            return Err(FsError::Quota);
+        };
+        let generation = entry.generation.checked_add(1).ok_or(FsError::Quota)?;
+        // The generation starts at 1 so that a zeroed handle is never a
+        // valid one, matching the capability table's "slot 0 is never
+        // valid" discipline.
+        if generation == 0 {
+            return Err(FsError::Quota);
         }
-        Err(FsError::Quota)
+        *entry = OpenEntry {
+            inode: inode as u16,
+            offset: 0,
+            generation,
+            in_use: true,
+        };
+        Ok(FileHandle {
+            slot: slot as u32,
+            generation,
+        })
     }
 
     /// Resolve a handle to its open-table slot, or report it as stale.

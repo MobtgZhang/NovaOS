@@ -7,8 +7,6 @@ license.workspace = true
 description = "NovaOS UEFI boot menu application implementing the NovaBoot unified boot protocol menu layer"
 
 [dependencies]
-nova-boot = { path = "../nova-boot" }
-nova-elf = { path = "../nova-elf" }
 uefi = { version = "0.30", features = ["alloc", "global_allocator", "panic_handler"] }
 
 [lints.rust]

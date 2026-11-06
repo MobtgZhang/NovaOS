@@ -1,19 +1,25 @@
-//! NovaOS UEFI 启动菜单应用（NovaBoot 统一启动协议的菜单层）。
+//! NovaOS UEFI boot menu application (the menu layer of the NovaBoot unified
+//! boot protocol, UEFI GOP graphical edition).
 //!
-//! 这是一个 UEFI 应用，用于在固件阶段展示操作系统选择菜单：
-//! 从 ESP 读取菜单配置、在控制台渲染菜单、响应键盘导航、选中条目后
-//! 加载内核 ELF 头部并打印 NovaBoot 协议快照的关键字段。
+//! Renders the OS-selection menu straight into the graphics framebuffer under
+//! QEMU/OVMF — no text console involved.
 //!
-//! # 设计边界（重要）
+//! # Design boundary (important)
 //!
-//! 本应用只负责“菜单 + 协议快照生成”。它目前**不**尝试把控制权交给
-//! 内核入口点：NovaOS 内核目前通过 Limine 引导（`make run` 路径保持不变），
-//! 而通过 NovaBoot 统一协议把控制权交给内核，需要内核端读取并校验
-//! `BootProtocol` 快照，属于下一阶段。此处的跳转被明确标记为 TODO，
-//! 不会声称已实现内核通过 UEFI 菜单启动。
+//! This application only implements the "UEFI-phase graphical menu". It does
+//! **not** hand control to the kernel entry point: NovaOS currently boots via
+//! Limine (the `make run` path stays untouched), and a NovaBoot hand-off needs
+//! a kernel-side reader that validates the `BootProtocol` snapshot — the next
+//! phase. The jump site is marked with a TODO and no kernel boot through the
+//! menu is claimed.
 //!
-//! 四个架构（x86_64、aarch64、riscv64、loongarch64）在菜单配置中都有
-//! 代表，但只有 x86_64 内核后端是完整的；其它架构条目是协议层的占位。
+//! Menu entries:
+//!   1. Desktop (default)   -> boot into the desktop
+//!   2. Safe Terminal        -> boot straight into a terminal
+//!
+//! Four architectures (x86_64, aarch64, riscv64, loongarch64) appear in the
+//! protocol model, but only the x86-64 kernel backend is complete; the others
+//! are protocol placeholders.
 
 #![no_std]
 #![no_main]
@@ -21,309 +27,436 @@
 
 extern crate alloc;
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+use alloc::vec::Vec;
 
-use core::fmt::Write as _;
-
-use nova_boot::menu_config::parse;
-use nova_boot::{BootMenu, BootMenuEntry, MAX_MENU_ENTRIES, MAX_MENU_NAME, MAX_MENU_PATH};
-use nova_elf::Elf;
-use uefi::entry;
+use uefi::Event;
 use uefi::prelude::*;
-use uefi::proto::console::text::{Key, ScanCode};
-use uefi::proto::media::file::{File, FileAttribute, FileMode};
+use uefi::proto::console::gop::{BltPixel, GraphicsOutput, PixelFormat};
+use uefi::proto::console::text::{Input, Key, ScanCode};
+use uefi::table::boot::{BootServices, ScopedProtocol, SearchType};
 use uefi::table::runtime::ResetType;
-use uefi::{CString16, Status};
 
-/// 菜单配置文件在 ESP 上的相对路径（相于本 UEFI 镜像启动所在的卷）。
-const MENU_CONFIG_PATH: &str = "\\EFI\\NOVA\\menu.conf";
+mod font;
+use font::{CHAR_SPACING, FONT_HEIGHT, FONT_WIDTH, char_rows, text_width};
 
-/// 默认菜单：当配置文件缺失时使用。四个架构各一条，只有 x86_64 有对应
-/// 完整的内核后端，其它架构目前是协议层占位。
-const DEFAULT_MENU: &str = "\
-title NovaOS x86_64
-path /boot/nova-kernel.elf
-arch x86_64
+/// Colors (`BltPixel::new(red, green, blue)`).
+const COLOR_BG: BltPixel = BltPixel::new(20, 20, 35); // dark blue-grey backdrop
+const COLOR_PANEL: BltPixel = BltPixel::new(30, 30, 50); // panel body
+const COLOR_TITLE_BG: BltPixel = BltPixel::new(40, 40, 70); // title bar
+const COLOR_TEXT: BltPixel = BltPixel::new(255, 255, 255); // white text
+const COLOR_HIGHLIGHT: BltPixel = BltPixel::new(100, 150, 255); // selection blue
+const COLOR_HIGHLIGHT_TEXT: BltPixel = BltPixel::new(255, 255, 255);
+const COLOR_DIM: BltPixel = BltPixel::new(150, 150, 170); // hint grey
+const COLOR_BORDER: BltPixel = BltPixel::new(90, 90, 120); // panel border
 
-title NovaOS AArch64
-path /boot/nova-kernel-aarch64.elf
-arch aarch64
+/// A menu entry.
+#[derive(Clone, Copy)]
+struct MenuItem {
+    key: char,           // shortcut '1' / '2'
+    label: &'static str, // display text
+    desc: &'static str,  // sub-caption
+}
 
-title NovaOS RISC-V 64
-path /boot/nova-kernel-riscv64.elf
-arch riscv64
+/// The two boot options.
+const MENU_ITEMS: &[MenuItem] = &[
+    MenuItem {
+        key: '1',
+        label: "Desktop",
+        desc: "Enter the desktop (default)",
+    },
+    MenuItem {
+        key: '2',
+        label: "Safe Terminal",
+        desc: "Boot straight to a terminal",
+    },
+];
 
-title NovaOS LoongArch 64
-path /boot/nova-kernel-loongarch64.elf
-arch loongarch64
-";
-
+/// UEFI entry point.
 #[entry]
-/// UEFI 入口点。
 fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
-    // 必须在任何分配或 `println!` 之前初始化 UEFI helper：`global_allocator`
-    // 所需的系统表句柄在这里才会被 `allocator` 缓存。
-    uefi::helpers::init(&mut system_table).expect("NovaOS UEFI helpers 初始化失败");
+    // Must run before any allocation or `println!`.
+    uefi::helpers::init(&mut system_table).expect("NovaOS UEFI helpers init failed");
 
-    uefi::println!("\r\nNovaOS Boot Menu");
-    uefi::println!("================\r\n");
-
-    // 先读取菜单配置（需要启动服务，此借用在读取完成后结束）。
-    let config_text = {
+    // The whole program runs inside an immutable-borrow closure: `bs` keeps
+    // borrowing `system_table`, and both the GOP and the keyboard inputs are
+    // opened through it, so no mutable borrow of `system_table` is needed.
+    (|| -> Status {
         let bs = system_table.boot_services();
-        match read_menu_config(bs) {
-            Ok(text) => {
-                uefi::println!("menu config loaded from {}", MENU_CONFIG_PATH);
-                text
-            }
+
+        // ---------- 1. Locate and open the GOP ----------
+        let handles = match bs.locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>()) {
+            Ok(h) => h,
             Err(error) => {
-                uefi::println!(
-                    "menu config unavailable ({:?}); using embedded defaults",
-                    error
-                );
-                DEFAULT_MENU.to_string()
+                uefi::println!("GOP handles lookup failed: {:?}", error.status());
+                return error.status();
+            }
+        };
+        if handles.is_empty() {
+            uefi::println!("No Graphics Output Protocol device found");
+            return Status::UNSUPPORTED;
+        }
+        let mut gop = match bs.open_protocol_exclusive::<GraphicsOutput>(handles[0]) {
+            Ok(g) => g,
+            Err(error) => {
+                uefi::println!("GOP open failed: {:?}", error.status());
+                return error.status();
+            }
+        };
+
+        // ---------- 2. Open every keyboard input handle ----------
+        let stdin_handles = match bs.locate_handle_buffer(SearchType::from_proto::<Input>()) {
+            Ok(h) => h,
+            Err(_) => {
+                uefi::println!("No input device found");
+                return Status::UNSUPPORTED;
+            }
+        };
+        if stdin_handles.is_empty() {
+            uefi::println!("No input device found");
+            return Status::UNSUPPORTED;
+        }
+        uefi::println!("input handles: {}", stdin_handles.len());
+        // Which handle is wired to the real keyboard differs per firmware
+        // (OVMF exposes several), so we open and wait on all of them.
+        let mut inputs: Vec<ScopedProtocol<Input>> = Vec::new();
+        for handle in stdin_handles.iter() {
+            if let Ok(protocol) = bs.open_protocol_exclusive::<Input>(*handle) {
+                inputs.push(protocol);
             }
         }
-    };
-
-    let configs = match parse(&config_text) {
-        Ok(configs) if !configs.is_empty() => configs,
-        _ => {
-            uefi::println!("failed to parse menu config; using embedded defaults");
-            parse(DEFAULT_MENU).expect("embedded default menu must parse")
+        if inputs.is_empty() {
+            uefi::println!("no input protocol could be opened");
+            return Status::UNSUPPORTED;
         }
-    };
 
-    // 将解析出的条目装入栈上固定缓冲，再构造 BorrowMenuEntry 切片。
-    let mut names = [[0u8; MAX_MENU_NAME]; MAX_MENU_ENTRIES];
-    let mut paths = [[0u8; MAX_MENU_PATH]; MAX_MENU_ENTRIES];
-    let mut count = 0usize;
-    // 把名称与路径拷进栈上固定缓冲（`parse` 已保证各自不超过上限，所以索引连续）。
-    for (index, cfg) in configs.iter().enumerate().take(MAX_MENU_ENTRIES) {
-        let name_bytes = cfg.name.as_bytes();
-        let path_bytes = cfg.path.as_bytes();
-        names[index][..name_bytes.len()].copy_from_slice(name_bytes);
-        paths[index][..path_bytes.len()].copy_from_slice(path_bytes);
-        count += 1;
-    }
-    if count == 0 {
-        uefi::println!("no valid menu entries; halting");
-        return Status::ABORTED;
-    }
-
-    // 把引用存进 MaybeUninit 槽位（只做不可变借用）。
-    let mut slots = [core::mem::MaybeUninit::<BootMenuEntry>::uninit(); MAX_MENU_ENTRIES];
-    for (index, cfg) in configs.iter().enumerate().take(count) {
-        slots[index] = core::mem::MaybeUninit::new(BootMenuEntry {
-            id: cfg.id,
-            name: &names[index][..cfg.name.as_bytes().len()],
-            architecture: cfg.architecture,
-            kernel_path: &paths[index][..cfg.path.as_bytes().len()],
-            flags: cfg.flags,
-        });
-    }
-
-    let entries_slice =
-        unsafe { core::slice::from_raw_parts(slots.as_ptr() as *const BootMenuEntry, count) };
-    let menu = BootMenu::new(entries_slice);
-
-    // 交互式菜单循环。
-    let mut selected: usize = 0;
-    'menu: loop {
-        draw_menu(&mut system_table, &configs, selected);
-
-        let key = wait_for_key(&mut system_table);
-        match key {
-            Key::Special(ScanCode::UP) => {
-                if selected > 0 {
-                    selected -= 1;
-                }
+        // ---------- 3. Pick a video mode (1024x768 preferred) ----------
+        let mut chosen = None;
+        let mut first_mode = None;
+        for m in gop.modes(bs) {
+            let (w, h) = m.info().resolution();
+            let f = m.info().pixel_format();
+            uefi::println!("GOP mode: {}x{} fmt={:?}", w, h, f);
+            if first_mode.is_none() {
+                first_mode = Some(m);
             }
-            Key::Special(ScanCode::DOWN) => {
-                if selected + 1 < count {
-                    selected += 1;
-                }
+            if (w, h) == (1024, 768) {
+                chosen = Some(m);
+                break;
             }
-            Key::Printable(ch) => {
-                let c = char::from(ch);
-                if c == '\r' || c == '\n' {
-                    // 回车：确认选中。
-                    break 'menu;
-                } else if c >= '1' && c <= '9' {
-                    let digit = (c as u16 - b'1' as u16) as usize;
-                    if digit < count {
-                        selected = digit;
-                        break 'menu;
+            if chosen.is_none() && (w, h) == (800, 600) {
+                chosen = Some(m);
+            }
+        }
+        let mode = match chosen {
+            Some(m) => m,
+            None => match first_mode {
+                Some(m) => m,
+                None => {
+                    uefi::println!("No usable GOP mode");
+                    return Status::UNSUPPORTED;
+                }
+            },
+        };
+
+        if let Err(error) = gop.set_mode(&mode) {
+            uefi::println!("GOP set_mode failed: {:?}", error.status());
+            return error.status();
+        }
+
+        let info = gop.current_mode_info();
+        let (screen_w, screen_h) = info.resolution();
+        let stride = info.stride();
+        let fmt = info.pixel_format();
+
+        uefi::println!(
+            "GOP active: {}x{} stride={} fmt={:?}",
+            screen_w,
+            screen_h,
+            stride,
+            fmt
+        );
+
+        // ---------- 4. Main loop: draw the menu, wait for keys ----------
+        loop {
+            {
+                let mut screen = borrow_framebuffer(&mut gop, stride, screen_w, screen_h, fmt);
+                draw_menu(&mut screen, 0);
+            }
+
+            let key = wait_for_key(&mut inputs, bs);
+
+            let mut selected_index: Option<usize> = None;
+            match key {
+                Key::Special(ScanCode::UP) => {}
+                Key::Special(ScanCode::DOWN) => {}
+                Key::Printable(ch) => {
+                    let c = char::from(ch);
+                    // Enter, or the shortcut of the default entry, pick Desktop.
+                    if c == '\r' || c == '\n' || c == '1' {
+                        selected_index = Some(0);
+                    } else if c == '2' {
+                        selected_index = Some(1);
+                    }
+                }
+                Key::Special(ScanCode::ESCAPE) => {
+                    uefi::println!("boot aborted by user");
+                    return Status::ABORTED;
+                }
+                _ => {}
+            }
+
+            if let Some(index) = selected_index {
+                let item = MENU_ITEMS[index];
+
+                // Redraw with the selection applied; hold a few frames so the
+                // user sees the result.
+                for _ in 0..30 {
+                    let mut screen = borrow_framebuffer(&mut gop, stride, screen_w, screen_h, fmt);
+                    draw_menu(&mut screen, index);
+                }
+
+                uefi::println!("selected: {} ({})", item.label, item.desc);
+
+                // TODO: write the NovaBoot BootProtocol snapshot, call
+                // ExitBootServices, and jump to the kernel entry point. The
+                // kernel side does not read NovaBoot yet, so no jump happens.
+                uefi::println!("NOTE: kernel hand-off via NovaBoot is not yet wired.");
+                uefi::println!("press any key to reboot");
+                let _ = wait_for_key(&mut inputs, bs);
+                system_table
+                    .runtime_services()
+                    .reset(ResetType::WARM, Status::SUCCESS, None);
+            }
+        }
+    })()
+}
+
+/// Map the GOP framebuffer into a writable byte slice and wrap it in a
+/// [`Screen`] draw context.
+fn borrow_framebuffer<'a>(
+    gop: &'a mut ScopedProtocol<GraphicsOutput>,
+    stride: usize,
+    screen_w: usize,
+    screen_h: usize,
+    fmt: PixelFormat,
+) -> Screen<'a> {
+    let mut fb = gop.frame_buffer();
+    let ptr = fb.as_mut_ptr();
+    let len = fb.size();
+    // Safety: `ptr`/`len` come from the GOP frame buffer and describe a
+    // device-backed memory range; we only write within `stride * height * 4`
+    // computed from the same mode info, and never past `len`.
+    let slice = unsafe { core::slice::from_raw_parts_mut(ptr, len) };
+    Screen {
+        fb: slice,
+        stride,
+        width: screen_w,
+        height: screen_h,
+        fmt,
+    }
+}
+
+/// A draw context over the GOP framebuffer: pixel format, stride and bounds
+/// bundled so drawing primitives take geometry only, not eight arguments.
+struct Screen<'fb> {
+    fb: &'fb mut [u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    fmt: PixelFormat,
+}
+
+impl Screen<'_> {
+    /// Write one pixel, clipped to the screen bounds.
+    fn set_pixel(&mut self, x: usize, y: usize, color: BltPixel) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let (r, g, b) = (color.red, color.green, color.blue);
+        let base = (y * self.stride + x) * 4;
+        if base + 3 >= self.fb.len() {
+            return;
+        }
+        // GOP exposes little-endian 32bpp pixels: the `Rgb` format puts red in
+        // the low byte, every other format (Bgr, Bitmask in QEMU) puts blue
+        // there. Anything we cannot address directly would be BltOnly and is
+        // treated like Bgr.
+        let (c0, c1, c2) = if self.fmt == PixelFormat::Rgb {
+            (r, g, b)
+        } else {
+            (b, g, r)
+        };
+        self.fb[base] = c0;
+        self.fb[base + 1] = c1;
+        self.fb[base + 2] = c2;
+        self.fb[base + 3] = 0;
+    }
+
+    /// Fill a solid rectangle, clipped.
+    fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: BltPixel) {
+        for row in y..y.saturating_add(h) {
+            for col in x..x.saturating_add(w) {
+                self.set_pixel(col, row, color);
+            }
+        }
+    }
+
+    /// Draw a 1-pixel rectangle outline, clipped.
+    fn rect_outline(&mut self, x: usize, y: usize, w: usize, h: usize, color: BltPixel) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let bottom = y.saturating_add(h).saturating_sub(1);
+        let right = x.saturating_add(w).saturating_sub(1);
+        for cx in x..=right {
+            self.set_pixel(cx, y, color);
+            self.set_pixel(cx, bottom, color);
+        }
+        for cy in y..=bottom {
+            self.set_pixel(x, cy, color);
+            self.set_pixel(right, cy, color);
+        }
+    }
+
+    /// Draw text, scaling each 5x7 glyph by `scale`, clipped.
+    fn draw_text(&mut self, mut x: usize, y: usize, text: &str, color: BltPixel, scale: usize) {
+        for ch in text.chars() {
+            if let Some(rows) = char_rows(ch) {
+                for row in 0..FONT_HEIGHT {
+                    for col in 0..FONT_WIDTH {
+                        if rows[row * FONT_WIDTH + col] {
+                            let px = x + col * scale;
+                            let py = y + row * scale;
+                            for dy in 0..scale {
+                                for dx in 0..scale {
+                                    self.set_pixel(px + dx, py + dy, color);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            Key::Special(ScanCode::ESCAPE) => {
-                uefi::println!("\r\nboot aborted by user");
-                return Status::ABORTED;
+            x = x.saturating_add((FONT_WIDTH + CHAR_SPACING) * scale);
+            if x >= self.width {
+                break;
             }
-            _ => {}
         }
     }
-
-    let entry = menu
-        .select(configs[selected].id)
-        .expect("selected entry exists");
-    uefi::println!();
-    let name_str = core::str::from_utf8(entry.name).unwrap_or("<invalid>");
-    uefi::println!("selected: {}", name_str);
-    uefi::println!("architecture: {}", entry.architecture.name());
-    let path_str = core::str::from_utf8(entry.kernel_path).unwrap_or("<invalid>");
-    uefi::println!("kernel path: {}", path_str);
-
-    // 尽力加载内核 ELF 头部并打印入口点（不加载全部段，只解析头部）。
-    load_kernel_header(system_table.boot_services(), entry.kernel_path);
-
-    // TODO: 此处应写入 NovaBoot BootProtocol 快照到已约定的物理地址、
-    // 调用 ExitBootServices，并跳转到内核入口点。需要内核端支持读取
-    // NovaBoot 协议（目前内核仍依赖 Limine 符号），故暂不执行跳转，
-    // 避免声称未验证的功能。`make run`（Limine 路径）不受影响。
-    uefi::println!();
-    uefi::println!("NOTE: kernel hand-off via NovaBoot is not yet wired.");
-    uefi::println!("press any key to reboot");
-    let _ = wait_for_key(&mut system_table);
-    // `reset` 不返回（固件重启机器），后面不需要返回值。
-    system_table
-        .runtime_services()
-        .reset(ResetType::WARM, Status::SUCCESS, None)
 }
 
-/// 把菜单绘制到 UEFI 文本输出控制台。
-fn draw_menu(
-    system_table: &mut SystemTable<Boot>,
-    configs: &[nova_boot::menu_config::MenuEntryConfig],
-    selected: usize,
-) {
-    let stdout = system_table.stdout();
-    let _ = writeln!(stdout, "\r\nNovaOS Boot Menu");
-    let _ = writeln!(stdout, "=================");
-    let _ = writeln!(
-        stdout,
-        "arrow keys: navigate   enter: boot   digits: direct select   esc: abort"
+/// Draw the complete menu screen.
+fn draw_menu(screen: &mut Screen, selected: usize) {
+    let (screen_w, screen_h) = (screen.width, screen.height);
+
+    // Backdrop.
+    screen.fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
+
+    // Panel and border.
+    let panel_w = 640.min(screen_w);
+    let panel_h = 420.min(screen_h);
+    let panel_x = (screen_w - panel_w) / 2;
+    let panel_y = (screen_h - panel_h) / 2;
+    screen.fill_rect(panel_x, panel_y, panel_w, panel_h, COLOR_PANEL);
+    screen.rect_outline(panel_x, panel_y, panel_w, panel_h, COLOR_BORDER);
+
+    // Title bar.
+    let title_h = 56;
+    screen.fill_rect(panel_x, panel_y, panel_w, title_h, COLOR_TITLE_BG);
+    screen.draw_text(
+        panel_x + 24,
+        panel_y + 16,
+        "NovaOS Boot Menu",
+        COLOR_TEXT,
+        2,
     );
-    let _ = writeln!(stdout);
-    for (index, cfg) in configs.iter().enumerate() {
-        let prefix = if index == selected { "> " } else { "  " };
-        let _ = writeln!(stdout, "{}{}", prefix, cfg.name);
+
+    // Entries.
+    let item_h = 64;
+    let item_y0 = panel_y + title_h + 32;
+    let gap = 20;
+
+    for (index, item) in MENU_ITEMS.iter().enumerate() {
+        let item_y = item_y0 + index * (item_h + gap);
+        let is_selected = index == selected;
+
+        // Highlight bar on the selected entry.
+        if is_selected {
+            screen.fill_rect(
+                panel_x + 40,
+                item_y,
+                panel_w - 80,
+                item_h,
+                COLOR_HIGHLIGHT,
+            );
+        }
+
+        // Shortcut number.
+        let mut key_text = String::new();
+        key_text.push(item.key);
+        key_text.push('.');
+        key_text.push(' ');
+        screen.draw_text(
+            panel_x + 64,
+            item_y + 14,
+            &key_text,
+            if is_selected {
+                COLOR_HIGHLIGHT_TEXT
+            } else {
+                COLOR_DIM
+            },
+            2,
+        );
+
+        // Label.
+        screen.draw_text(
+            panel_x + 110,
+            item_y + 14,
+            item.label,
+            if is_selected {
+                COLOR_HIGHLIGHT_TEXT
+            } else {
+                COLOR_TEXT
+            },
+            2,
+        );
+
+        // Sub-caption.
+        screen.draw_text(panel_x + 110, item_y + 38, item.desc, COLOR_DIM, 1);
     }
-    let _ = writeln!(stdout);
+
+    // Footer hint.
+    let hint = "Up/Down: navigate   Enter: select   1/2: direct   Esc: abort";
+    let hint_w = text_width(hint);
+    screen.draw_text(
+        panel_x + (panel_w - hint_w) / 2,
+        panel_y + panel_h - 32,
+        hint,
+        COLOR_DIM,
+        1,
+    );
 }
 
-/// 等待并读取下一次按键（阻塞，直到有按键）。
-///
-/// `stdin()` 与 `boot_services()` 分别对 `SystemTable` 取可变与共享借用，
-/// 因此不能同时持有；这里把每次借用都限制在一个小作用域里。
-fn wait_for_key(system_table: &mut SystemTable<Boot>) -> Key {
+/// Block until any input handle delivers a key, and return it.
+fn wait_for_key(inputs: &mut [ScopedProtocol<Input>], bs: &BootServices) -> Key {
     loop {
-        let event = {
-            let stdin = system_table.stdin();
-            stdin
-                .wait_for_key_event()
-                .expect("UEFI input device has no wait-for-key event")
-        };
-        {
-            let bs = system_table.boot_services();
-            let _ = bs.wait_for_event(&mut [event]);
+        // Collect every handle's key event (`Event` is not `Clone`, so fetch
+        // them fresh each round).
+        let mut events: Vec<Event> = Vec::new();
+        for input in inputs.iter_mut() {
+            if let Some(event) = input.wait_for_key_event() {
+                events.push(event);
+            }
         }
-        let stdin = system_table.stdin();
-        match stdin.read_key() {
-            Ok(Some(key)) => return key,
-            Ok(None) => {}
-            Err(error) => uefi::println!("keyboard read error: {:?}", error.status()),
+        if events.is_empty() {
+            continue;
         }
-    }
-}
-
-/// 从本 UEFI 镜像启动所在的卷读取菜单配置文件。
-fn read_menu_config(bs: &BootServices) -> Result<String, Status> {
-    let mut fs = bs
-        .get_image_file_system(bs.image_handle())
-        .map_err(|e| e.status())?;
-    let mut root = fs.open_volume().map_err(|e| e.status())?;
-    let path = CString16::try_from(MENU_CONFIG_PATH).map_err(|_| Status::INVALID_PARAMETER)?;
-    let handle = root
-        .open(&path, FileMode::Read, FileAttribute::empty())
-        .map_err(|e| e.status())?;
-    let mut file = handle
-        .into_regular_file()
-        .ok_or(Status::INVALID_PARAMETER)?;
-    let mut buffer = [0u8; 4096];
-    let mut offset = 0usize;
-    while offset < buffer.len() {
-        let n = file.read(&mut buffer[offset..]).map_err(|e| e.status())?;
-        if n == 0 {
-            break;
-        }
-        offset += n;
-    }
-    core::str::from_utf8(&buffer[..offset])
-        .map(|s| s.to_string())
-        .map_err(|_| Status::INVALID_PARAMETER)
-}
-
-/// 尽力打开内核 ELF 文件并打印其入口点与可加载段数。
-fn load_kernel_header(bs: &BootServices, path: &[u8]) {
-    let path16: String = path.iter().copied().map(|c| c as char).collect();
-    let uefi_path = path16.replace('/', "\\");
-    let cpath = match CString16::try_from(uefi_path.as_str()) {
-        Ok(c) => c,
-        Err(_) => {
-            uefi::println!("kernel path invalid: {}", path16);
-            return;
-        }
-    };
-
-    let mut fs = match bs.get_image_file_system(bs.image_handle()) {
-        Ok(fs) => fs,
-        Err(error) => {
-            uefi::println!("cannot open image file system: {:?}", error.status());
-            return;
-        }
-    };
-    let mut root = match fs.open_volume() {
-        Ok(root) => root,
-        Err(error) => {
-            uefi::println!("cannot open volume: {:?}", error.status());
-            return;
-        }
-    };
-    let handle = match root.open(&cpath, FileMode::Read, FileAttribute::empty()) {
-        Ok(handle) => handle,
-        Err(error) => {
-            uefi::println!("cannot open kernel {}: {:?}", path16, error.status());
-            return;
-        }
-    };
-    let mut file = match handle.into_regular_file() {
-        Some(file) => file,
-        None => {
-            uefi::println!("kernel path is not a regular file: {}", path16);
-            return;
-        }
-    };
-
-    let mut buffer = [0u8; 4096];
-    let n = match file.read(&mut buffer) {
-        Ok(n) => n,
-        Err(error) => {
-            uefi::println!("cannot read kernel: {:?}", error.status());
-            return;
-        }
-    };
-
-    match Elf::parse(&buffer[..n]) {
-        Ok(elf) => {
-            uefi::println!("kernel ELF parsed OK");
-            uefi::println!("entry point: 0x{:016X}", elf.entry_point());
-            let loadable = elf.loadable_segments().count();
-            uefi::println!("loadable segments: {}", loadable);
-        }
-        Err(error) => {
-            uefi::println!("kernel ELF parse error: {:?}", error.tag());
+        let _ = bs.wait_for_event(&mut events);
+        for input in inputs.iter_mut() {
+            if let Ok(Some(key)) = input.read_key() {
+                uefi::println!("key received: {:?}", key);
+                return key;
+            }
         }
     }
 }
