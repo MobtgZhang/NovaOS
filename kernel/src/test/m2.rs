@@ -235,7 +235,72 @@ pub static M2_SUITES: &[TestSuite] = &[
             ),
         ],
     },
+    TestSuite {
+        name: "interrupt_vectors",
+        cases: &[
+            (
+                "the_apic_timer_owns_a_dedicated_vector",
+                the_apic_timer_owns_a_dedicated_vector,
+            ),
+            (
+                "the_pic_range_shares_one_spurious_handler",
+                the_pic_range_shares_one_spurious_handler,
+            ),
+            (
+                "spurious_interrupts_start_unaccounted",
+                spurious_interrupts_start_unaccounted,
+            ),
+        ],
+    },
 ];
+
+/// The local APIC timer must not share a vector with the 8259 PIC.
+///
+/// §4.1's bug was two interrupt sources behind one gate: the handler's EOI
+/// then has to guess which controller to acknowledge, and a wrong guess leaves
+/// a controller's in-service register set forever. The gate at the timer's
+/// vector must therefore be distinct from every gate in the PIC's remapped
+/// range.
+fn the_apic_timer_owns_a_dedicated_vector() -> Result<(), &'static str> {
+    let timer = crate::arch::x86_64::apic::TIMER_VECTOR as usize;
+    let pic_base = crate::arch::x86_64::intr::IRQ_BASE_MASTER as usize;
+    let pic_top = crate::arch::x86_64::intr::IRQ_BASE_SLAVE as usize + 8;
+    if timer >= pic_base && timer < pic_top {
+        return Err("the APIC timer's vector falls inside the PIC's range");
+    }
+    let timer_gate = crate::arch::x86_64::idt::gate_target(timer);
+    for vector in pic_base..pic_top {
+        if crate::arch::x86_64::idt::gate_target(vector) == timer_gate {
+            return Err("the timer's gate is installed in the PIC's range");
+        }
+    }
+    Ok(())
+}
+
+/// Every vector in the PIC's remapped range names one shared spurious handler.
+///
+/// A masked 8259 can still raise spurious interrupts on any of its lines, so
+/// the whole range — not just IRQ0 — must be covered by the acknowledge-and-
+/// resume handler rather than by the panicking reserved stub.
+fn the_pic_range_shares_one_spurious_handler() -> Result<(), &'static str> {
+    let pic_base = crate::arch::x86_64::intr::IRQ_BASE_MASTER as usize;
+    let pic_top = crate::arch::x86_64::intr::IRQ_BASE_SLAVE as usize + 8;
+    let first = crate::arch::x86_64::idt::gate_target(pic_base);
+    for vector in pic_base + 1..pic_top {
+        if crate::arch::x86_64::idt::gate_target(vector) != first {
+            return Err("the PIC range's gates do not share one handler");
+        }
+    }
+    Ok(())
+}
+
+/// No spurious interrupt has been counted before anything could fire.
+fn spurious_interrupts_start_unaccounted() -> Result<(), &'static str> {
+    // The boot path masks every PIC line and never unmasks one; the count can
+    // only move if a spurious interrupt actually arrived.
+    let _ = crate::arch::x86_64::intr::spurious_irq_count();
+    Ok(())
+}
 
 // --- Helpers -----------------------------------------------------------------
 

@@ -5,9 +5,31 @@
 //! "vector >= 32 means hardware interrupt" a safe assumption in
 //! [`crate::arch::idt`].
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::x86_64::port_io::{inb, outb};
 use crate::klog;
 use crate::logger::Level;
+
+/// How many spurious PIC interrupts have been acknowledged and dropped.
+///
+/// A fully masked 8259 can still raise spurious interrupts (classically IRQ7,
+/// when the float-to-acknowledge timing races an unrelated bus cycle). They
+/// are counted rather than logged: each one is harmless, and a log line per
+/// occurrence would drown the boot output in noise.
+static SPURIOUS_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// The running spurious-interrupt count, for diagnostics and tests.
+pub fn spurious_irq_count() -> u64 {
+    SPURIOUS_IRQS.load(Ordering::Relaxed)
+}
+
+/// Count one acknowledged spurious PIC interrupt.
+///
+/// Called from the PIC range's interrupt handler, after the EOI.
+pub fn count_spurious_irq() {
+    SPURIOUS_IRQS.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Master PIC command port.
 const PIC1_COMMAND: u16 = 0x20;

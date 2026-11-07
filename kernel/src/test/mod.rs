@@ -58,6 +58,7 @@ pub const SUITE_NAMES: &[&str] = &[
     "user_cannot_write_kernel",
     "task_a_cannot_read_task_b",
     "invalid_elf_rejected",
+    "interrupt_vectors",
     // M3: capability and IPC.
     "cap_rights_enforced",
     "cap_send_only_denies_recv",

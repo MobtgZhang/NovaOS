@@ -1285,6 +1285,73 @@ unsafe extern "C" fn timer_stub() -> ! {
     )
 }
 
+/// The PIC interrupt stub.
+///
+/// Same machine shape as [`timer_stub`]: the CPU's five-word frame plus the
+/// full register file, so the handler can resume the interrupted code through
+/// the saved block without the scheduler's involvement.
+#[unsafe(naked)]
+unsafe extern "C" fn pic_irq_stub() -> ! {
+    core::arch::naked_asm!(
+        // SAFETY: as `timer_stub` — the interrupted register file goes to the
+        // current kernel stack, one word per push.
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // SAFETY: an eight-byte pad restores 16-byte alignment for the call.
+        "sub rsp, 8",
+        "mov rdi, rsp",
+        "add rdi, 8",
+        "call nova_kernel_pic_irq_handler",
+        // SAFETY: the handler is declared `-> !`.
+        "ud2",
+    )
+}
+
+/// Acknowledge a PIC interrupt and resume the interrupted code.
+///
+/// With every PIC line masked, the only interrupts this handler can see are
+/// spurious ones. The response is exactly that: acknowledge both controllers
+/// so no in-service register is left set (the bug §4.1 described), count the
+/// event, and return to the interrupted code with its state untouched — the
+/// scheduler is not told, because nothing happened that could interest it.
+///
+/// # Safety
+///
+/// Reached only from `pic_irq_stub`, with a valid kernel stack and an
+/// installed IDT.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nova_kernel_pic_irq_handler(registers: *const UserRegisters) -> ! {
+    // SAFETY: an EOI is only valid while servicing an interrupt, which is
+    // exactly what this is. The PIC's in-service state must be cleared even
+    // for a spurious interrupt, or the line and everything below it locks up.
+    unsafe {
+        super::intr::send_eoi();
+    }
+    super::intr::count_spurious_irq();
+
+    // Resume the interrupted code through the saved block: the stub pushed
+    // the full register file below the CPU's frame, and the block restores
+    // both. The scheduler never learns a spurious interrupt happened, which
+    // is the point — no quantum was consumed and no thread changed.
+    //
+    // SAFETY: the block addresses the stub's own saved register file, on the
+    // current kernel stack, with the same layout `resume_from_block` reads.
+    unsafe { crate::task::resume_from_block(registers as u64) }
+}
+
 /// The timer interrupt handler.
 ///
 /// # What it does
@@ -1456,12 +1523,21 @@ pub unsafe fn init() {
         set!(20, virtualization_stub);
         set!(21, control_protection_stub);
 
-        // The timer interrupt, at the vector the PIC was remapped to.
-        //
-        // This is the *only* hardware interrupt with a handler. Every other
-        // line stays masked at the PIC, so an unmasked line with no handler
-        // cannot fire into a zeroed gate.
-        set!(super::intr::IRQ_BASE_MASTER as usize, timer_stub);
+        // The local APIC timer, on its own vector — not the one the PIC was
+        // remapped to. Two sources on one vector made the handler's EOI a
+        // guess; with the timer alone on 0x30, its APIC-only EOI is correct
+        // by construction (§4.1).
+        set!(super::apic::TIMER_VECTOR as usize, timer_stub);
+
+        // The PIC's remapped range carries only spurious interrupts — every
+        // line is masked, and a masked 8259 can still raise one. The handler
+        // acknowledges both controllers and resumes the interrupted code
+        // unchanged; the count is the observable.
+        for index in
+            super::intr::IRQ_BASE_MASTER as usize..(super::intr::IRQ_BASE_SLAVE as usize + 8)
+        {
+            set!(index, pic_irq_stub);
+        }
 
         // Vectors 22-31 are reserved. Leaving them zero would report an
         // uninformative "unexpected interrupt", so they share a stub that at
@@ -1493,6 +1569,21 @@ pub unsafe fn init() {
     }
 
     klog!(Level::Debug, "idt: loaded {IDT_ENTRIES} entries");
+}
+
+/// The handler address one installed gate names, for diagnostics and tests.
+///
+/// The offset is the gate's own concatenation of the entry's low and high
+/// halves — the address the CPU jumps to, reassembled the way `gate` built it.
+pub fn gate_target(vector: usize) -> u64 {
+    // SAFETY: the IDT is a boot-installed static, mapped for the kernel's
+    // lifetime; the read needs no lock because `init` wrote it before any
+    // reader exists.
+    let entry = unsafe { (&raw const IDT as *const IdtEntry).add(vector) };
+    let low = unsafe { (*entry).offset_low } as u64;
+    let middle = unsafe { (*entry).offset_mid } as u64;
+    let high = unsafe { (*entry).offset_high } as u64;
+    (high << 48) | (middle << 16) | low
 }
 
 /// Load the already-built IDT on a processor.

@@ -131,13 +131,12 @@ pub unsafe fn init(tick_hz: u64) {
         actual_frequency(reload),
     );
 
-    // The handler is installed and the scheduler is running by the time this
-    // function is called, so the timer may now begin delivering IRQ0.
-    //
-    // SAFETY: the IDT's IRQ0 gate has already been installed.
-    unsafe {
-        crate::arch::x86_64::intr::unmask_irq(0);
-    }
+    // IRQ0 is deliberately *not* unmasked here. The PIC stays fully masked in
+    // this kernel — its only consumer would be this timer, and the tick comes
+    // from the local APIC timer on its own vector instead (see `apic`). An
+    // unmasked PIT line sharing the APIC timer's old vector was §4.1's bug:
+    // the handler's APIC-only EOI would have left the PIC's in-service
+    // register set forever.
 }
 
 /// The frequency a given reload value actually produces.

@@ -38,7 +38,17 @@ const TIMER_CURRENT_COUNT: u32 = 0x390;
 // timer then never counts down and never delivers a vector. Periodic mode
 // is therefore bit 17, not bit 18.
 const TIMER_PERIODIC: u32 = 1 << 17;
-const TIMER_VECTOR: u32 = 0x20;
+
+/// The vector the local APIC timer delivers.
+///
+/// Deliberately *not* the vector the 8259 PIC was remapped to (0x20): sharing
+/// one vector between two interrupt sources meant the handler could not know
+/// which controller to acknowledge, and a PIT line arriving on it would leave
+/// the PIC's in-service register set forever — freezing that IRQ and every
+/// lower-priority line. With the timer on its own vector, the handler's APIC
+/// EOI is correct by construction, and the PIC range below carries only a
+/// spurious-interrupt acknowledgement (see `idt`).
+pub const TIMER_VECTOR: u32 = 0x30;
 
 /// The interrupt command register — the low half, written last to fire.
 const ICR_LOW: u32 = 0x300;
