@@ -84,27 +84,51 @@ pub unsafe fn init() {
 /// Bring up per-CPU table state on an application processor.
 ///
 /// The bootstrap processor has already installed the shared IDT and its own
-/// GDT/TSS. This installs the AP's own GDT/TSS and loads the shared IDT.
+/// GDT/TSS. This installs the AP's own GDT/TSS, loads the shared IDT, and
+/// configures the AP's local interrupt controller.
 ///
 /// # Safety
 ///
 /// Must run on the AP, with interrupts masked, after it has switched to its own
-/// kernel stack.
-pub unsafe fn init_cpu(cpu: usize) {
+/// kernel stack and after the kernel address space is active.
+pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
     // SAFETY: delegated to this function's contract.
-    unsafe { x86_64::init_cpu(cpu) }
+    unsafe { x86_64::init_cpu(cpu, direct_map_offset) }
+}
+
+/// Configure this target's interrupt controller on the bootstrap processor.
+///
+/// On x86-64 this maps and arms the local APIC; a different backend has a
+/// different controller and the same job.
+///
+/// # Safety
+///
+/// Must run once on the bootstrap processor, with interrupts masked, after
+/// the direct map exists.
+pub unsafe fn init_interrupt_controller(direct_map_offset: u64) {
+    // SAFETY: delegated to this function's contract.
+    unsafe { x86_64::apic::init(direct_map_offset) }
+}
+
+/// The stack pointer privilege transitions to `cpu` use.
+pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
+    x86_64::privilege_stack_for_cpu(cpu)
+}
+
+/// Wake the application processor in kernel slot `cpu`.
+///
+/// Returns whether the processor reached its startup path within the
+/// backend's bounded waits. The mechanism is the backend's own — INIT–SIPI
+/// on x86-64, PSCI `CPU_ON` on AArch64, SBI hart start on RISC-V — but the
+/// contract is one line: after this returns `true`, the slot's per-CPU
+/// scheduler, tables, and idle thread all exist.
+pub fn bring_up_application_processor(cpu: usize) -> bool {
+    x86_64::bring_up_application_processor(cpu)
 }
 
 /// Bring up the console. Safe to call more than once.
 pub fn console_init() {
     console().init();
-}
-
-/// Print the architecture's boot-time tables to the console.
-///
-/// Diagnostics only; safe to call more than once.
-pub fn dump_tables() {
-    x86_64::gdt::dump_tables();
 }
 
 /// Move the CPU onto the kernel's own stack.

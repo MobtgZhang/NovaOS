@@ -23,6 +23,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::boot::info::MAX_CPUS;
+use crate::klog;
 
 /// Set after the bootstrap processor has completed the state every AP needs.
 static SMP_READY: AtomicBool = AtomicBool::new(false);
@@ -160,6 +161,34 @@ pub fn wait_for_aps(max_spins: u64) -> bool {
     false
 }
 
+/// Wake every application processor the snapshot describes.
+///
+/// This is the arch-neutral *policy*: iterate the snapshot's processor slots
+/// past the bootstrap processor's, and ask the backend to wake each one. The
+/// *mechanism* — INIT–SIPI through a trampoline page on x86-64, PSCI on
+/// AArch64 — lives behind [`crate::arch::bring_up_application_processor`], so
+/// this loop reads the same on every target.
+///
+/// A processor that does not come up is reported and skipped rather than
+/// fatal: a machine with a failed AP still boots on the ones that did, and
+/// the boot log says exactly which slot failed.
+pub fn bring_up_application_processors() {
+    // SAFETY: called from the boot path after `capture` published the
+    // snapshot; the snapshot is immutable from then on.
+    let info = unsafe { crate::boot::read_boot_info() };
+    for cpu in 1..info.processor_count() {
+        if is_online(cpu) {
+            continue;
+        }
+        if !crate::arch::bring_up_application_processor(cpu) {
+            klog!(
+                crate::logger::Level::Error,
+                "smp: cpu {cpu} did not come online"
+            );
+        }
+    }
+}
+
 /// The stable thread identifier used by an AP's kernel-only idle thread.
 ///
 /// IDs are per-CPU scheduler identities because each CPU owns its own thread
@@ -187,14 +216,14 @@ pub unsafe extern "C" fn ap_idle_entry() -> ! {
     )
 }
 
-// Entry point the bootloader calls on an application processor.
+// Entry point the boot manager's trampoline hands an application processor
+// into, via `gdt::switch_to_kernel_stack_for_cpu_and_continue`.
 //
 // # NovaBoot status
 //
-// There is deliberately no AP entry point yet. The protocol can describe up to
-// `MAX_CPUS` processors, but no MP hand-over exists in the NovaBoot snapshot:
-// the kernel boots the bootstrap processor only, and the SMP suites skip
-// themselves when the snapshot reports one CPU. Bringing APs up through
-// NovaBoot needs the kernel's own ACPI MADT walk plus an INIT-SIPI trampoline,
-// which is the next NovaBoot milestone; the gate and diagnostics this module
-// already publishes are what that trampoline will hand the APs into.
+// The boot manager enumerates the processors from ACPI and publishes them in
+// the snapshot; the kernel wakes each one through
+// [`bring_up_application_processors`], which asks the architecture backend to
+// run its own bring-up mechanism. An AP that reaches
+// [`crate::boot_after_ap_stack_switch`] installs its per-CPU state and reports
+// online here.

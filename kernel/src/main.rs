@@ -154,10 +154,6 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // anything that can fault.
     unsafe { arch::init() };
 
-    // Diagnostics: dump the GDT and IDT now that the console exists and the
-    // kernel owns the stack the dump runs on.
-    arch::dump_tables();
-
     logger::init();
 
     // Now that output exists, the checks that can panic are safe to run.
@@ -217,14 +213,21 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     unsafe {
         syscall::init();
         sched::init();
-        arch::x86_64::apic::init(boot::read_boot_info().direct_map_offset);
+        arch::init_interrupt_controller(boot::read_boot_info().direct_map_offset);
 
-        // The APs have been waiting on this gate since `boot::capture` handed
-        // them over. Everything they need — the kernel address space, the shared
-        // IDT, the per-CPU scheduler and stack tables, and the mapped APIC — now
-        // exists, so they can enter their own startup paths.
+        // Everything the application processors need — the kernel address
+        // space, the shared IDT, the per-CPU scheduler and stack tables, and
+        // the mapped APIC — now exists. Publish the gate and then wake the
+        // snapshot's processors through the architecture's own bring-up
+        // mechanism.
         boot::smp::mark_ready();
     }
+
+    // The wake-up is the architecture's job (INIT–SIPI through a trampoline
+    // page on x86-64), but the *list* comes from the snapshot the boot
+    // manager's ACPI walk published. Each woken processor installs its own
+    // tables, timer, scheduler, and idle thread, then reports online here.
+    boot::smp::bring_up_application_processors();
 
     // Devices, then the filesystems that sit on them. This runs after `mm`
     // (the drivers allocate frames for virtqueues and map BARs) and after
@@ -338,23 +341,18 @@ pub unsafe fn boot_after_stack_switch() -> ! {
 ///
 /// # Safety
 ///
-/// Reached only from [`crate::arch::x86_64::gdt::switch_to_kernel_stack_for_cpu_and_continue`],
-/// with interrupts masked, after the bootstrap processor published `SMP_READY`.
-/// The AP abandons the bootloader-provided frame and never unwinds it.
+/// Reached only through the architecture's AP entry path
+/// (`arch::switch_to_kernel_stack_for_cpu_and_continue`), with interrupts
+/// masked, after the bootstrap processor woke this processor. The AP abandons
+/// the trampoline's frame and never unwinds it.
 pub unsafe fn boot_after_ap_stack_switch(cpu: usize) -> ! {
     // SAFETY: delegated to this function's contract. The AP needs the kernel's
     // address space, its own tables, its own APIC timer, and its own scheduler.
     unsafe {
+        let direct_map_offset = crate::boot::read_boot_info().direct_map_offset;
         crate::mm::address_space::activate(&crate::mm::address_space::kernel_space());
-        crate::arch::init_cpu(cpu);
-        crate::boot::smp::record_tss_rsp0(
-            cpu,
-            crate::arch::x86_64::gdt::privilege_stack_for_cpu(cpu),
-        );
-        crate::arch::x86_64::apic::init_for_cpu(
-            cpu,
-            crate::boot::read_boot_info().direct_map_offset,
-        );
+        crate::arch::init_cpu(cpu, direct_map_offset);
+        crate::boot::smp::record_tss_rsp0(cpu, crate::arch::privilege_stack_for_cpu(cpu));
         crate::sched::init_for_cpu(cpu);
 
         let space = crate::mm::address_space::kernel_space();

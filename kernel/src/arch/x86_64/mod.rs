@@ -28,6 +28,7 @@ pub mod msr;
 pub mod paging;
 pub mod pit;
 pub mod port_io;
+pub mod smp;
 
 pub mod console;
 pub mod exit;
@@ -158,16 +159,36 @@ pub unsafe fn arch_init() {
 ///
 /// The shared IDT is already filled by the bootstrap processor; the AP only
 /// loads it into its own register. The AP's own GDT/TSS are installed so its
-/// timer interrupts use its own stack.
+/// timer interrupts use its own stack, and its local APIC is configured —
+/// the timer arms with the same shape the bootstrap processor's does.
 ///
 /// # Safety
 ///
 /// Must run on the AP, with interrupts masked, after it has switched to its own
-/// kernel stack and after the bootstrap processor's IDT exists.
-pub unsafe fn init_cpu(cpu: usize) {
+/// kernel stack, after the bootstrap processor's IDT exists, and after the
+/// kernel address space is active.
+pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
     // SAFETY: delegated to this function's contract.
     unsafe {
         gdt::init_cpu(cpu);
         idt::load();
+        apic::init_for_cpu(cpu, direct_map_offset);
     }
+}
+
+/// The stack pointer privilege transitions to this CPU use.
+///
+/// On x86-64 this is the CPU's TSS `RSP0` — the stack an interrupt or ring
+/// transition lands on.
+pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
+    gdt::privilege_stack_for_cpu(cpu)
+}
+
+/// Wake the application processor in kernel slot `cpu`.
+///
+/// The mechanism is the backend's own: on x86-64 an INIT–SIPI sequence
+/// through a trampoline page (see [`smp`]). The return value says whether the
+/// processor reached its startup path within the backend's bounded waits.
+pub fn bring_up_application_processor(cpu: usize) -> bool {
+    smp::bring_up(cpu)
 }

@@ -236,6 +236,11 @@ pub struct BootProtocol {
     pub initramfs_length: u64,
     pub cpu_count: u16,
     pub cpu_ids: [u32; MAX_CPUS],
+    /// The local APIC identifier of the bootstrap processor — the CPU the
+    /// snapshot was published *from*. The kernel locates its own slot by this
+    /// value rather than by position, so a MADT that lists the BSP last still
+    /// lands the boot CPU in slot zero's opposite neighbour without surprise.
+    pub bsp_lapic_id: u32,
     pub memory_count: u16,
     pub memory: [BootMemoryRegion; MAX_MEMORY_REGIONS],
     pub framebuffer: BootFramebuffer,
@@ -260,6 +265,7 @@ impl BootProtocol {
             initramfs_length: 0,
             cpu_count: 0,
             cpu_ids: [0; MAX_CPUS],
+            bsp_lapic_id: 0,
             memory_count: 0,
             memory: [const {
                 BootMemoryRegion {
@@ -304,6 +310,12 @@ impl BootProtocol {
                     return Err(BootProtocolError::DuplicateCpu);
                 }
             }
+        }
+        // The bootstrap processor must be among the listed ones: the kernel
+        // maps its own identity through this field, and a BSP outside the
+        // list would leave the boot CPU with no slot at all.
+        if !self.cpu_ids[..self.cpu_count as usize].contains(&self.bsp_lapic_id) {
+            return Err(BootProtocolError::BspNotListed);
         }
 
         if self.memory_count as usize > MAX_MEMORY_REGIONS {
@@ -373,6 +385,7 @@ pub enum BootProtocolError {
     MissingKernel,
     BadCpuCount,
     DuplicateCpu,
+    BspNotListed,
     TooManyRegions,
     RegionOverflow,
     EmptyRegion,
@@ -393,6 +406,7 @@ impl BootProtocolError {
             Self::MissingKernel => "missing-kernel",
             Self::BadCpuCount => "bad-cpu-count",
             Self::DuplicateCpu => "duplicate-cpu",
+            Self::BspNotListed => "bsp-not-listed",
             Self::TooManyRegions => "too-many-regions",
             Self::RegionOverflow => "region-overflow",
             Self::EmptyRegion => "empty-region",
@@ -568,6 +582,15 @@ mod tests {
         let mut protocol = valid_protocol();
         protocol.cpu_ids[1] = protocol.cpu_ids[0];
         assert_eq!(protocol.validate(), Err(BootProtocolError::DuplicateCpu));
+    }
+
+    #[test]
+    fn a_bootstrap_processor_outside_the_list_is_refused() {
+        let mut protocol = valid_protocol();
+        // The listed ids never include this one, so a kernel that trusted it
+        // would find no slot for the CPU it is running on.
+        protocol.bsp_lapic_id = 0xFF;
+        assert_eq!(protocol.validate(), Err(BootProtocolError::BspNotListed));
     }
 
     #[test]

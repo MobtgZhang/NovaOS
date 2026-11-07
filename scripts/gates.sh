@@ -104,9 +104,8 @@ gate_boot() {
     # the QEMU boot suite. It exits non-zero on a failure *or* a timeout, and it
     # archives the serial log under `target/novaos/run/archive/`.
     #
-    # The Limine release is fetched first: the boot needs it, and a cold
-    # environment does not have it.
-    cargo xtask fetch-limine
+    # No fetch step: the ESP image is produced entirely by `cargo xtask image`
+    # from the in-tree boot manager; there is no external bootloader release.
     cargo xtask test --timeout "${NOVA_QEMU_TIMEOUT:-120}"
 }
 

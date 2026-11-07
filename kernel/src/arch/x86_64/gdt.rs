@@ -8,7 +8,6 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::ptr::{addr_of, addr_of_mut};
 
-use crate::arch::capabilities::{ByteSink, Console};
 use crate::boot::info::MAX_CPUS;
 use crate::klog;
 use crate::logger::Level;
@@ -1353,72 +1352,6 @@ unsafe extern "C" fn reload_code_segment_and_return() {
         "push r10",
         "iretq",
     )
-}
-
-/// Print the raw GDT and IDT bytes to the console.
-///
-/// The GDT is the one structure whose corruption produces a symptom with no
-/// diagnostic of its own: a bad descriptor means the CPU rejects the gate and
-/// raises `#GP` instead of entering the handler, and the `#GP` handler is reached
-/// through an equally bad gate, so the machine triple-faults with an empty log.
-///
-/// Dumping the raw bytes lets the encoding be checked against the architectural
-/// layout by eye, which is far faster than reasoning about what a mis-encoded
-/// byte *would* do.
-///
-/// Separate from [`init`] because the console must already exist: `init` runs
-/// before the UART is programmed, so anything it prints is silently discarded.
-pub fn dump_tables() {
-    dump_table("gdt", addr_of!(GDT) as *const u8, size_of::<Gdt>());
-    dump_table(
-        "idt",
-        crate::arch::x86_64::idt::idt_bytes(),
-        crate::arch::x86_64::idt::IDT_ENTRIES * 16,
-    );
-    // The pseudo-descriptors `lgdt` and `lidt` actually read. Printing them
-    // settles whether the *instruction* was issued with the right bytes, which
-    // is a different question from whether the tables themselves are correct.
-    crate::arch::x86_64::idt::dump_pseudo_descriptors();
-}
-
-/// The raw bytes of the GDT's pseudo-descriptor.
-///
-/// The ten bytes `lgdt` reads: a little-endian 16-bit limit followed by a
-/// little-endian 64-bit base.
-///
-/// Returned by value rather than by pointer to a stack temporary, because a
-/// pointer would dangle by the time the caller dereferenced it — and a
-/// diagnostic that reads freed stack is worse than no diagnostic at all.
-pub fn pseudo_descriptor_bytes() -> [u8; 10] {
-    let mut bytes = [0u8; 10];
-    bytes[0..2].copy_from_slice(&((size_of::<Gdt>() - 1) as u16).to_le_bytes());
-    bytes[2..10].copy_from_slice(&(addr_of!(GDT) as u64).to_le_bytes());
-    bytes
-}
-
-/// Print a table's raw bytes to the console, for boot-time diagnosis.
-///
-/// Deliberately primitive: it formats hex itself and writes through the console
-/// directly, because a diagnostic that depends on the subsystem it is diagnosing
-/// cannot report that subsystem's failure.
-fn dump_table(label: &str, bytes: *const u8, len: usize) {
-    let mut line = ByteSink::<96>::new();
-    line.push_str("[NOVA] DBG ");
-    line.push_str(label);
-    line.push_str(": ");
-    for index in 0..len {
-        if index % 16 == 0 && index != 0 {
-            crate::arch::console().send_bytes(line.as_bytes());
-            line = ByteSink::<96>::new();
-            line.push_str("[NOVA] DBG   ");
-        }
-        // SAFETY: `bytes` points at `len` readable bytes of a table the caller
-        // owns, and `index` is within that range.
-        let byte = unsafe { *bytes.add(index) };
-        line.push_hex(byte as u64);
-        line.push_str(" ");
-    }
-    crate::arch::console().send_bytes(line.as_bytes());
 }
 
 /// The null segment: present bit clear, so any use faults.

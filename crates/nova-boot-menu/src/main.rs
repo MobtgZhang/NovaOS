@@ -2,9 +2,10 @@
 //!
 //! This application renders the OS-selection menu through the GOP framebuffer,
 //! then loads the selected kernel ELF and initramfs off the ESP, builds the
-//! 4 KiB-only early page tables the kernel requires, publishes a
-//! [`nova_boot::BootProtocol`] snapshot, and transfers control to the kernel's
-//! `nova_boot_entry`.
+//! early page tables (huge-leaf HHDM over the firmware's regions, kernel
+//! higher-half window), enumerates the processors from the firmware's ACPI
+//! tables, publishes a [`nova_boot::BootProtocol`] snapshot, and transfers
+//! control to the kernel's `nova_boot_entry`.
 //!
 //! # Boot contract with the kernel
 //!
@@ -24,8 +25,10 @@
 //!   0xFFFFFFFF80000000`), covering the kernel image, the bootstrap stack, and
 //!   the snapshot page.
 //!
-//! All mappings are 4 KiB pages: the kernel's `walk_to_leaf` cannot descend
-//! through a huge page, so no PS bit may be set anywhere.
+//! The HHDM and kernel windows are built from the largest leaves the
+//! alignment allows (1 GiB where the CPU supports `PDPE1GB`, else 2 MiB), with
+//! 4 KiB pages at the unaligned edges; the kernel's walker understands huge
+//! leaves, so no rule forbids them here.
 
 #![no_std]
 #![no_main]
@@ -49,8 +52,8 @@ use uefi::{Handle, Status};
 use nova_boot::fb_format;
 use nova_boot::region;
 use nova_boot::{
-    BootArch, BootFramebuffer, BootMemoryRegion, BootMode, BootProtocol, MAGIC, MAX_CPUS,
-    MAX_MEMORY_REGIONS, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    BootArch, BootFramebuffer, BootMemoryRegion, BootMode, BootProtocol, MAGIC, MAX_MEMORY_REGIONS,
+    PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 use crate::font::{CHAR_SPACING, FONT_HEIGHT, FONT_WIDTH, char_rows, text_width};
@@ -59,6 +62,7 @@ use crate::load::{
 };
 use crate::paging::{BOOT_STACK_SIZE, HHDM_OFFSET, KERNEL_LMA, PAGE_SIZE, Tables};
 
+mod acpi;
 mod font;
 mod load;
 mod paging;
@@ -124,6 +128,25 @@ struct BootHandoff {
 fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
     // Must run before any allocation or `println!`.
     uefi::helpers::init(&mut system_table).expect("NovaOS UEFI helpers init failed");
+
+    // Enumerate the processors once, while boot services are alive and the
+    // firmware's ACPI tables are dereferenceable. The snapshot below carries
+    // the plain identifiers, so the kernel's boot path never parses firmware
+    // tables; a machine with no ACPI falls back to the bootstrap processor.
+    let processors = match acpi::discover(&system_table) {
+        Ok(table) => {
+            uefi::println!(
+                "acpi: {} processors, bsp lapic id {:#x}",
+                table.count,
+                table.bsp_lapic_id
+            );
+            table
+        }
+        Err(reason) => {
+            uefi::println!("acpi: {} — single-processor fallback", reason.tag());
+            acpi::ProcessorTable::single()
+        }
+    };
 
     // Run the menu inside a closure that borrows `system_table` through
     // `boot_services()`. Once the closure returns, the borrow ends and
@@ -282,6 +305,7 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
                     fmt,
                     selected_index as u16,
                     boot_mode,
+                    processors,
                 ) {
                     Ok(handoff) => return Ok(handoff),
                     Err(error) => {
@@ -549,6 +573,7 @@ fn boot_kernel(
     fmt: PixelFormat,
     selected_entry: u16,
     boot_mode: u16,
+    processors: acpi::ProcessorTable,
 ) -> Result<BootHandoff, String> {
     // ---- 6a. Read the kernel ELF and initramfs ----
     let elf_data = read_file(fs, KERNEL_ELF_PATH)
@@ -673,9 +698,13 @@ fn boot_kernel(
         addr_of_mut!((*snapshot).initramfs_start).write(initramfs_phys);
         addr_of_mut!((*snapshot).initramfs_length).write(initramfs_data.len() as u64);
 
-        addr_of_mut!((*snapshot).cpu_count).write(1);
-        for i in 0..MAX_CPUS {
-            addr_of_mut!((*snapshot).cpu_ids[i]).write(0);
+        // The processors ACPI described, or the single-processor fallback.
+        // The bootstrap processor is always listed first by convention, but
+        // the kernel locates it by `bsp_lapic_id` rather than by position.
+        addr_of_mut!((*snapshot).cpu_count).write(processors.count);
+        addr_of_mut!((*snapshot).bsp_lapic_id).write(processors.bsp_lapic_id);
+        for (index, id) in processors.ids.iter().enumerate() {
+            addr_of_mut!((*snapshot).cpu_ids[index]).write(*id);
         }
 
         // Memory regions.

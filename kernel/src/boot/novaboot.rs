@@ -232,18 +232,20 @@ pub unsafe fn capture() -> &'static BootInfo {
         copy_str_into("NovaBoot", &raw mut (*target).bootloader_name);
         copy_str_into("nova-boot-menu", &raw mut (*target).bootloader_version);
 
-        // Single-CPU boot. The protocol can describe up to `MAX_CPUS`
-        // processors, but no MP hand-over exists yet: the kernel boots the
-        // bootstrap processor only, and the SMP suites skip themselves when
-        // the snapshot reports one CPU. Bringing APs up needs the kernel's own
-        // ACPI MADT walk plus an INIT-SIPI trampoline, which is documented as
-        // the next NovaBoot milestone.
-        (&raw mut (*target).cpu_count).write(1);
-        (&raw mut (*target).bsp_lapic_id).write(0);
-        (&raw mut (*target).cpu_ids[0]).write(0);
+        // The processors the boot manager's ACPI walk enumerated. The
+        // snapshot's validation already checked the count against `MAX_CPUS`,
+        // the ids for duplicates, and the bootstrap processor's membership —
+        // so this is a copy, not a re-derivation.
+        (&raw mut (*target).cpu_count).write(snapshot.cpu_count as usize);
+        (&raw mut (*target).bsp_lapic_id).write(snapshot.bsp_lapic_id);
+        for index in 0..KERNEL_MAX_CPUS {
+            (&raw mut (*target).cpu_ids[index]).write(snapshot.cpu_ids[index]);
+        }
         klog!(
             Level::Info,
-            "novaboot: single-processor hand-over (SMP trampoline pending)"
+            "novaboot: {} processors, bsp lapic id {:#x}",
+            snapshot.cpu_count,
+            snapshot.bsp_lapic_id
         );
 
         // The direct map is the only route from the kernel's high addresses to

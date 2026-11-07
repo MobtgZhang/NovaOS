@@ -39,9 +39,19 @@
 /// `nova-kernel` and `nova-rt` are bare-metal `no_std` / `no_main` binaries
 /// with their own `_start`, and neither can be linked for the host.
 ///
+/// `nova-boot-menu` is a UEFI application: the `uefi` crate owns the panic
+/// lang item there, so a host test harness cannot link at all. Its pure
+/// layout math lives in `nova-boot`, whose tests run here.
+///
 /// `xtask` is the tool driving the run rather than code under test — but it is
 /// not an exemption: [`driver`] runs its own suite.
-pub const EXCLUDED_HOST_PACKAGES: &[&str] = &["nova-kernel", "nova-rt", "nova-apps", "xtask"];
+pub const EXCLUDED_HOST_PACKAGES: &[&str] = &[
+    "nova-kernel",
+    "nova-rt",
+    "nova-apps",
+    "nova-boot-menu",
+    "xtask",
+];
 
 /// Run the host tests.
 ///
@@ -134,7 +144,9 @@ mod tests {
         // The rule, stated once: every workspace member that is a bare-metal
         // binary rather than a library must be excluded from the host test
         // run. A new one that is not would fail here rather than in CI.
-        for package in ["nova-kernel", "nova-rt", "nova-apps"] {
+        // `nova-boot-menu` is a UEFI binary: the `uefi` crate owns the panic
+        // lang item, so its host test harness cannot link.
+        for package in ["nova-kernel", "nova-rt", "nova-apps", "nova-boot-menu"] {
             assert!(
                 EXCLUDED_HOST_PACKAGES.contains(&package),
                 "{package} is a bare-metal binary and must be excluded from the host tests"

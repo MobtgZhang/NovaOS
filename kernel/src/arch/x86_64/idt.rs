@@ -1351,55 +1351,6 @@ pub unsafe extern "C" fn nova_kernel_timer_handler(registers: *const UserRegiste
     }
 }
 
-/// The raw bytes of the IDT, for boot-time diagnosis.
-///
-/// Returns a pointer to the table itself rather than a copy: the table is
-/// 4 KiB, and copying it to the stack during a fault report would be a poor
-/// trade. The caller must only read it.
-pub fn idt_bytes() -> *const u8 {
-    // SAFETY: delegated to the function's contract.
-    addr_of!(IDT) as *const u8
-}
-
-/// Print the pseudo-descriptors `lgdt` and `lidt` read.
-///
-/// The pseudo-descriptor is the only thing the CPU actually reads when a table
-/// is loaded, so if it is malformed the CPU keeps using the table the bootloader
-/// left behind — and the kernel then behaves as though its own GDT and IDT were
-/// never installed, which is indistinguishable from "the gates are wrong".
-pub fn dump_pseudo_descriptors() {
-    let gdt = crate::arch::x86_64::gdt::pseudo_descriptor_bytes();
-    dump_table("gdtp", gdt.as_ptr(), gdt.len());
-
-    let mut idt = [0u8; 10];
-    idt[0..2].copy_from_slice(&((size_of::<Idt>() - 1) as u16).to_le_bytes());
-    idt[2..10].copy_from_slice(&((&raw const IDT) as u64).to_le_bytes());
-    dump_table("idtp", idt.as_ptr(), idt.len());
-}
-
-/// Print a table's raw bytes to the console, for boot-time diagnosis.
-fn dump_table(label: &str, bytes: *const u8, len: usize) {
-    use crate::arch::capabilities::{ByteSink, Console};
-
-    let mut line = ByteSink::<96>::new();
-    line.push_str("[NOVA] DBG ");
-    line.push_str(label);
-    line.push_str(": ");
-    for index in 0..len {
-        if index % 16 == 0 && index != 0 {
-            crate::arch::console().send_bytes(line.as_bytes());
-            line = ByteSink::<96>::new();
-            line.push_str("[NOVA] DBG   ");
-        }
-        // SAFETY: `bytes` points at `len` readable bytes of a table the caller
-        // owns, and `index` is within that range.
-        let byte = unsafe { *bytes.add(index) };
-        line.push_hex(byte as u64);
-        line.push_str(" ");
-    }
-    crate::arch::console().send_bytes(line.as_bytes());
-}
-
 /// Build a gate entry pointing at `handler`.
 ///
 /// # The IST index and the gate type share a byte

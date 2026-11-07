@@ -4,7 +4,7 @@
 //!
 //! A single PML4 with the upper-half entries (256..512) populated:
 //!
-//! - `PML4[0]` -> identity-map of the low half: enough that the boot manager's
+//! - `PML4[0]` -> identity-map of the low 4 GiB: enough that the boot manager's
 //!   own code, stack, and the UEFI runtime remain reachable after CR3 is
 //!   reloaded.
 //! - `PML4[256]` -> HHDM window: every physical byte the firmware reported is
@@ -103,17 +103,16 @@ impl Frame {
 pub struct Tables {
     /// The PML4 page itself.
     pub pml4: Frame,
-    /// PML4[0] -> PDPT -> PD -> PTs identity-mapping the low half.
+    /// PML4[0] -> PDPT; PDPT[i] -> PD[i]; PD[i][j] -> 2 MiB identity leaf.
     ///
     /// These fields are not read by Rust after construction, but the CPU walks
     /// through them via the PML4, so they must not be dropped.
     #[allow(dead_code)]
     low_pdpt: Frame,
+    /// The 512 PD pages of the low identity map, retained for the same reason
+    /// as `low_pdpt`.
     #[allow(dead_code)]
-    low_pd: Frame,
-    /// One PT per 2 MiB of the low half (512 PTs cover 4 GiB).
-    #[allow(dead_code)]
-    low_pts: [Frame; ENTRIES],
+    low_pds: alloc::vec::Vec<Frame>,
     /// HHDM window tables (populated by [`Tables::map_hhdm`]).
     hhdm_pdpt: Option<Frame>,
     /// Kernel window tables (populated by [`Tables::map_kernel_window`]).
@@ -121,32 +120,33 @@ pub struct Tables {
 }
 
 impl Tables {
-    /// Build page tables that identity-map the low 4 GiB through PML4[0],
-    /// leaving PML4[256] and PML4[511] empty until [`map_hhdm`] and
+    /// Build page tables that identity-map the whole low 4 GiB through
+    /// PML4[0], leaving PML4[256] and PML4[511] empty until [`map_hhdm`] and
     /// [`map_kernel_window`] fill them.
     pub fn new(bs: &BootServices) -> Result<Self, uefi::Status> {
         let pml4 = Frame::allocate_one(bs, MemoryType::LOADER_DATA)?;
         let low_pdpt = Frame::allocate_one(bs, MemoryType::LOADER_DATA)?;
-        let low_pd = Frame::allocate_one(bs, MemoryType::LOADER_DATA)?;
 
         // PML4[0] -> low PDPT.
         Self::write_entry(pml4.phys() as *mut u64, 0, TABLE | low_pdpt.phys());
 
-        // PDPT[0] -> low PD.
-        Self::write_entry(low_pdpt.phys() as *mut u64, 0, TABLE | low_pd.phys());
-
-        // PD[pt_index] -> PT[pt_index], each PT identity-mapping 2 MiB.
-        let mut low_pts = core::array::from_fn(|_| Frame::from_phys(0));
-        for (pt_index, pt_slot) in low_pts.iter_mut().enumerate() {
-            let pt = Frame::allocate_one(bs, MemoryType::LOADER_DATA)?;
-            // PT[leaf_index] = identity leaf for physical page (pt_index * 512 + leaf_index).
+        // PDPT[i] -> PD[i], and every PD[i][j] is a 2 MiB identity leaf: 512
+        // PDs of 512 leaves each cover the entire low 4 GiB. The boot
+        // manager keeps executing its own code on its own stack across the
+        // CR3 reload — wherever UEFI loaded them below 4 GiB — so the
+        // identity map must reach all of it. (An earlier 512-PT build
+        // covered only the first 1 GiB while its comment claimed 4 GiB; with
+        // the boot manager at ~2 GiB the first fetch after `mov cr3`
+        // page-faulted and triple-faulted, and the kernel never printed.)
+        let mut low_pds = alloc::vec::Vec::with_capacity(ENTRIES);
+        for pd_index in 0..ENTRIES {
+            let pd = Frame::allocate_one(bs, MemoryType::LOADER_DATA)?;
             for leaf_index in 0..ENTRIES {
-                let physical = (pt_index as u64 * ENTRIES as u64 + leaf_index as u64) * PAGE_SIZE;
-                Self::write_entry(pt.phys() as *mut u64, leaf_index, LEAF | physical);
+                let physical = (pd_index as u64 * ENTRIES as u64 + leaf_index as u64) * P2_PAGE;
+                Self::write_entry(pd.phys() as *mut u64, leaf_index, LEAF | PS | physical);
             }
-            // PD[pt_index] -> PT.
-            Self::write_entry(low_pd.phys() as *mut u64, pt_index, TABLE | pt.phys());
-            *pt_slot = pt;
+            Self::write_entry(low_pdpt.phys() as *mut u64, pd_index, TABLE | pd.phys());
+            low_pds.push(pd);
         }
 
         // PML4[256] and PML4[511] are intentionally left zero here.
@@ -156,8 +156,7 @@ impl Tables {
         Ok(Self {
             pml4,
             low_pdpt,
-            low_pd,
-            low_pts,
+            low_pds,
             hhdm_pdpt: None,
             kernel_pdpt: None,
         })
@@ -441,6 +440,10 @@ impl Tables {
 pub unsafe fn enter_new_tables(pml4_phys: u64, rsp: u64, rdi: u64, entry: u64) -> ! {
     unsafe {
         core::arch::asm!(
+            // Interrupts off: after CR3 is reloaded the firmware's IDT is no
+            // longer reachable, and an NMI (or a spurious interrupt) landing
+            // between the reload and the jump would fault on its own fetch.
+            "cli",
             "mov cr3, {pml4}",
             "mov rsp, {rsp}",
             "mov rdi, {rdi}",

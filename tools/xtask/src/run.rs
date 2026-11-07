@@ -153,7 +153,10 @@ fn qemu_command(
         "q35,accel=tcg".to_string(),
     ));
     command.extend(device("-cpu", "qemu64".to_string()));
-    command.extend(device("-smp", "1".to_string()));
+    // Four processors: the kernel's SMP suites (and the snapshot's processor
+    // table) exercise a real 4-CPU machine, and the ACPI walk in the boot
+    // manager reports whatever the firmware's MADT lists.
+    command.extend(device("-smp", "4".to_string()));
     command.extend(device("-m", format!("{}M", crate::qemu::MEMORY_MIB)));
 
     // Two pflash drives: a read-only firmware and a writable variable store.
@@ -565,7 +568,7 @@ mod tests {
 
     fn temp_args() -> Vec<String> {
         qemu_command(
-            Path::new("/tmp/nova.iso"),
+            Path::new("/tmp/nova.img"),
             Path::new("/tmp/OVMF_CODE.fd"),
             Path::new("/tmp/OVMF_VARS.fd"),
             Path::new("/tmp/serial.log"),
@@ -597,7 +600,10 @@ mod tests {
             joined.contains("unit=1"),
             "the variable store is a second drive"
         );
-        assert!(joined.contains("media=cdrom"), "the ISO is a CD");
+        assert!(
+            joined.contains("media=cdrom") || joined.contains("media=disk"),
+            "the boot media is attached"
+        );
         assert!(joined.contains("isa-debug-exit"), "the exit device");
         assert!(joined.contains("iobase=0xf4"), "the port the kernel writes");
         assert!(
@@ -670,25 +676,29 @@ mod tests {
     }
 
     #[test]
-    fn the_iso_is_attached_exactly_once_as_a_cd() {
-        // Two `-drive file=<iso>` entries would make QEMU pick one
-        // nondeterministically, and an ISO attached as a *disk* rather than a CD
-        // is not what the hybrid image's El Torito layout expects.
+    fn the_esp_image_is_attached_exactly_once_as_a_disk() {
+        // Two `-drive file=<image>` entries would make QEMU pick one
+        // nondeterministically, and the image must be a *disk*: OVMF's boot
+        // manager finds `\EFI\BOOT\BOOTX64.EFI` on its FAT partition, which a
+        // cdrom attachment does not expose.
         let command = temp_args();
-        let iso_drives = command
+        let image_drives = command
             .iter()
-            .filter(|argument| argument.starts_with("file=/tmp/nova.iso"))
+            .filter(|argument| argument.starts_with("file=/tmp/nova.img,"))
             .count();
 
-        assert_eq!(iso_drives, 1, "the ISO must be attached exactly once");
+        assert_eq!(
+            image_drives, 1,
+            "the ESP image must be attached exactly once"
+        );
 
-        let cdrom = command
+        let drive = command
             .iter()
-            .find(|argument| argument.contains("/tmp/nova.iso"))
-            .expect("the ISO drive argument exists");
+            .find(|argument| argument.contains("/tmp/nova.img"))
+            .expect("the ESP image drive argument exists");
         assert!(
-            cdrom.contains("media=cdrom"),
-            "the ISO must be a cdrom, got {cdrom:?}",
+            drive.contains("media=disk"),
+            "the ESP image must be a disk, got {drive:?}"
         );
     }
 
