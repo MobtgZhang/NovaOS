@@ -20,8 +20,10 @@
 | §2.3 HHDM 逐 4K 映射 | **已修复** | HHDM 用巨叶；测试 `the_hhdm_window_uses_huge_leaves` 通过 |
 | §3.1 AP bring-up 不存在 | **已修复** | 真实 INIT-SIPI + 低内存 trampoline（16 位手写机器码全部 32 位立即数补 `66` 前缀）；`-smp 4` 实测 `cpu 1/2/3 online=true scheduler_threads=1 ticks=18794/10694/770` |
 | 附带发现 | **已修复** | 帧位图两处正确性 bug（计数 u32 回绕、`find_first_free_from` 用掩码当移位量）——宿主复现后修复；顺序分配 hint 改单调前进 |
+| §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
+| §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
 
-**仍然未解**（保持原判断）：§3.2 的 per-CPU 抽象（`sched/mod.rs:223,549`、`task/mod.rs:606,616,694` 仍硬编码 cpu 0——AP 目前只跑内核 idle 线程，用户线程的 syscall 上下文保存仍落在 BSP 表上）；§4 中断模型全套；P0 之外的驱动/存储/网络项。
+**仍然未解**：§4 中断模型全套（§4.1/4.2 P0）；内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。
 
 ---
 
@@ -120,9 +122,9 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - 已有的部分：`AP_ONLINE`/`AP_TICKS`/`AP_TSS_RSP0` 等**诊断原子**（smp.rs:27-126）、per-CPU GDT/TSS 安装路径（`arch/x86_64/mod.rs:167-173 init_cpu`）、AP 内核-only idle 线程裸函数 `ap_idle_entry`（smp.rs:177-188，`sti/hlt/jmp` 自环）。也就是说"AP 到达后要做什么"已备好，但**没有人能把 AP 叫醒**：没有 MADT 解析、没有 INIT-SIPI 发送、没有低内存 trampoline 页。
 - SMP 测试套件因此在 `processor_count()==1` 时自我跳过（`test/harness.rs:54`）——205 个测试里 SMP 部分是 SKIPPED，"通过"具有误导性。
 
-### 3.2 调度器与用户线程绑死 CPU 0〔缺陷〕**High**（**仍未解，SMP 下一步**）
+### 3.2 调度器与用户线程绑死 CPU 0〔缺陷〕**High** → **已修复并验证（2026-11-08）**
 
-> **更新**：AP 已能上线并运行内核 idle 线程（§3.1），但经复核 `sched/mod.rs:223,549`、`task/mod.rs:606,616,694` 的硬编码 cpu 0 **原样还在**——用户线程的上下文保存、地址空间读取、线程创建仍全部落在 BSP 表上。AP 侧目前只有 idle 自循环，不会踩到这些路径；一旦 AP 开始跑用户线程，这里立即成为正确性雷区。多核化的下一步就是 per-CPU 抽象（GS base），原判断不变。
+> **已修复**：GS-base per-CPU 抽象落地（`arch::x86_64::percpu`，含编译期偏移断言）；syscall stub、`return_to_user`、`save_current_syscall_context`、`current_thread_space`、调度器全部包装改经 `arch::current_cpu()`；线程创建轮转分发。原判断的四个硬编码点全部消除。共享可变状态（服务层、帧分配器、virtio）以递归 irq-safe SpinLock 收口。
 
 - `kernel/src/sched/mod.rs:521-554` `save_current_syscall_context`：**硬编码 `state_for_cpu(0)` / `thread_in_slot_for_cpu(0, ...)`**。同样地 `task/mod.rs:600-609 current_thread_space` 也读 `thread_pool(0)`。
 - `process.rs:615` `create_thread` 一律 `create_thread_for_cpu(0, ...)`。
@@ -133,7 +135,7 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - round-robin、`DEFAULT_TIMESLICE = 4` tick @ 100 Hz = 40 ms（`sched/mod.rs:65-72`、`pit.rs:72`）；无优先级、无实时类、无负载均衡、无亲和性、无 tickless；PIT tick 驱动而非 APIC timer 单票（见 §5 的实际 tick 源混乱）。
 - 无 idle 线程：BSP 上无可运行线程时直接 `exit(EXIT_PANIC)`——桌面会话里"最后一个用户线程退出"等于内核自尽。AP 侧倒是有 idle 线程（smp.rs:172-188），两套语义不一致。
 
-### 3.4 全局单槽 syscall 副作用〔设计张力〕**Low**
+### 3.4 全局单槽 syscall 副作用〔设计张力〕**Low** → **已修复（2026-11-08）**
 
 - `task/mod.rs:511-569`：`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 是 `static mut` 全局单槽，契约是"syscall 路径串行 + 中断屏蔽"。多核化后每个 syscall 都要改成 per-CPU 槽。
 
