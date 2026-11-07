@@ -268,6 +268,23 @@ impl FrameAllocator {
         allocator
     }
 
+    /// Move the sequential allocation hint forward to `frame + 1`.
+    ///
+    /// Monotonic on purpose. The hint is an optimization over the floor scan,
+    /// and two legitimate paths hand out frames *below* it: `alloc_dma` scans
+    /// from the floor to keep device-reachable frames, and `alloc`'s own
+    /// fallback rescan runs when the hint region has run out. Storing those
+    /// low frames unconditionally would drag the hint backwards, and a
+    /// workload that mixes ordinary allocations with either path would never
+    /// walk past its starting region — the freed frames below the hint would
+    /// be handed out again forever.
+    fn advance_hint(&self, frame: usize) {
+        let next = frame.saturating_add(1);
+        if self.hint.load(Ordering::Relaxed) < next {
+            self.hint.store(next, Ordering::Relaxed);
+        }
+    }
+
     /// Allocate one physical frame.
     ///
     /// Returns a frame *index*, not an address. Mapping a frame into the
@@ -284,7 +301,7 @@ impl FrameAllocator {
             && let Some(frame) = bitmap.find_first_free_from(hint)
         {
             bitmap.mark_allocated(frame);
-            self.hint.store(frame + 1, Ordering::Relaxed);
+            self.advance_hint(frame);
             return Ok(frame);
         }
 
@@ -292,7 +309,7 @@ impl FrameAllocator {
         match bitmap.find_first_free_from(self.base_frame) {
             Some(frame) => {
                 bitmap.mark_allocated(frame);
-                self.hint.store(frame + 1, Ordering::Relaxed);
+                self.advance_hint(frame);
                 Ok(frame)
             }
             None => Err(FrameError::OutOfMemory),
@@ -319,7 +336,10 @@ impl FrameAllocator {
         match bitmap.find_first_free_from(self.base_frame) {
             Some(frame) if frame < self.dma_limit_frame => {
                 bitmap.mark_allocated(frame);
-                self.hint.store(frame + 1, Ordering::Relaxed);
+                // Deliberately via `advance_hint`, not a plain store: a DMA
+                // buffer below the kernel image must not drag the sequential
+                // hint backwards.
+                self.advance_hint(frame);
                 Ok(frame)
             }
             // Either the pool is exhausted or only the frames above the DMA
@@ -564,10 +584,8 @@ impl Bitmap {
             return;
         }
         let (word, mask) = Self::bit(frame);
-        let old = self.word(word);
-        let new = old | mask;
-        self.allocated += (new.count_ones() - old.count_ones()) as usize;
-        self.set_word(word, new);
+        let new = self.word(word) | mask;
+        self.store_counted(word, new);
     }
 
     /// Mark `frame` free. Out-of-range and already-free frames are ignored.
@@ -576,10 +594,8 @@ impl Bitmap {
             return;
         }
         let (word, mask) = Self::bit(frame);
-        let old = self.word(word);
-        let new = old & !mask;
-        self.allocated += (new.count_ones() - old.count_ones()) as usize;
-        self.set_word(word, new);
+        let new = self.word(word) & !mask;
+        self.store_counted(word, new);
     }
 
     /// Mark every frame in `[start, start + count)` allocated.
@@ -601,6 +617,23 @@ impl Bitmap {
         self.mark_range(start, count, false);
     }
 
+    /// Store one backing word, keeping the allocated count in step.
+    ///
+    /// The count moves by the *signed* popcount difference between the old and
+    /// the new word. The difference is computed in `i64` on purpose: a plain
+    /// `u32` subtraction wraps in release builds, so freeing one frame would
+    /// add `2^32 - 1` to the count instead of subtracting one, and `free_count`
+    /// would then wrap into the astronomicals.
+    fn store_counted(&mut self, word_index: usize, new: u64) {
+        let old = self.word(word_index);
+        if old == new {
+            return;
+        }
+        let delta = new.count_ones() as i64 - old.count_ones() as i64;
+        self.allocated = (self.allocated as i64 + delta) as usize;
+        self.set_word(word_index, new);
+    }
+
     /// The range-marking worker behind the two public directions.
     fn mark_range(&mut self, start: usize, count: usize, allocate: bool) {
         let last = start.saturating_add(count).min(self.len);
@@ -616,10 +649,12 @@ impl Bitmap {
                 ((1u64 << span) - 1) << bit_index
             };
 
-            let old = self.word(word_index);
-            let new = if allocate { old | mask } else { old & !mask };
-            self.allocated += (new.count_ones() - old.count_ones()) as usize;
-            self.set_word(word_index, new);
+            let new = if allocate {
+                self.word(word_index) | mask
+            } else {
+                self.word(word_index) & !mask
+            };
+            self.store_counted(word_index, new);
 
             frame += span;
         }
@@ -647,7 +682,8 @@ impl Bitmap {
         let mut frame = start;
 
         while frame < self.len {
-            let (word, bit) = Self::bit(frame);
+            let word = frame / u64::BITS as usize;
+            let bit = frame % u64::BITS as usize;
             let word_bits = self.word(word);
 
             if word_bits == u64::MAX && bit == 0 {
@@ -656,8 +692,11 @@ impl Bitmap {
                 continue;
             }
 
-            // `!word_bits` marks the free bits; mask off the ones below `bit` so
-            // the scan can never walk backwards.
+            // `!word_bits` marks the free bits; mask off the ones below `bit`
+            // so the scan can never walk backwards. `bit` is the bit *index*
+            // here — `Self::bit` returns the decoded mask, and shifting by a
+            // mask would wrap the shift count in release builds and unmask
+            // the whole word, handing back frames below `start`.
             let free = !word_bits & (u64::MAX << bit);
 
             if free != 0 {
