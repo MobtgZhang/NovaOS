@@ -23,7 +23,7 @@
 | §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
 | §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
 
-**仍然未解**：§4 中断模型全套（§4.1/4.2 P0）；内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。
+**仍然未解**：§4.2 中断驱动的设备路径（P0）；内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1 已修复并验证（2026-11-08）〕
 
 ---
 
@@ -143,9 +143,9 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 ## 4. 中断体系
 
-### 4.1 vector 0x20 双重占用 + 错误的 EOI 组合〔缺陷〕**High**
+### 4.1 vector 0x20 双重占用 + 错误的 EOI 组合〔缺陷〕**High** → **已修复并验证（2026-11-08）**
 
-这是本次读码新发现的一个真实正确性问题：
+> **已修复**：APIC timer 换独立 vector 0x30（`apic::TIMER_VECTOR`，pub）；`pit::init` 不再 unmask IRQ0，PIC 保持全 mask 纪律——按源分发 EOI 的问题因"每 vector 单一中断源"而在构造上消失。PIC 重映射范围 0x20..0x30 全部安装共享 `pic_irq_stub`/`nova_kernel_pic_irq_handler`：双 PIC EOI + `intr::SPURIOUS_IRQS` 计数 + `task::resume_from_block` 原样续行（被 mask 的 8259 仍可能产生 spurious 中断，旧行为是 panic stub，第一次就死机）。新增 `idt::gate_target()` 供测试读取门目标地址；新增 `interrupt_vectors` suite（3 用例：timer 门在 PIC 范围外且不与其重合、PIC 范围共享一个 handler、spurious 计数初始为零）。门禁全绿，boot 套件 64 suites / 218 cases 全过，`-smp 4` 三 AP 正常 tick。
 
 - 8259 PIC 被重映射到 `0x20/0x28`（`arch/x86_64/intr.rs:26-28`），PIT 的 IRQ0 因此走 vector 0x20（`pit.rs:139` 还 `unmask_irq(0)`）；
 - 同时本地 APIC 的 LVT timer 也被配置为 **同一个 vector 0x20**、periodic 模式、count 0x1000（`arch/x86_64/apic.rs:41,74-89`），且 BSP 一并初始化（`apic.rs:116-119`）；
