@@ -22,7 +22,7 @@
 //! enough to prove link reachability through an emulated NIC; it is not a claim
 //! that NovaOS implements a full internet stack.
 
-use core::cell::UnsafeCell;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 use nova_net::{DhcpReply, Ipv4Addr};
 
@@ -49,17 +49,14 @@ impl NetState {
     }
 }
 
-/// The network state, behind an `UnsafeCell`.
+/// The network state, behind the kernel's recursive spin lock: user threads
+/// on application processors can reach `with_net` while the boot CPU does.
 struct SingleNetState {
-    inner: UnsafeCell<NetState>,
+    inner: SpinLock<NetState>,
 }
 
-// SAFETY: the kernel mutates this state in place from code running on one CPU
-// with interrupts masked, exactly like the block and service state.
-unsafe impl Sync for SingleNetState {}
-
 static STATE: SingleNetState = SingleNetState {
-    inner: UnsafeCell::new(NetState::new()),
+    inner: SpinLock::new(NetState::new()),
 };
 
 /// The network state.
@@ -68,9 +65,8 @@ static STATE: SingleNetState = SingleNetState {
 ///
 /// The caller must be kernel code running with interrupts masked on the boot
 /// CPU, which is every caller in this tree.
-unsafe fn state() -> &'static mut NetState {
-    // SAFETY: delegated to this function's contract.
-    unsafe { &mut *STATE.inner.get() }
+fn state() -> SpinLockGuard<'static, NetState> {
+    STATE.inner.lock()
 }
 
 /// Find the VirtIO network device and take it over.
@@ -107,8 +103,9 @@ pub fn init() -> usize {
                 );
                 // SAFETY: called once from boot with interrupts masked, before
                 // any reader of the table exists.
-                let state = unsafe { state() };
-                state.devices[state.len] = Some(net_device);
+                let mut state = state();
+                let len = state.len;
+                state.devices[len] = Some(net_device);
                 state.len += 1;
                 found += 1;
             }
@@ -133,8 +130,7 @@ pub fn init() -> usize {
 
 /// How many NICs are live.
 pub fn device_count() -> usize {
-    // SAFETY: read-only access from kernel code with interrupts masked.
-    unsafe { state().len }
+    state().len
 }
 
 /// Run `f` with the NIC.
@@ -142,8 +138,7 @@ pub fn device_count() -> usize {
 /// A closure rather than a long-lived reference: the device table is one
 /// static, and two mutable references to it would be aliases.
 pub fn with_net<T>(f: impl FnOnce(&mut VirtioNet) -> T) -> Result<T, NetError> {
-    // SAFETY: as `device_count`; the borrow ends where `f` does.
-    let state = unsafe { state() };
+    let mut state = state();
     let device = state
         .devices
         .get_mut(0)
@@ -154,11 +149,8 @@ pub fn with_net<T>(f: impl FnOnce(&mut VirtioNet) -> T) -> Result<T, NetError> {
 
 /// The link state, if a NIC exists.
 pub fn link_info() -> Option<LinkInfo> {
-    // SAFETY: read-only access from kernel code with interrupts masked.
-    unsafe {
-        let mut state = state();
-        state.devices[0].as_ref().map(|device| device.link_info())
-    }
+    let state = state();
+    state.devices[0].as_ref().map(|device| device.link_info())
 }
 
 /// Resolve a DNS name to one IPv4 address.
@@ -261,7 +253,7 @@ pub fn dhcp_acquire() -> Result<DhcpReply, NetError> {
 pub fn shutdown_all() {
     // SAFETY: as `device_count`. Each device is taken out of the table so a
     // second call cannot shut down a released device.
-    let state = unsafe { state() };
+    let mut state = state();
     for slot in state.devices.iter_mut() {
         if let Some(mut device) = slot.take() {
             device.shutdown();

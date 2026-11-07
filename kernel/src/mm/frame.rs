@@ -27,7 +27,7 @@
 //! word slice. The kernel-side [`FrameAllocator`] is a thin shell over it that
 //! chooses the backing store and adds the direct map needed to touch it.
 
-use core::cell::UnsafeCell;
+use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::ADDRESS_SPACE;
@@ -83,11 +83,12 @@ const DMA_FRAME_LIMIT: usize = 0x10_0000;
 ///
 /// # Concurrency
 ///
-/// The bitmap sits behind an [`UnsafeCell`] and every accessor is `unsafe`. That
-/// is deliberate: NovaOS runs on one CPU with interrupts masked during
-/// allocation, so there is nothing to race against. Real concurrency replaces
-/// this shell with a locked one — the safe [`Bitmap`] logic it wraps is exactly
-/// what survives that refactor, which is why the split exists.
+/// The bitmap sits behind a [`SpinLock`]: two processors can allocate frames
+/// at overlapping times once user threads run on application processors, and
+/// the hint-then-rescan sequence only stays correct if the whole of it is
+/// serialized. The lock is the same recursive, interrupt-safe one the service
+/// layer uses, so a dispatch path that allocates while already holding a
+/// kernel lock re-enters rather than deadlocks.
 ///
 /// # Reserved floor
 ///
@@ -96,7 +97,7 @@ const DMA_FRAME_LIMIT: usize = 0x10_0000;
 /// out would corrupt the running kernel, so "allocation failed" is the correct
 /// outcome long before that watermark is reached.
 pub struct FrameAllocator {
-    bitmap: UnsafeCell<Bitmap>,
+    bitmap: SpinLock<Bitmap>,
     /// First frame the allocator may hand out.
     base_frame: usize,
     /// Number of frames the bitmap tracks: every physical frame up to the
@@ -219,7 +220,7 @@ impl FrameAllocator {
         );
 
         let mut allocator = Self {
-            bitmap: UnsafeCell::new(bitmap),
+            bitmap: SpinLock::new(bitmap),
             base_frame,
             total_frames: limit_frame,
             dma_limit_frame: DMA_FRAME_LIMIT.min(limit_frame),
@@ -233,9 +234,11 @@ impl FrameAllocator {
         // region order — which validation counts but does not enforce — does
         // not matter.
         //
-        // SAFETY: single-CPU construction from `_start`, before any reader.
-        unsafe {
-            let bitmap = &mut *allocator.bitmap.get();
+        // Construction runs from `_start`, before any reader exists; the lock
+        // still serialises the seeding so the invariant "guarded by the same
+        // lock everywhere" holds without an exception for boot.
+        {
+            let mut bitmap = allocator.bitmap.lock();
 
             bitmap.mark_allocated_range(0, limit_frame);
 
@@ -254,11 +257,7 @@ impl FrameAllocator {
             bitmap.mark_allocated_range(bitmap_start_frame, bitmap_frames);
         }
 
-        let free = {
-            // SAFETY: read-only access, single-CPU construction.
-            let bitmap = unsafe { &*allocator.bitmap.get() };
-            bitmap.free_count()
-        };
+        let free = allocator.bitmap.lock().free_count();
         klog!(
             Level::Debug,
             "mm: allocator seeded with {free} free frames (dma-capable below frame {})",
@@ -290,9 +289,10 @@ impl FrameAllocator {
     /// Returns a frame *index*, not an address. Mapping a frame into the
     /// kernel's address space is the HHDM's job, not the allocator's.
     pub fn alloc(&self) -> Result<usize, FrameError> {
-        // SAFETY: single-CPU allocator. Allocation is only reachable from
-        // kernel code; real concurrency replaces this shell with a locked one.
-        let bitmap = unsafe { &mut *self.bitmap.get() };
+        // The lock spans the whole hint-then-rescan sequence: two processors
+        // could otherwise both observe the same free bit and hand out one
+        // frame twice.
+        let mut bitmap = self.bitmap.lock();
 
         // Allocation is overwhelmingly sequential, so try the hint first and
         // fall back to a full scan only when that region is exhausted.
@@ -330,8 +330,8 @@ impl FrameAllocator {
     /// small-RAM configuration — this is the same pool as [`Self::alloc`],
     /// and the restriction costs nothing.
     pub fn alloc_dma(&self) -> Result<usize, FrameError> {
-        // SAFETY: single-CPU allocator, as `alloc`.
-        let bitmap = unsafe { &mut *self.bitmap.get() };
+        // Locked for the whole scan, as `alloc`.
+        let mut bitmap = self.bitmap.lock();
 
         match bitmap.find_first_free_from(self.base_frame) {
             Some(frame) if frame < self.dma_limit_frame => {
@@ -369,20 +369,18 @@ impl FrameAllocator {
             return;
         }
 
-        // SAFETY: delegated to this function's contract; single-CPU access.
-        unsafe { (&mut *self.bitmap.get()).mark_free(frame) };
+        let mut bitmap = self.bitmap.lock();
+        bitmap.mark_free(frame);
     }
 
     /// Whether `frame` is currently allocated.
     pub fn is_allocated(&self, frame: usize) -> bool {
-        // SAFETY: read-only access to the bitmap, single-CPU.
-        unsafe { (*self.bitmap.get()).is_allocated(frame) }
+        self.bitmap.lock().is_allocated(frame)
     }
 
     /// Current allocator statistics.
     pub fn stats(&self) -> AllocatorStats {
-        // SAFETY: read-only access to the bitmap, single-CPU.
-        let bitmap = unsafe { &*self.bitmap.get() };
+        let bitmap = self.bitmap.lock();
         AllocatorStats {
             total_frames: self.total_frames,
             allocated_frames: bitmap.allocated_count(),
@@ -397,8 +395,7 @@ impl FrameAllocator {
     /// suite asserts on the free count directly, and `stats()` is a copy of four
     /// fields where only one of them is wanted.
     pub fn free_count(&self) -> usize {
-        // SAFETY: read-only access to the bitmap, single-CPU.
-        unsafe { (*self.bitmap.get()).free_count() }
+        self.bitmap.lock().free_count()
     }
 
     /// First frame the allocator will ever hand out.

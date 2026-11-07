@@ -23,7 +23,7 @@
 //! benefit is that `device_reads` / `device_writes` in the counters are the
 //! truth about what the hardware was asked to do.
 
-use core::cell::UnsafeCell;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 use nova_fs::diskfs::{BlockDevice, DeviceError, SECTOR_BYTES};
 
@@ -213,30 +213,21 @@ impl BlockState {
 
 /// The block state, behind an `UnsafeCell`.
 ///
-/// Same arrangement as the service state, and for the same reason: it is
-/// mutated in place from kernel code that runs on one CPU with interrupts
-/// masked. M2's locking work is what replaces it, not a change of shape here.
+/// Same arrangement as the service state: guarded by the kernel's recursive
+/// spin lock, because user threads on application processors can reach
+/// `with_disk` while the boot CPU does.
 struct SingleBlockState {
-    inner: UnsafeCell<BlockState>,
+    inner: SpinLock<BlockState>,
 }
 
-// SAFETY: see the struct's docs; the single-CPU, interrupts-masked rule the
-// frame allocator and the service state both rely on.
-unsafe impl Sync for SingleBlockState {}
-
 static STATE: SingleBlockState = SingleBlockState {
-    inner: UnsafeCell::new(BlockState::new()),
+    inner: SpinLock::new(BlockState::new()),
 };
 
 /// The block state.
 ///
-/// # Safety
-///
-/// The caller must be kernel code running with interrupts masked on the boot
-/// CPU, which is every caller in this tree.
-unsafe fn state() -> &'static mut BlockState {
-    // SAFETY: delegated to this function's contract; see `services::state`.
-    unsafe { &mut *STATE.inner.get() }
+fn state() -> SpinLockGuard<'static, BlockState> {
+    STATE.inner.lock()
 }
 
 /// Find every VirtIO block device and take it over.
@@ -279,8 +270,9 @@ pub fn init() -> usize {
                 );
                 // SAFETY: called once from boot with interrupts masked, before
                 // any reader of the table exists.
-                let state = unsafe { state() };
-                state.disks[state.len] = Some(Disk {
+                let mut state = state();
+                let len = state.len;
+                state.disks[len] = Some(Disk {
                     device: disk_device,
                     cache: [CacheLine::empty(); CACHE_LINES],
                     stats: DiskStats::default(),
@@ -309,8 +301,7 @@ pub fn init() -> usize {
 
 /// How many disks are live.
 pub fn disk_count() -> usize {
-    // SAFETY: read-only access from kernel code with interrupts masked.
-    unsafe { state().len }
+    state().len
 }
 
 /// Run `f` with one disk.
@@ -320,8 +311,7 @@ pub fn disk_count() -> usize {
 /// Every caller therefore says what it needs in one call, and the borrow ends
 /// where the call does.
 pub fn with_disk<T>(index: usize, f: impl FnOnce(&mut Disk) -> T) -> Result<T, BlockError> {
-    // SAFETY: as `disk_count`; the borrow is handed to `f` and not retained.
-    let state = unsafe { state() };
+    let mut state = state();
     let disk = state
         .disks
         .get_mut(index)
@@ -338,7 +328,7 @@ pub fn with_disk<T>(index: usize, f: impl FnOnce(&mut Disk) -> T) -> Result<T, B
 pub fn shutdown_all() {
     // SAFETY: as `disk_count`. Each disk is taken out of the table so a second
     // call cannot shut down a released device.
-    let state = unsafe { state() };
+    let mut state = state();
     for slot in state.disks.iter_mut() {
         if let Some(mut disk) = slot.take() {
             disk.device.shutdown();
