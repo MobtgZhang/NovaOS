@@ -70,6 +70,7 @@
 //! block is written.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::x86_64::gdt::{
     KERNEL_CODE_SELECTOR, KERNEL_DATA_SELECTOR, USER_CODE_SELECTOR, USER_DATA_SELECTOR,
@@ -618,11 +619,34 @@ pub fn current_thread_space() -> Option<AddressSpace> {
     }
 }
 
-/// Create a thread on the bootstrap processor.
+/// The next CPU slot a newly created user thread is dispatched to.
 ///
-/// User processes are owned by the bootstrap processor in this SMP phase, so
-/// the existing callers keep this CPU-zero convenience form.
+/// Round-robin, not "always zero": pinning every user thread to the bootstrap
+/// processor is what made the application processors idle-only (§3.2). The
+/// counter is shared, so concurrent creations on two CPUs interleave — an
+/// approximate balance is the goal, not an exact one.
+static DISPATCH_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Create a user thread, dispatching it round-robin across the online CPUs.
+///
+/// Every CPU whose startup has completed is a legal home: it has its own
+/// thread pool, its own kernel stack pool, its own scheduler, and its own
+/// per-CPU data, so a user thread's syscalls land on the creating CPU's
+/// tables by construction. The bootstrap processor is always online (this
+/// code is running on it).
 pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
+    // Scan each slot at most once: `MAX_CPUS` probes cover every CPU. The
+    // fallback names the bootstrap processor explicitly, so a boot snapshot
+    // with no online APs (the single-processor configuration) still creates
+    // the thread rather than dropping it.
+    let start = DISPATCH_CURSOR.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
+    for step in 0..MAX_CPUS {
+        let cpu = (start + step) % MAX_CPUS;
+        let online = cpu == 0 || crate::boot::smp::is_online(cpu);
+        if online && let Some(thread) = create_thread_for_cpu(cpu, id, process, space, entry) {
+            return Some(thread);
+        }
+    }
     create_thread_for_cpu(0, id, process, space, entry)
 }
 
