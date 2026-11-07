@@ -1,6 +1,6 @@
 # NovaOS 代码问题与未实现功能分析报告（issues-001）
 
-- 日期：2026-11-07
+- 日期：2026-11-07（2026-11-08 更新：§1/§2/§3 的 P0 项已修复并验证，见文首"更新记录"）
 - 对象：当前 `main` 分支代码（Limine 移除完成、205/205 测试通过之后的现状）
 - 方法：逐文件读码（内核 `mm/`、`sched/`、`task/`、`arch/x86_64/`、`boot/`、`drivers/`、`services/`、`syscall/`，以及 `crates/nova-net`、`crates/nova_fs`），配合既有子代理对文件系统/驱动子系统的详尽发现。
 - 严重程度：**High** = 阻塞"运行于现代硬件"或存在正确性风险；**Medium** = 功能缺陷或明显短板；**Low** = 设计债。
@@ -8,26 +8,45 @@
 
 ---
 
+## 更新记录（2026-11-08）
+
+以下条目已**修复并经 QEMU `-smp 4` headless 端到端验证**（内核测试套件 214/214 全绿，`scripts/gates.sh` 五道门禁全过；提交 `a835722`、`7f36054`）：
+
+| 条目 | 状态 | 验证证据 |
+|---|---|---|
+| §1.1 ACPI 解析 | **已实现（最小集）** | `nova-boot-menu/src/acpi.rs`：RSDP→XSDT→MADT type-0 枚举 4 个处理器；boot log `acpi: 4 processors, bsp lapic id 0x0` |
+| §1.2 早期页表 4K-only | **引导侧已修** | NovaBoot 恒等映射改为 PML4[0]→PDPT→512 个 PD×2 MiB 叶子，盖满低 4 GiB；内核侧 `walk_to_leaf` 仍 4K-only（见下文原状） |
+| §2.1 256 MiB 硬上限 | **已修复** | 位图改运行期尺寸；2 GiB QEMU 实测 `18452 allocated + 499922 free = 518374 frames (63 KiB bitmap)`；DMA 4 GiB 边界经 `alloc_dma` + `DMA_FRAME_LIMIT` 显式约束（§2.6 的隐式保证随之显式化） |
+| §2.3 HHDM 逐 4K 映射 | **已修复** | HHDM 用巨叶；测试 `the_hhdm_window_uses_huge_leaves` 通过 |
+| §3.1 AP bring-up 不存在 | **已修复** | 真实 INIT-SIPI + 低内存 trampoline（16 位手写机器码全部 32 位立即数补 `66` 前缀）；`-smp 4` 实测 `cpu 1/2/3 online=true scheduler_threads=1 ticks=18794/10694/770` |
+| 附带发现 | **已修复** | 帧位图两处正确性 bug（计数 u32 回绕、`find_first_free_from` 用掩码当移位量）——宿主复现后修复；顺序分配 hint 改单调前进 |
+
+**仍然未解**（保持原判断）：§3.2 的 per-CPU 抽象（`sched/mod.rs:223,549`、`task/mod.rs:606,616,694` 仍硬编码 cpu 0——AP 目前只跑内核 idle 线程，用户线程的 syscall 上下文保存仍落在 BSP 表上）；§4 中断模型全套；P0 之外的驱动/存储/网络项。
+
+---
+
 ## 0. 总体判断
 
-NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存上限**的 Symbian 风格微内核原型，其强项是能力系统 / IPC / 策略层可宿主测试（205 测试全绿），弱项是它实际上**只能在 QEMU 的一个非常窄的配置窗口里运行**：1 个 CPU、≤256 MiB 内存、slirp 网络、virtio 设备、PS/2 + GOP 固件仿真。下表是各子系统的"完成度 × 是否阻塞现代硬件"一览：
+NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核原型，其强项是能力系统 / IPC / 策略层可宿主测试（214 测试全绿），弱项是它实际上**只能在 QEMU 的一个较窄的配置窗口里运行**：slirp 网络、virtio 设备、PS/2 + GOP 固件仿真——但内存上限与单 CPU 这两条最大的硬阻塞已在 2026-11-08 移除（见文首更新记录）。下表是各子系统的"完成度 × 是否阻塞现代硬件"一览：
 
 | 子系统 | 完成度 | 阻塞现代硬件？ |
 |---|---|---|
-| 内存管理 | 位图分配器 + 4 级页表，无巨页/堆/COW | **是**（>256 MiB 直接 panic） |
-| SMP | 只有诊断门，AP bring-up 不存在 | **是**（多核机器浪费其余核心，且调度正确性依赖单 CPU） |
+| 内存管理 | 位图分配器（运行期尺寸，2 GiB 实测）+ 4 级页表 + HHDM 巨叶；无堆/COW | **不再**（>256 MiB panic 已解；剩余是质量债） |
+| SMP | **真实多核唤醒已验证**（3 AP 在线、各自调度器线程与 tick）；用户线程路径仍绑死 CPU 0 | 部分（唤醒已通，per-CPU 抽象未做） |
 | 中断 | PIC 重映射 + APIC timer，设备全轮询 | **是**（无法服务任何设备 IRQ） |
 | 驱动 | virtio-blk/net 轮询、PS/2 轮询、GOP | **是**（无 NVMe/AHCI/USB/xHCI/ECAM） |
 | 文件系统 | NOVADSK 自定义格式 + RamFS，无 VFS | 部分（可用但脆弱） |
 | 网络 | 包构造/解析库 + 轮询 TCP 客户端 | 部分（绑死 QEMU slirp） |
 | 进程/IPC/能力 | 微内核核心已成形，最有价值 | 否（质量较好） |
-| 启动 | UEFI + NovaBoot，无 ACPI | **是**（无 MADT/RSDP 解析） |
+| 启动 | UEFI + NovaBoot + **ACPI MADT 处理器枚举** | 部分（MADT 已解；FADT/HPET/IOAPIC 未解） |
 
 ---
 
 ## 1. 启动与"现代硬件可运行性"
 
-### 1.1 完全没有 ACPI 解析〔未实现〕**High**
+### 1.1 完全没有 ACPI 解析〔未实现〕**High** → **处理器枚举已实现（2026-11-08）**
+
+> **更新**：RSDP→XSDT→MADT type-0 枚举已在 `crates/nova-boot-menu/src/acpi.rs` 实现，经 BootProtocol 快照传给内核；`-smp 4` 实测枚举出 4 个处理器并全部唤醒。**仍未解**：FADT（电源管理/ACPI 模式）、HPET、RTC 墙上时钟、I/O APIC 枚举（§4 的前提）。
 
 - 全代码库中 `ACPI`/`MADT`/`RSDP`/`HPET` 仅出现在注释里（`kernel/src/boot/novaboot.rs:240`、`kernel/src/boot/smp.rs:198`、`kernel/src/test/harness.rs:54`）。
 - 后果链：
@@ -37,7 +56,9 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
   - 没有 RTC/`FADT` 世纪寄存器，内核**没有任何墙上时钟**——这也解释了文件系统为什么没有时间戳（§6）。
 - NovaBoot 的 `BootProtocol` 快照结构已为 `cpu_ids: [u32; MAX_CPUS]`（`kernel/src/boot/info.rs:233`）留好了位置，但填充端写死 `cpu_count=1, bsp_lapic_id=0`（`kernel/src/boot/novaboot.rs:236-243`）。
 
-### 1.2 早期页表只支持 4K 页〔未实现〕**Medium**
+### 1.2 早期页表只支持 4K 页〔未实现〕**Medium** → **引导侧已修（2026-11-08）**
+
+> **更新**：NovaBoot 的恒等映射已改为 PML4[0]→PDPT→512 个 PD、每 PD 2 MiB 叶子，盖满低 4 GiB（此前只盖 1 GiB，引导镜像在 ~2 GiB 时首次取指即三重故障）。内核侧 `walk_to_leaf` 仍不识别大页位——任何内核查询/修改路径遇到 2 MiB 叶子仍会走错，需与 §2.3 的收尾联动。
 
 - `crates/nova-boot` 的引导期页表（PML4[0]/[256]/[511] 三条链）全部是 4K 叶子；内核侧 `mm/page_table.rs` 的 `walk_to_leaf` 同样不支持 2MiB/1GiB 叶子（§3）。
 - 在 4K-only 下映射 256 MiB HHDM 需要 65536 个 PTE；真实机器 32 GiB 内存需要 800 万+ 个 PTE（约 16 GiB 的表空间都不够），**这是"现代硬件不可运行"的第一数学障碍**。
@@ -51,7 +72,9 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 
 ## 2. 内存管理
 
-### 2.1 物理帧分配器 256 MiB 硬上限，超限直接 panic〔缺陷 + 设计债〕**High**
+### 2.1 物理帧分配器 256 MiB 硬上限，超限直接 panic〔缺陷 + 设计债〕**High** → **已修复（2026-11-08）**
+
+> **更新**：位图改为运行期尺寸——从固件内存图中量出帧数、在最大的可用区内划出位图存储（63 KiB @ 2 GiB），设计上限 ≥192 GiB（6 MiB 位图）；2 GiB QEMU 实测 518374 帧正常分配回收。4 GiB DMA 边界不再靠"上限 < 4 GiB"隐式成立，而是 `alloc_dma` + `DMA_FRAME_LIMIT` 显式约束。附带修掉两个正确性 bug：位图计数 u32 回绕、`find_first_free_from` 用位掩码当移位量（宿主复现后修复，commit `7f36054`）。§2.2 的单 CPU `UnsafeCell` 契约仍在，是 SMP per-CPU 化时的第一改动点。
 
 - `kernel/src/mm/frame.rs:265-268`：`MAX_BITMAP_WORDS = 1024` → `MAX_FRAMES = 65536`（4K 帧）= 256 MiB。
 - `kernel/src/mm/frame.rs:112-120`：机器可用内存超过上限时 `Bitmap::with_capacity` 失败即 `panic!`，并提示"raise MAX_BITMAP_WORDS"。**现代任何一台真实电脑都会在此崩溃**。这是移植性的头号阻塞项。
@@ -61,7 +84,9 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 
 - `kernel/src/mm/frame.rs:130`：`bitmap: UnsafeCell<Bitmap>`，文档自认 "M2 replaces this type when preemption makes it genuinely concurrent"。当前靠"中断屏蔽 + 单 CPU"契约成立；一旦 SMP 真正落地（§4），这里是第一个要改的（需要自旋锁或 per-CPU 池）。
 
-### 2.3 HHDM 逐 4K 映射、无巨页〔缺陷〕**High**（与 1.2 同根）
+### 2.3 HHDM 逐 4K 映射、无巨页〔缺陷〕**High**（与 1.2 同根）→ **HHDM 已修（2026-11-08）**
+
+> **更新**：`map_hhdm` 已用 2 MiB 巨叶（测试 `the_hhdm_window_uses_huge_leaves` 通过）。**未解**：`mm/page_table.rs` 的 `walk_to_leaf` 仍不识别大页位——内核查询/修改路径（页表遍历、权限修改、将来的 unmap）遇到巨叶仍会错判，需按下面清单收尾。
 
 - `kernel/src/mm/address_space.rs` 的 `map_hhdm` 对 usable 区域逐帧循环 `map_kernel_page`，256 MiB 就是 65536 次页表写 + 中间表分配；`map_kernel_mmio` 同样 4K。
 - `mm/page_table.rs` 的 `walk_to_leaf` 不识别大页位，意味着即使硬件支持，内核任何查询/修改路径都假定 4K 叶子。加巨页必须同时改：`walk_to_leaf`、`map_hhdm`、NovaBoot 早期页表、以及帧位图的"连续 512 帧对齐"假设。
@@ -81,18 +106,23 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 ### 2.6 DMA 与 IOMMU〔未实现〕**Medium**
 
 - virtio 驱动的 DMA 缓冲直接用物理帧，没有 IOMMU/iova 概念，靠"帧分配器上限 256 MiB < 4 GiB"隐式保证 DMA 地址安全。一旦修 2.1（内存超过 4 GiB），virtio 32-bit 设备会拿到 >4 GiB 的地址而静默损坏——修 2.1 时必须同时引入 bounce buffer 或 DMA 约束检查。
+  - **更新（2026-11-08）**：2.1 修复时已同步引入 `alloc_dma` + `DMA_FRAME_LIMIT`（4 GiB/4 KiB）显式约束，DMA 路径不可能拿到边界之上的帧；IOMMU/iova 仍是未实现项。
 
 ---
 
 ## 3. SMP（多核多线程）
 
-### 3.1 AP bring-up 完全不存在〔未实现〕**High**
+### 3.1 AP bring-up 完全不存在〔未实现〕**High** → **已实现并验证（2026-11-08）**
+
+> **更新**：`kernel/src/arch/x86_64/smp.rs` 实现完整 INIT–SIPI 唤醒链：MADT 拿 LAPIC ID → INIT IPI → 两次 SIPI（含重试）→ 低内存 trampoline（<1 MiB 页，恒等映射进内核空间 PML4[0]）→ 16 位手写机器码开 PAE/LME/NXE/PG → far jump 进 64 位 stub → per-CPU 内核栈续行（`boot_after_ap_stack_switch`）。`-smp 4` headless 实测 **cpu 1/2/3 全部 online，各自调度器线程与真实 timer tick**。调试中定位的关键缺陷：手写 16 位机器码里的 32 位立即数没有 `66` 前缀——`or eax, 0x80000001` 实际解码成 `or ax, 0x0001`（PG 位从未置上），被吞的立即数尾部还变成 `add [bx+si], al` 顺带写物理内存。该经验已写进 trampoline 的文档注释。
 
 - `kernel/src/boot/smp.rs:190-200` 注释直说："There is deliberately no AP entry point yet … the kernel boots the bootstrap processor only"。
 - 已有的部分：`AP_ONLINE`/`AP_TICKS`/`AP_TSS_RSP0` 等**诊断原子**（smp.rs:27-126）、per-CPU GDT/TSS 安装路径（`arch/x86_64/mod.rs:167-173 init_cpu`）、AP 内核-only idle 线程裸函数 `ap_idle_entry`（smp.rs:177-188，`sti/hlt/jmp` 自环）。也就是说"AP 到达后要做什么"已备好，但**没有人能把 AP 叫醒**：没有 MADT 解析、没有 INIT-SIPI 发送、没有低内存 trampoline 页。
 - SMP 测试套件因此在 `processor_count()==1` 时自我跳过（`test/harness.rs:54`）——205 个测试里 SMP 部分是 SKIPPED，"通过"具有误导性。
 
-### 3.2 调度器与用户线程绑死 CPU 0〔缺陷〕**High**
+### 3.2 调度器与用户线程绑死 CPU 0〔缺陷〕**High**（**仍未解，SMP 下一步**）
+
+> **更新**：AP 已能上线并运行内核 idle 线程（§3.1），但经复核 `sched/mod.rs:223,549`、`task/mod.rs:606,616,694` 的硬编码 cpu 0 **原样还在**——用户线程的上下文保存、地址空间读取、线程创建仍全部落在 BSP 表上。AP 侧目前只有 idle 自循环，不会踩到这些路径；一旦 AP 开始跑用户线程，这里立即成为正确性雷区。多核化的下一步就是 per-CPU 抽象（GS base），原判断不变。
 
 - `kernel/src/sched/mod.rs:521-554` `save_current_syscall_context`：**硬编码 `state_for_cpu(0)` / `thread_in_slot_for_cpu(0, ...)`**。同样地 `task/mod.rs:600-609 current_thread_space` 也读 `thread_pool(0)`。
 - `process.rs:615` `create_thread` 一律 `create_thread_for_cpu(0, ...)`。
@@ -231,8 +261,8 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 | socket | 8 | `services/net.rs:62` |
 | mount | 2 | `services/fs.rs` |
 | 磁盘文件 | 8 | `diskfs.rs:92` |
-| CPU | 8（快照）但实际 1 | `boot/info.rs:36` vs `novaboot.rs:242` |
-| 内存 | 256 MiB | `frame.rs:265` |
+| CPU | 8（快照）但用户线程路径实际只用 0 | `boot/info.rs:36` vs `sched/mod.rs:549` |
+| 内存 | ~~256 MiB~~ → 运行期尺寸（2 GiB 实测，设计上限 ≥192 GiB） | `frame.rs` |
 | initramfs | 512 KiB | `initramfs.rs` |
 | 消息 payload | 64 B 内联 | `SERVICE_REQUEST` |
 
@@ -264,11 +294,14 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 ## 10. "运行于现代硬件"差距清单（按优先级）
 
 **P0 —— 不做就在真机第一分钟内失败**
-1. 物理内存 > 256 MiB panic（frame.rs:112-120）→ 位图改启动期分配或 buddy；同时处理 4 GiB DMA 边界（§2.6）。
-2. 巨页支持（2MiB/1GiB）：`walk_to_leaf`、`map_hhdm`、NovaBoot 早期页表三处联动；否则表内存爆炸。
-3. ACPI 最小集：RSDP → MADT（CPU/IOAPIC 枚举）→（可选 FADT）。这是 SMP 和一切 modern 中断路由的前提。
-4. AP bring-up：MADT 拿 LAPIC ID → INIT-SIPI → 低内存 trampoline → `arch::init_cpu` 已备好的 per-CPU 路径；同时完成 per-CPU 抽象（GS base），拆除 sched/task 中所有硬编码 cpu=0（sched/mod.rs:549、task/mod.rs:606、process.rs:615-617）与 `static mut PENDING_EFFECT`。
-5. 中断模型：APIC timer 独立 vector、PIC 全 mask 或弃用；I/O APIC 路由 + 至少一种设备中断驱动模式（推荐 MSI-X 先行，xHCI 必需）。
+
+> 进度（2026-11-08）：**1 ✅、2 半 ✅（引导侧/HHDM 已巨叶，`walk_to_leaf` 未改）、3 ✅（处理器枚举）、4 半 ✅（AP 唤醒已通，per-CPU 未做）、5 未动**。§2.6 的 DMA 4 GiB 边界随 1 显式化。
+
+1. ~~物理内存 > 256 MiB panic（frame.rs:112-120）~~ → **已修**：运行期尺寸位图；DMA 边界经 `alloc_dma` 显式约束（§2.6）。
+2. 巨页支持（2MiB/1GiB）：~~`map_hhdm`、NovaBoot 早期页表~~ → **已修**；**剩余**：`walk_to_leaf` 识别大页位（内核查询/修改路径）。
+3. ~~ACPI 最小集：RSDP → MADT（CPU 枚举）~~ → **已修**（`nova-boot-menu/src/acpi.rs`）；**剩余**：IOAPIC 枚举（第 5 项的前提）、FADT/HPET。
+4. ~~AP bring-up：MADT LAPIC ID → INIT-SIPI → 低内存 trampoline → per-CPU init_cpu~~ → **唤醒链已通**（`-smp 4` 三 AP 在线）；**剩余**：per-CPU 抽象（GS base），拆除 sched/task 硬编码 cpu 0（sched/mod.rs:549、task/mod.rs:606、process.rs:615-617）与 `static mut PENDING_EFFECT`。
+5. 中断模型：APIC timer 独立 vector、PIC 全 mask 或弃用；I/O APIC 路由 + 至少一种设备中断驱动模式（推荐 MSI-X 先行，xHCI 必需）。**未动**。
 
 **P1 —— 真机上"可用"所需**
 6. xHCI + USB HID（键鼠）；无它则无输入。
@@ -298,3 +331,5 @@ NovaOS 目前是一个**单 CPU、轮询驱动、全静态池、256 MiB 内存�
 ## 12. 结语
 
 按子系统计，**能力/IPC/策略层是真实资产**（宿主可测、原子转移、撤销级联），**内存/SMP/中断/驱动是四根必须重做的柱子**，文件系统和网络是"可用但脆弱"的原型。四根柱子的共同主题是同一件事：*这个内核的所有正确性论证都建立在"单 CPU + 中断屏蔽 + 一切有界"上，而现代硬件恰好逐条否定这三个前提*。修复顺序建议严格按 §10 P0 的 1→5 推进，因为它们互为前提（内存上限不解，堆无从谈起；ACPI 不解，SMP 无从谈起；per-CPU 不解，中断驱动无从谈起）。
+
+**进度（2026-11-08）**：四根柱子中内存（P0-1）已完全重建，SMP（P0-3/4 的唤醒链）与巨页（P0-2 的引导侧/HHDM）已打通验证——三者互相咬合（ACPI 枚举喂给 SMP，巨页喂给引导，位图喂给一切），修复过程中发现"看似无关的 5 个测试失败"实为帧位图两处计数/扫描 bug。剩余关键路径：per-CPU 抽象（P0-4 收尾）→ 中断模型（P0-5）→ 驱动现代化（P1）。经验教训值得留下：**宿主可测的子系统和真机行为之间的鸿沟，只能靠"宿主复现→定位→内核修复"的循环来闭合**——本次帧位图 bug 在宿主上 20 分钟复现，在 QEMU 里消耗了整个调试会话。
