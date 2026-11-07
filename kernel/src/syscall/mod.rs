@@ -172,20 +172,12 @@ impl UserRegisters {
     }
 }
 
-/// The user's stack pointer at the moment of the `syscall`.
-///
-/// The `syscall` instruction does not touch `RSP`, but the stub switches to
-/// the kernel stack immediately afterwards, so the value has to be preserved
-/// somewhere the kernel can read it back. A dedicated global is that place:
-/// the entry path is strictly serialised — interrupts are masked on entry,
-/// and `SFMASK` clears `IF` — so one slot is enough.
-///
-/// # Safety
-///
-/// Only the syscall entry stub writes it, and only while a syscall is being
-/// dispatched.
-#[unsafe(no_mangle)]
-pub static mut NOVA_KERNEL_USER_STACK_POINTER: u64 = 0;
+// The user's stack pointer at the moment of the `syscall` lives in the
+// executing CPU's per-CPU data (`arch::x86_64::percpu`), not in a global: the
+// `syscall` instruction does not touch `RSP`, but the stub switches to the
+// kernel stack immediately afterwards, and two processors can be inside the
+// stub at overlapping times — a single slot would hand one processor's user
+// stack pointer to the other's `iretq`.
 
 /// Install the syscall MSRs.
 ///
@@ -247,24 +239,25 @@ pub unsafe fn init() {
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() -> ! {
     core::arch::naked_asm!(
-        // SAFETY: the user's stack pointer is stashed in a kernel-owned global
-        // before the stack pointer is replaced. The store is a single aligned
-        // eight-byte write to a statically allocated word.
+        // SAFETY: the user's stack pointer is stashed in this CPU's own
+        // per-CPU cell before the stack pointer is replaced. `GS` base points
+        // at the executing processor's data (see `percpu`), so two processors
+        // entering syscalls concurrently cannot overwrite each other's stash —
+        // the single global this cell replaces could not say the same. The
+        // store is a single aligned eight-byte write.
         //
-        // `NOVA_KERNEL_USER_STACK_POINTER` is `no_mangle` precisely so that
-        // the assembler can name it: `naked_asm!` accepts no operands, so a
-        // Rust-side symbol has to be reachable by name. The name in the
-        // assembler is the *symbol* name, which is the Rust identifier
-        // verbatim — Rust's `no_mangle` does not case-fold it.
-        "mov qword ptr [rip + NOVA_KERNEL_USER_STACK_POINTER], rsp",
-        // SAFETY: the TSS's `RSP0` is at offset 8 of the TSS structure —
-        // `privilege_stack_table[0]`. The offset is asserted at compile time
-        // in `gdt`, so the two cannot drift apart.
+        // The offset is `percpu::OFFSET_USER_STACK_POINTER`; a field move in
+        // `PerCpuData` is caught by its compile-time assertions.
+        "mov qword ptr gs:[0x00], rsp",
+        // SAFETY: this CPU's kernel stack top comes from the per-CPU cell the
+        // scheduler wrote when it resumed the current thread — the same value
+        // the TSS's `RSP0` carries for interrupt entries. The offset is
+        // `percpu::OFFSET_KERNEL_STACK`.
         //
-        // `nova_kernel_tss` is the TSS the CPU itself reads on every
-        // privilege transition, so the kernel stack it names is the same one
-        // the CPU would have used for an interrupt.
-        "mov rsp, qword ptr [rip + nova_kernel_tss + 8]",
+        // The single TSS this load replaces named the bootstrap processor's
+        // stack only; a second processor entering here would have landed on
+        // the first one's stack.
+        "mov rsp, qword ptr gs:[0x08]",
         // SAFETY: each `push` writes one word of the register file to the
         // kernel stack. The stack is mapped and has room: the kernel reserves
         // a stack per thread, and the boot thread has one of its own.
@@ -590,12 +583,10 @@ fn stage_outgoing_payload(number: u64, args: [u64; 6]) {
     };
 
     // SAFETY: service state is installed before user processes can run.
-    unsafe {
-        let kernel = crate::services::state();
-        let thread = crate::task::current_syscall_context().thread as usize;
-        if thread < kernel.outgoing_message.len() {
-            kernel.outgoing_message[thread] = Some(message);
-        }
+    let mut kernel = crate::services::state();
+    let thread = crate::task::current_syscall_context().thread as usize;
+    if thread < kernel.outgoing_message.len() {
+        kernel.outgoing_message[thread] = Some(message);
     }
 }
 
@@ -607,7 +598,7 @@ fn copy_received_payload(thread: usize, args: [u64; 6]) {
 
     // SAFETY: service state is installed before user processes can run.
     unsafe {
-        let kernel = crate::services::state();
+        let mut kernel = crate::services::state();
         let Some(message) = kernel.last_message.get(thread).and_then(Option::as_ref) else {
             return;
         };
@@ -734,10 +725,10 @@ fn service_request(args: [u64; 6]) -> Outcome {
 
     // SAFETY: the service state was installed during boot and the entry path
     // holds no other borrow of it.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
 
     let result = crate::services::dispatch::service_request(
-        kernel,
+        &mut kernel,
         &context,
         service_id,
         opcode,
@@ -887,10 +878,11 @@ unsafe fn return_to_user(registers: &UserRegisters) -> ! {
     // The user's `RFLAGS`, which the CPU put in `R11` before the entry.
     let user_rflags = registers.user_rflags();
     // The user's `RSP`. The `syscall` instruction did not change it, and the
-    // stub stashed it before switching stacks.
+    // stub stashed it in this CPU's per-CPU cell before switching stacks.
     //
-    // SAFETY: delegated to this function's contract; the stub wrote it.
-    let user_rsp = unsafe { NOVA_KERNEL_USER_STACK_POINTER };
+    // SAFETY: delegated to this function's contract; the stub wrote it on
+    // this same CPU, with interrupts masked.
+    let user_rsp = unsafe { crate::arch::x86_64::percpu::user_stack_pointer() };
     klog!(Level::Info, "debug: return rflags={user_rflags:#x}");
 
     // The frame is built *below* the saved registers: the stack grows down,

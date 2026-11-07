@@ -44,6 +44,7 @@ mod logger;
 mod mm;
 mod sched;
 mod services;
+mod sync;
 mod syscall;
 mod task;
 mod test;

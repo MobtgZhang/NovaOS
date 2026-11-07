@@ -156,7 +156,7 @@ pub fn with_net<T>(f: impl FnOnce(&mut VirtioNet) -> T) -> Result<T, NetError> {
 pub fn link_info() -> Option<LinkInfo> {
     // SAFETY: read-only access from kernel code with interrupts masked.
     unsafe {
-        let state = state();
+        let mut state = state();
         state.devices[0].as_ref().map(|device| device.link_info())
     }
 }

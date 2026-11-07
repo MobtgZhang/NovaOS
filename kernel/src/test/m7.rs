@@ -192,13 +192,12 @@ pub static M7_SUITES: &[TestSuite] = &[
 ];
 
 /// The kernel's own service state, reset for this case.
-fn fresh_state() -> &'static mut KernelState {
+fn fresh_state() -> crate::sync::SpinLockGuard<'static, crate::services::KernelState> {
     // SAFETY: suites run one at a time in ring 0 with interrupts masked.
-    unsafe {
-        let state = crate::services::test_state();
-        state.reset();
-        state
-    }
+    let state = crate::services::test_state();
+    let mut state = state;
+    state.reset();
+    state
 }
 
 /// Create one task in the fresh state and return its slot.
@@ -430,12 +429,13 @@ fn the_nic_reports_the_qemu_user_address() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn the_link_query_reports_address_and_gateway() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = link_request(NET_VERSION, 0);
     let mut reply = [0u8; 64];
 
-    let length = ask(state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
     if length != NET_LINK_REPLY_SIZE {
         return Err("the link reply was not the protocol's fixed size");
     }
@@ -455,12 +455,13 @@ fn the_link_query_reports_address_and_gateway() -> Result<(), &'static str> {
 }
 
 fn the_link_query_reports_the_service_version() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = link_request(NET_VERSION, 0);
     let mut reply = [0u8; 64];
 
-    let length = ask(state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
     if length != NET_LINK_REPLY_SIZE {
         return Err("the link reply was not the protocol's fixed size");
     }
@@ -471,12 +472,13 @@ fn the_link_query_reports_the_service_version() -> Result<(), &'static str> {
 }
 
 fn an_unknown_version_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = link_request(ProtocolVersion::new(2, 0), 0);
     let mut reply = [0u8; 64];
 
-    let length = ask(state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
     if length != NET_LINK_REPLY_SIZE {
         return Err("the refusal reply was not the protocol's fixed size");
     }
@@ -487,12 +489,13 @@ fn an_unknown_version_is_refused() -> Result<(), &'static str> {
 }
 
 fn nonzero_flags_are_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = link_request(NET_VERSION, 1);
     let mut reply = [0u8; 64];
 
-    let length = ask(state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
     if length != NET_LINK_REPLY_SIZE {
         return Err("the refusal reply was not the protocol's fixed size");
     }
@@ -507,15 +510,16 @@ fn nonzero_flags_are_refused() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_dns_query_returns_a_nonzero_a_record() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
 
     let name = b"example.com";
     let request = resolve_request(NET_VERSION, 0, name);
     let mut reply = [0u8; 64];
 
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_RESOLVE,
         &request[..NET_RESOLVE_REQUEST_SIZE + name.len()],
@@ -535,15 +539,16 @@ fn a_dns_query_returns_a_nonzero_a_record() -> Result<(), &'static str> {
 }
 
 fn the_dns_reply_carries_the_service_version() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
 
     let name = b"example.com";
     let request = resolve_request(NET_VERSION, 0, name);
     let mut reply = [0u8; 64];
 
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_RESOLVE,
         &request[..NET_RESOLVE_REQUEST_SIZE + name.len()],
@@ -563,12 +568,13 @@ fn the_dns_reply_carries_the_service_version() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_short_link_request_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = [0u8; NET_LINK_REQUEST_SIZE - 1];
     let mut reply = [0u8; 64];
 
-    let length = ask(state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_LINK_QUERY, &request, &mut reply)?;
     if length != NET_LINK_REPLY_SIZE {
         return Err("the refusal reply was not the protocol's fixed size");
     }
@@ -579,13 +585,14 @@ fn a_short_link_request_is_refused() -> Result<(), &'static str> {
 }
 
 fn a_resolve_request_with_zero_name_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = resolve_request(NET_VERSION, 0, b"");
     let mut reply = [0u8; 64];
 
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_RESOLVE,
         &request[..NET_RESOLVE_REQUEST_SIZE],
@@ -601,8 +608,9 @@ fn a_resolve_request_with_zero_name_is_refused() -> Result<(), &'static str> {
 }
 
 fn an_oversized_datagram_length_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
 
     let mut request = [0u8; NET_SEND_REQUEST_SIZE];
     request[0..2].copy_from_slice(&NET_VERSION.major.to_le_bytes());
@@ -613,7 +621,7 @@ fn an_oversized_datagram_length_is_refused() -> Result<(), &'static str> {
     request[14..16].copy_from_slice(&(NET_MAX_DATAGRAM as u16 + 1).to_le_bytes());
 
     let mut reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SEND, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SEND, &request, &mut reply)?;
     if length != nova_protocols::net::NET_SEND_REPLY_SIZE {
         return Err("the refusal reply was not the protocol's fixed size");
     }
@@ -663,7 +671,7 @@ fn open_tcp_socket(
     let mut reply = [0u8; 64];
     for _ in 0..reserved_slots {
         let dummy = socket_open_request(NET_VERSION, 0, NET_SOCKET_UDP);
-        let length = ask(state, slot, NET_OP_SOCKET_OPEN, &dummy, &mut reply)?;
+        let length = ask(&mut *state, slot, NET_OP_SOCKET_OPEN, &dummy, &mut reply)?;
         if length != NET_SOCKET_OPEN_REPLY_SIZE || reply_status(&reply) != Some(0) {
             return Err("a reserved socket did not open");
         }
@@ -671,7 +679,7 @@ fn open_tcp_socket(
 
     let request = socket_open_request(NET_VERSION, 0, NET_SOCKET_TCP);
     let mut reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SOCKET_OPEN, &request, &mut reply)?;
+    let length = ask(&mut *state, slot, NET_OP_SOCKET_OPEN, &request, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE {
         return Err("the socket-open reply was not the protocol's fixed size");
     }
@@ -720,23 +728,25 @@ fn close_socket(state: &mut KernelState, slot: usize, socket: u16) -> Result<(),
 }
 
 fn a_tcp_socket_reaches_the_forwarded_server() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
-    let (socket, _port) = connect_forwarded_tcp(state, slot, 0)?;
-    close_socket(state, slot, socket)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = connect_forwarded_tcp(&mut state, slot, 0)?;
+    close_socket(&mut state, slot, socket)?;
     Ok(())
 }
 
 fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
-    let (socket, _port) = connect_forwarded_tcp(state, slot, 1)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = connect_forwarded_tcp(&mut state, slot, 1)?;
 
     let payload = b"nova-tcp";
     let send = socket_send_request(NET_VERSION, 0, socket, payload);
     let mut send_reply = [0u8; 64];
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_SOCKET_SEND,
         &send[..NET_SOCKET_SEND_REQUEST_SIZE + payload.len()],
@@ -758,7 +768,7 @@ fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
     // The forwarded `/bin/cat` echoes the stream bytes back to the socket.
     let recv = socket_recv_request(NET_VERSION, 0, socket, NET_MAX_SOCKET_RECV as u16);
     let mut recv_reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SOCKET_RECV, &recv, &mut recv_reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_RECV, &recv, &mut recv_reply)?;
     if length < NET_SOCKET_RECV_REPLY_SIZE {
         return Err("the socket-receive reply was shorter than its header");
     }
@@ -779,18 +789,25 @@ fn a_tcp_socket_carries_a_request() -> Result<(), &'static str> {
     }
 
     // Release the forwarded connection for the next case.
-    close_socket(state, slot, socket)?;
+    close_socket(&mut state, slot, socket)?;
     Ok(())
 }
 
 fn a_tcp_socket_closes_cleanly() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
-    let (socket, _port) = connect_forwarded_tcp(state, slot, 2)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = connect_forwarded_tcp(&mut state, slot, 2)?;
 
     let close = socket_close_request(NET_VERSION, 0, socket);
     let mut close_reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SOCKET_CLOSE, &close, &mut close_reply)?;
+    let length = ask(
+        &mut state,
+        slot,
+        NET_OP_SOCKET_CLOSE,
+        &close,
+        &mut close_reply,
+    )?;
     if length != NET_SOCKET_CLOSE_REPLY_SIZE {
         return Err("the socket-close reply was not the protocol's fixed size");
     }
@@ -808,14 +825,15 @@ fn a_tcp_socket_closes_cleanly() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn an_icmp_echo_reaches_the_gateway() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let payload = b"nova";
     let request = icmp_request(NET_VERSION, 0, LINK_GATEWAY.octets(), 7, 3, payload);
 
     let mut reply = [0u8; 64];
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_ICMP_ECHO,
         &request[..NET_ICMP_REQUEST_SIZE + payload.len()],
@@ -844,14 +862,15 @@ fn an_icmp_echo_reaches_the_gateway() -> Result<(), &'static str> {
 }
 
 fn an_icmp_echo_reports_the_service_version() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let payload = b"nova";
     let request = icmp_request(NET_VERSION, 0, LINK_GATEWAY.octets(), 7, 3, payload);
 
     let mut reply = [0u8; 64];
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_ICMP_ECHO,
         &request[..NET_ICMP_REQUEST_SIZE + payload.len()],
@@ -871,11 +890,12 @@ fn an_icmp_echo_reports_the_service_version() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn dhcp_returns_a_guest_address() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = dhcp_request(NET_VERSION, 0);
     let mut reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_DHCP, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_DHCP, &request, &mut reply)?;
 
     if length != NET_DHCP_REPLY_SIZE {
         return Err("the DHCP reply was not the protocol's fixed size");
@@ -891,11 +911,12 @@ fn dhcp_returns_a_guest_address() -> Result<(), &'static str> {
 }
 
 fn dhcp_returns_an_acknowledgement() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let request = dhcp_request(NET_VERSION, 0);
     let mut reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_DHCP, &request, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_DHCP, &request, &mut reply)?;
 
     if length != NET_DHCP_REPLY_SIZE {
         return Err("the DHCP reply was not the protocol's fixed size");
@@ -915,19 +936,26 @@ fn dhcp_returns_an_acknowledgement() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
 
     let open = socket_open_request(NET_VERSION, 0, NET_SOCKET_UDP);
     let mut reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE || reply_status(&reply) != Some(0) {
         return Err("the UDP socket did not open");
     }
     let socket = reply_socket(&reply).ok_or("the socket-open reply had no identifier")?;
 
     let connect = socket_connect_request(NET_VERSION, 0, socket, 53, DNS_SERVER.octets());
-    let length = ask(state, slot, NET_OP_SOCKET_CONNECT, &connect, &mut reply)?;
+    let length = ask(
+        &mut state,
+        slot,
+        NET_OP_SOCKET_CONNECT,
+        &connect,
+        &mut reply,
+    )?;
     if length != NET_SOCKET_CONNECT_REPLY_SIZE || reply_status(&reply) != Some(0) {
         return Err("the UDP socket did not connect to the DNS server");
     }
@@ -941,7 +969,7 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
         .ok_or("the DNS query did not fit")?;
     let send = socket_send_request(NET_VERSION, 0, socket, &query[..query_length]);
     let length = ask(
-        state,
+        &mut state,
         slot,
         NET_OP_SOCKET_SEND,
         &send[..NET_SOCKET_SEND_REQUEST_SIZE + query_length],
@@ -953,7 +981,7 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
 
     let recv = socket_recv_request(NET_VERSION, 0, socket, NET_MAX_SOCKET_RECV as u16);
     let mut recv_reply = [0u8; 64];
-    let length = ask(state, slot, NET_OP_SOCKET_RECV, &recv, &mut recv_reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_RECV, &recv, &mut recv_reply)?;
     if length < NET_SOCKET_RECV_REPLY_SIZE {
         return Err("the socket-receive reply was shorter than its header");
     }
@@ -978,13 +1006,14 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
 }
 
 fn a_socket_is_not_usable_by_another_task() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first = task_slot(state)?;
-    let second = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first = task_slot(&mut state)?;
+    let second = task_slot(&mut state)?;
 
     let open = socket_open_request(NET_VERSION, 0, NET_SOCKET_TCP);
     let mut reply = [0u8; 64];
-    let length = ask(state, first, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
+    let length = ask(&mut state, first, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE || reply_status(&reply) != Some(0) {
         return Err("the first task could not open a socket");
     }
@@ -993,7 +1022,7 @@ fn a_socket_is_not_usable_by_another_task() -> Result<(), &'static str> {
     let connect = socket_connect_request(NET_VERSION, 0, socket, 80, LINK_GATEWAY.octets());
     let mut foreign_reply = [0u8; 64];
     let length = ask(
-        state,
+        &mut state,
         second,
         NET_OP_SOCKET_CONNECT,
         &connect,
@@ -1009,13 +1038,14 @@ fn a_socket_is_not_usable_by_another_task() -> Result<(), &'static str> {
 }
 
 fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = task_slot(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
     let mut reply = [0u8; 64];
 
     // Unknown protocol version.
     let open = socket_open_request(ProtocolVersion::new(2, 0), 0, NET_SOCKET_TCP);
-    let length = ask(state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Unsupported.code())
     {
@@ -1024,7 +1054,7 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
 
     // Socket kind the service does not implement.
     let open = socket_open_request(NET_VERSION, 0, 3);
-    let length = ask(state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
     if length != NET_SOCKET_OPEN_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Unsupported.code())
     {
@@ -1033,7 +1063,13 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
 
     // Zero socket identifier.
     let connect = socket_connect_request(NET_VERSION, 0, 0, 80, LINK_GATEWAY.octets());
-    let length = ask(state, slot, NET_OP_SOCKET_CONNECT, &connect, &mut reply)?;
+    let length = ask(
+        &mut state,
+        slot,
+        NET_OP_SOCKET_CONNECT,
+        &connect,
+        &mut reply,
+    )?;
     if length != NET_SOCKET_CONNECT_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Invalid.code())
     {
@@ -1042,7 +1078,7 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
 
     // Receive limit above the protocol's budget.
     let recv = socket_recv_request(NET_VERSION, 0, 1, NET_MAX_SOCKET_RECV as u16 + 1);
-    let length = ask(state, slot, NET_OP_SOCKET_RECV, &recv, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_RECV, &recv, &mut reply)?;
     if length != NET_SOCKET_RECV_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Invalid.code())
     {
@@ -1055,7 +1091,7 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
     send[2..4].copy_from_slice(&NET_VERSION.minor.to_le_bytes());
     send[8..10].copy_from_slice(&1u16.to_le_bytes());
     send[10..12].copy_from_slice(&(NET_MAX_SOCKET_PAYLOAD as u16 + 1).to_le_bytes());
-    let length = ask(state, slot, NET_OP_SOCKET_SEND, &send, &mut reply)?;
+    let length = ask(&mut state, slot, NET_OP_SOCKET_SEND, &send, &mut reply)?;
     if length != NET_SOCKET_SEND_REPLY_SIZE
         || reply_status(&reply) != Some(ErrorCode::Invalid.code())
     {

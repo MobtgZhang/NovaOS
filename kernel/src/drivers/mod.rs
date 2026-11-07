@@ -86,7 +86,7 @@ pub unsafe fn init() {
 
     // SAFETY: delegated to this function's contract; `services::init` has
     // installed the state, and nothing has dispatched against it yet.
-    let state = unsafe { crate::services::state() };
+    let mut state = crate::services::state();
 
     // A missing `/media` would make every mount unreachable through a client
     // that stat'd its way down the path first. The failure is ignored because

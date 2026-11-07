@@ -186,8 +186,8 @@ pub unsafe fn dispatch_syscall(
 ) -> SyscallOutcome {
     // SAFETY: delegated to this function's contract: the state is installed
     // and no other borrow of it is live.
-    let kernel = unsafe { state() };
-    dispatch_syscall_in(kernel, context, number, args)
+    let mut kernel = state();
+    dispatch_syscall_in(&mut kernel, context, number, args)
 }
 
 /// Dispatch one syscall against an explicit service state.

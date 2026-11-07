@@ -500,18 +500,24 @@ unsafe fn thread_pool(cpu: usize) -> &'static mut [Option<Thread>; MAX_THREADS] 
 }
 
 /// The CPU slot of the processor running this code.
-fn current_cpu() -> usize {
-    crate::arch::x86_64::apic::cpu_index()
+///
+/// Routed through the architecture facade so high-level code never names a
+/// backend module.
+pub fn current_cpu() -> usize {
+    crate::arch::current_cpu()
 }
 
-/// The effect the most recent syscall asked for.
+/// The effect the most recent syscall on *this* CPU asked for.
 ///
-/// A single slot rather than a per-thread field: only one syscall can be in
-/// flight at a time, because the entry path runs with interrupts masked.
-static mut PENDING_EFFECT: ThreadEffect = ThreadEffect::Continue;
+/// One slot per CPU rather than one per thread: within a CPU only one syscall
+/// can be in flight at a time, because the entry path runs with interrupts
+/// masked. The per-CPU split is what lets two processors dispatch syscalls
+/// concurrently without one CPU's effect being consumed by the other's
+/// scheduler tick (§ "global single-slot" tension from the issues report).
+static mut PENDING_EFFECT: [ThreadEffect; MAX_CPUS] = [const { ThreadEffect::Continue }; MAX_CPUS];
 
-/// The exit status the most recent `THREAD_EXIT` carried.
-static mut PENDING_EXIT_STATUS: i64 = 0;
+/// The exit status the most recent `THREAD_EXIT` on *this* CPU carried.
+static mut PENDING_EXIT_STATUS: [i64; MAX_CPUS] = [const { 0 }; MAX_CPUS];
 
 /// Record what a syscall did to the calling thread.
 ///
@@ -522,9 +528,10 @@ static mut PENDING_EXIT_STATUS: i64 = 0;
 /// dispatched.
 pub unsafe fn note_syscall_effect(effect: ThreadEffect) {
     // SAFETY: delegated to this function's contract. The slot is written by
-    // the entry path and read by the scheduler, both with interrupts masked.
+    // the entry path and read by the scheduler — both on the CPU that entered
+    // the syscall, both with interrupts masked.
     unsafe {
-        PENDING_EFFECT = effect;
+        PENDING_EFFECT[current_cpu()] = effect;
     }
 }
 
@@ -536,8 +543,8 @@ pub unsafe fn note_syscall_effect(effect: ThreadEffect) {
 pub unsafe fn take_syscall_effect() -> ThreadEffect {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        let effect = PENDING_EFFECT;
-        PENDING_EFFECT = ThreadEffect::Continue;
+        let effect = PENDING_EFFECT[current_cpu()];
+        PENDING_EFFECT[current_cpu()] = ThreadEffect::Continue;
         effect
     }
 }
@@ -550,7 +557,7 @@ pub unsafe fn take_syscall_effect() -> ThreadEffect {
 pub unsafe fn note_exit_status(status: i64) {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        PENDING_EXIT_STATUS = status;
+        PENDING_EXIT_STATUS[current_cpu()] = status;
     }
 }
 
@@ -562,8 +569,8 @@ pub unsafe fn note_exit_status(status: i64) {
 pub unsafe fn take_exit_status() -> i64 {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        let status = PENDING_EXIT_STATUS;
-        PENDING_EXIT_STATUS = 0;
+        let status = PENDING_EXIT_STATUS[current_cpu()];
+        PENDING_EXIT_STATUS[current_cpu()] = 0;
         status
     }
 }
@@ -598,12 +605,15 @@ pub fn current_syscall_context() -> crate::services::dispatch::SyscallContext {
 /// Returns `None` when no thread is running — which happens on the boot
 /// thread, before the scheduler has been given anything to switch to.
 pub fn current_thread_space() -> Option<AddressSpace> {
-    // SAFETY: the bootstrap processor is the only CPU that dispatches a user
-    // syscall. Its current slot is read while interrupts are masked, and the
+    // The asking thread runs on whichever processor entered the syscall; its
+    // own pool holds its own thread. The bootstrap-processor-only assumption
+    // this used to make is what pinned every user thread to CPU 0.
+    let cpu = current_cpu();
+    // SAFETY: the current slot is read while interrupts are masked, and the
     // thread's `space` is a `Copy` handle to a table the kernel owns.
     unsafe {
         crate::sched::current_slot()
-            .and_then(|slot| (unsafe { thread_pool(0) }).get(slot).copied().flatten())
+            .and_then(|slot| (unsafe { thread_pool(cpu) }).get(slot).copied().flatten())
             .map(|thread| thread.space)
     }
 }

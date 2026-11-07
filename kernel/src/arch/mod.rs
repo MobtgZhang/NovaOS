@@ -59,6 +59,21 @@ compile_error!(
      capabilities in `arch::shared` and adding one `cfg` arm in `arch/mod.rs`."
 );
 
+/// The executing processor's kernel slot index.
+///
+/// High-level code must ask the facade rather than name a backend module.
+/// x86-64 reads the per-CPU data block the processor's `GS` base points at;
+/// aarch64 currently runs single-processor builds and names slot 0.
+#[cfg(target_arch = "x86_64")]
+pub fn current_cpu() -> usize {
+    x86_64::percpu::cpu_index()
+}
+
+#[cfg(target_arch = "aarch64")]
+pub fn current_cpu() -> usize {
+    0
+}
+
 /// Geometry of this target's address space.
 ///
 /// Re-exported under its own name rather than by re-exporting the backend's

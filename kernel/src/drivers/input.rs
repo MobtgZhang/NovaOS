@@ -141,7 +141,7 @@ pub unsafe fn init() {
 pub unsafe fn poll() -> usize {
     // SAFETY: the service state is installed during boot and the timer path
     // holds no other mutable borrow of it.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     let parts = kernel.split();
     let mut routed = 0usize;
 

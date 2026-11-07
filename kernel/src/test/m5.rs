@@ -49,7 +49,6 @@ use nova_fs::ramfs::FsError;
 use super::harness::TestSuite;
 use crate::drivers::block::KernelBlockDevice;
 use crate::drivers::{self, block, pci, virtio};
-use crate::services::KernelState;
 
 /// The M5 suites, in registration order.
 ///
@@ -397,7 +396,8 @@ fn a_written_sector_reads_back_from_the_medium() -> Result<(), &'static str> {
 /// point: the write is write-through to the device, and close asks the device to
 /// make it durable, so reopening reads what the medium holds.
 fn a_file_written_through_the_vfs_reads_back() -> Result<(), &'static str> {
-    let state = fresh_state();
+    let mut state = fresh_state();
+    let mut state = &mut *state;
     let task = state.create_task().ok_or("task pool is empty")?;
     let slot = state.slot_of_task(task).ok_or("the new task has no slot")?;
 
@@ -656,7 +656,8 @@ fn the_read_only_device_refuses_writes() -> Result<(), &'static str> {
 /// gets `E_READ_ONLY` — not a silent success and not a mysterious I/O error.
 /// Reading is, of course, still allowed.
 fn a_read_only_mount_refuses_a_vfs_write() -> Result<(), &'static str> {
-    let state = fresh_state();
+    let mut state = fresh_state();
+    let mut state = &mut *state;
     let task = state.create_task().ok_or("task pool is empty")?;
     let slot = state.slot_of_task(task).ok_or("the new task has no slot")?;
 
@@ -723,7 +724,8 @@ fn a_read_only_mount_refuses_a_vfs_write() -> Result<(), &'static str> {
 /// the same capability discipline as a RAM file, and that a caller without a
 /// grant learns nothing about which disks are mounted.
 fn a_mount_is_reachable_only_through_a_scope() -> Result<(), &'static str> {
-    let state = fresh_state();
+    let mut state = fresh_state();
+    let mut state = &mut *state;
     let task = state.create_task().ok_or("task pool is empty")?;
     let slot = state.slot_of_task(task).ok_or("the new task has no slot")?;
 
@@ -789,12 +791,11 @@ fn arm_owner_exited() -> ArmedFault {
 /// server alone) against a 64 KiB stack, so it lives in a static and is reached
 /// through the `UnsafeCell` the kernel uses. `reset` unmounts every disk, which
 /// is why the mount cases re-mount before reaching for a path.
-fn fresh_state() -> &'static mut KernelState {
+fn fresh_state() -> crate::sync::SpinLockGuard<'static, crate::services::KernelState> {
     // SAFETY: the tests run one at a time, in ring 0, with interrupts masked —
     // the same single-CPU assumption the kernel's own service state relies on.
-    unsafe {
-        let state = crate::services::test_state();
-        state.reset();
-        state
-    }
+    let state = crate::services::test_state();
+    let mut state = state;
+    state.reset();
+    state
 }

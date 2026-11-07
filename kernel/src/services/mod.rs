@@ -63,7 +63,7 @@ pub mod object;
 pub mod process;
 pub mod supervisor;
 
-use core::cell::UnsafeCell;
+use crate::sync::{SpinLock, SpinLockGuard};
 
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
@@ -738,23 +738,19 @@ impl Default for KernelState {
 
 /// Holds the kernel's service state.
 ///
-/// The state is behind an `UnsafeCell` because it is mutated in place; the
-/// `Sync` implementation documents the single-CPU, interrupts-masked
-/// assumption that makes that sound.
+/// The state sits behind a recursive interrupt-safe spin lock
+/// ([`crate::sync::SpinLock`]): dispatch paths may reach for the state while
+/// already holding it, and two processors may dispatch syscalls at overlapping
+/// times once user threads run on application processors. The guard each
+/// accessor returns dereferences to the state and releases on drop.
 struct SingleState {
-    inner: UnsafeCell<KernelState>,
+    inner: SpinLock<KernelState>,
 }
-
-// SAFETY: the state is mutated only from kernel code that runs with
-// interrupts masked on a single CPU. That is the same assumption the frame
-// allocator makes, and it is replaced by a real lock when M2 introduces
-// preemption.
-unsafe impl Sync for SingleState {}
 
 impl SingleState {
     const fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(KernelState::new()),
+            inner: SpinLock::new(KernelState::new()),
         }
     }
 }
@@ -784,16 +780,11 @@ static TEST_STATE: SingleState = SingleState::new();
 
 /// The test suites' own service state.
 ///
-/// # Safety
-///
-/// The same discipline as [`state()`]: the suites run one at a time, in ring
-/// 0, with interrupts masked, and no two callers hold this borrow at once.
-/// A caller that keeps the returned reference across another call to this
-/// function has aliased it, which is the same mistake the aliasing rule
-/// forbids everywhere else.
-pub unsafe fn test_state() -> &'static mut KernelState {
-    // SAFETY: delegated to this function's contract.
-    unsafe { &mut *TEST_STATE.inner.get() }
+/// The suites run one at a time, in ring 0, with interrupts masked; the lock
+/// still guards the borrow so the discipline is the same one the kernel state
+/// uses.
+pub fn test_state() -> SpinLockGuard<'static, KernelState> {
+    TEST_STATE.inner.lock()
 }
 
 /// Install the kernel's service state.
@@ -810,22 +801,15 @@ pub unsafe fn init() {
     // than a race.
 }
 
-/// The kernel's service state.
+/// The kernel's service state, locked for the duration of the borrow.
 ///
-/// # Safety
-///
-/// `init` must already have run. The returned reference is `&'static` because
-/// the state lives in a static and is never moved.
-///
-/// Only one borrow may be live at a time: the state is behind a raw pointer
-/// for exactly this reason, so that a caller who has finished with a borrow
-/// can take another without the two aliasing in the compiler's model. The
-/// service layer never holds two at once — every helper takes `&KernelState`
-/// or `&mut KernelState` explicitly rather than reaching for the global.
+/// The guard dereferences to [`KernelState`]; dropping it releases the lock.
+/// The service layer never holds two independent borrows at once — every
+/// helper takes `&KernelState` or `&mut KernelState` explicitly rather than
+/// reaching for the global — and re-entrant acquisition from a dispatch path
+/// that already holds the state is detected by the lock's CPU-keyed
+/// recursion rather than aliasing two `&mut`.
 #[inline]
-pub unsafe fn state() -> &'static mut KernelState {
-    // SAFETY: delegated to this function's contract. The exclusive borrow is
-    // sound under the same single-CPU, interrupts-masked assumption that makes
-    // the `Sync` implementation above sound.
-    unsafe { &mut *STATE.inner.get() }
+pub fn state() -> SpinLockGuard<'static, KernelState> {
+    STATE.inner.lock()
 }

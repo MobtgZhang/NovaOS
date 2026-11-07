@@ -38,15 +38,15 @@ pub fn exec_image(name: &[u8], grant: Option<(&[u8], Rights)>) -> Result<CapHand
     let context = task::current_syscall_context();
     // SAFETY: service state is installed before user processes can run, and
     // the syscall path holds the only mutable borrow.
-    let kernel = unsafe { crate::services::state() };
-    crate::services::dispatch::check_spawn_authority(kernel, &context)?;
+    let mut kernel = crate::services::state();
+    crate::services::dispatch::check_spawn_authority(&kernel, &context)?;
     if let Some((path, rights)) = grant {
-        check_grant_is_delegable(kernel, context.task_slot, path, rights)?;
+        check_grant_is_delegable(&kernel, context.task_slot, path, rights)?;
     }
     // SAFETY: boot capture has run, and syscall entry runs with interrupts
     // masked; this is the same contract as the rest of the syscall path.
     let boot_info = unsafe { crate::boot::read_boot_info() };
-    exec_image_in_state_with_grant(kernel, name, context.task_slot, boot_info, grant)
+    exec_image_in_state_with_grant(&mut kernel, name, context.task_slot, boot_info, grant)
 }
 
 /// Whether `parent_slot` may hand `path` and `rights` to a child.
@@ -77,8 +77,8 @@ pub fn exec_image_in(name: &[u8], parent_slot: usize) -> Result<CapHandle, Error
     let boot_info = unsafe { crate::boot::read_boot_info() };
     // SAFETY: service state is installed before user processes can run, and
     // the syscall path holds the only mutable borrow.
-    let kernel = unsafe { crate::services::state() };
-    exec_image_in_state_with_grant(kernel, name, parent_slot, boot_info, None)
+    let mut kernel = crate::services::state();
+    exec_image_in_state_with_grant(&mut kernel, name, parent_slot, boot_info, None)
 }
 
 /// Start an image against an explicit kernel state, without a path grant.
@@ -206,7 +206,7 @@ pub(crate) fn exec_image_in_state_with_grant(
 pub fn start_init_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
     // SAFETY: service state was installed during boot, before any user thread
     // existed, and the boot path runs serialised with interrupts masked.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     let Some(id) = kernel.create_task() else {
         klog!(Level::Error, "process: init has no task slot");
         return Err(ErrorCode::NoMemory);
@@ -228,7 +228,7 @@ pub fn start_init_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
     // interrupts masked; this is the same contract as `exec_image_in`.
     let boot_info = unsafe { crate::boot::read_boot_info() };
     let result = exec_image_in_state_with_grant(
-        kernel,
+        &mut kernel,
         name,
         slot,
         boot_info,
@@ -254,21 +254,21 @@ pub fn live_task_count() -> usize {
 /// Remove a dead task and release its slot.
 pub fn retire_task(slot: usize) -> bool {
     // SAFETY: syscall path is serialised; exiting thread cannot return.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     kernel.retire_task(slot)
 }
 
 /// Whether a live task was started from the named initramfs image.
 pub fn service_is_alive(name: &[u8]) -> bool {
     // SAFETY: syscall path is serialised.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     kernel.service_is_alive(name)
 }
 
 /// Create both sides of an endpoint pair in the calling task.
 pub fn create_endpoint_pair() -> Result<CapHandle, ErrorCode> {
     // SAFETY: service state is installed before user processes can run.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     let context = task::current_syscall_context();
     let slot = context.task_slot;
     if slot >= MAX_TASKS {
@@ -287,7 +287,7 @@ pub fn create_endpoint_pair() -> Result<CapHandle, ErrorCode> {
 /// Return the side of a pair created by [`create_endpoint_pair`].
 pub fn take_pending_endpoint() -> Result<CapHandle, ErrorCode> {
     // SAFETY: service state is installed before user processes can run.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     let context = task::current_syscall_context();
     let Some(task) = kernel.task_at_slot_mut(context.task_slot) else {
         return Err(ErrorCode::BadHandle);
@@ -304,7 +304,7 @@ pub fn take_pending_endpoint() -> Result<CapHandle, ErrorCode> {
 /// Return the management endpoint this process received at spawn.
 pub fn management_endpoint() -> Result<CapHandle, ErrorCode> {
     // SAFETY: service state is installed before user processes can run.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     let context = task::current_syscall_context();
     let Some(task) = kernel.task_at_slot(context.task_slot) else {
         return Err(ErrorCode::BadHandle);

@@ -170,7 +170,7 @@ pub unsafe fn init_for_cpu(cpu: usize) {
 
 /// How many times the bootstrap processor's scheduler has switched threads.
 pub fn switch_count() -> u64 {
-    switch_count_for_cpu(0)
+    switch_count_for_cpu(crate::task::current_cpu())
 }
 
 /// How many times a specific CPU's scheduler has switched threads.
@@ -181,7 +181,7 @@ pub fn switch_count_for_cpu(cpu: usize) -> u64 {
 
 /// How many timer ticks the bootstrap processor has seen.
 pub fn tick_count() -> u64 {
-    tick_count_for_cpu(0)
+    tick_count_for_cpu(crate::task::current_cpu())
 }
 
 /// How many timer ticks a specific CPU has seen.
@@ -194,7 +194,7 @@ pub fn tick_count_for_cpu(cpu: usize) -> u64 {
 ///
 /// `None` when the boot thread is running — it is not in the pool.
 pub fn current_slot() -> Option<usize> {
-    current_slot_for_cpu(0)
+    current_slot_for_cpu(crate::task::current_cpu())
 }
 
 /// The pool slot of the running thread on a specific CPU.
@@ -205,7 +205,7 @@ pub fn current_slot_for_cpu(cpu: usize) -> Option<usize> {
 
 /// The identifier of the running thread on the bootstrap processor, if any.
 pub fn current_thread_id() -> Option<u32> {
-    current_thread_id_for_cpu(0)
+    current_thread_id_for_cpu(crate::task::current_cpu())
 }
 
 /// The identifier of the running thread on a specific CPU, if any.
@@ -220,7 +220,7 @@ pub fn current_thread_id_for_cpu(cpu: usize) -> Option<u32> {
 
 /// The state of the running thread on the bootstrap processor.
 pub fn current_state() -> Option<ThreadState> {
-    current_state_for_cpu(0)
+    current_state_for_cpu(crate::task::current_cpu())
 }
 
 /// The state of the running thread on a specific CPU.
@@ -235,7 +235,7 @@ pub fn current_state_for_cpu(cpu: usize) -> Option<ThreadState> {
 
 /// Whether the bootstrap processor's scheduler has a runnable thread.
 pub fn has_runnable_thread() -> bool {
-    has_runnable_thread_for_cpu(0)
+    has_runnable_thread_for_cpu(crate::task::current_cpu())
 }
 
 /// Whether a specific CPU's scheduler has a runnable thread.
@@ -246,7 +246,7 @@ pub fn has_runnable_thread_for_cpu(cpu: usize) -> bool {
 
 /// The number of threads the bootstrap processor's scheduler tracks.
 pub fn thread_count() -> usize {
-    thread_count_for_cpu(0)
+    thread_count_for_cpu(crate::task::current_cpu())
 }
 
 /// The number of threads a specific CPU's scheduler tracks.
@@ -257,7 +257,7 @@ pub fn thread_count_for_cpu(cpu: usize) -> usize {
 
 /// The bootstrap processor's runnable threads, in queue order.
 pub fn runnable_order() -> impl Iterator<Item = u32> + 'static {
-    runnable_order_for_cpu(0)
+    runnable_order_for_cpu(crate::task::current_cpu())
 }
 
 /// A specific CPU's runnable threads, in queue order.
@@ -270,7 +270,7 @@ pub fn runnable_order_for_cpu(cpu: usize) -> impl Iterator<Item = u32> + 'static
 
 /// The bootstrap processor's policy state machine, for the tests.
 pub fn scheduler() -> &'static mut nova_core::scheduler::Scheduler {
-    scheduler_for_cpu(0)
+    scheduler_for_cpu(crate::task::current_cpu())
 }
 
 /// A specific CPU's policy state machine.
@@ -285,7 +285,7 @@ pub fn scheduler_for_cpu(cpu: usize) -> &'static mut nova_core::scheduler::Sched
 ///
 /// Must be called with interrupts masked, from the scheduler's own context.
 pub unsafe fn exit_current_thread() {
-    unsafe { exit_current_thread_for_cpu(0) }
+    unsafe { exit_current_thread_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Mark the running thread on a specific CPU as exited.
@@ -361,7 +361,7 @@ pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u
 ///
 /// Must only be called from the scheduler path, with interrupts masked.
 pub unsafe fn reap_exited_threads() {
-    unsafe { reap_exited_threads_for_cpu(0) }
+    unsafe { reap_exited_threads_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Reap exited threads on a specific CPU.
@@ -404,7 +404,7 @@ pub unsafe fn reap_exited_threads_for_cpu(cpu: usize) {
 ///
 /// Must be called from the timer interrupt handler, with interrupts masked.
 pub unsafe fn tick() -> bool {
-    unsafe { tick_for_cpu(0) }
+    unsafe { tick_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Account one timer tick on a specific CPU and preempt if the timeslice
@@ -465,7 +465,8 @@ pub unsafe fn tick_for_cpu(cpu: usize) -> bool {
 /// The register pointer must address fifteen valid words and the frame pointer
 /// must address the CPU's five-word interrupt frame.
 pub unsafe fn save_running_context(registers: &UserRegisters, frame: &IretFrame) {
-    unsafe { save_running_context_for_cpu(0, registers, frame) }
+    // The interrupted thread belongs to the CPU that took the interrupt.
+    unsafe { save_running_context_for_cpu(crate::task::current_cpu(), registers, frame) }
 }
 
 /// Save a specific CPU's running thread.
@@ -519,9 +520,14 @@ pub unsafe fn save_running_context_for_cpu(
 /// and with `CURRENT_SLOT` naming the calling thread. The caller must still be
 /// on the kernel stack entered by the syscall stub.
 pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
-    // SAFETY: the syscall stub wrote this global before switching stacks, and
-    // the syscall path is serialised so no later entry can overwrite it yet.
-    let user_stack = unsafe { crate::syscall::NOVA_KERNEL_USER_STACK_POINTER };
+    // The syscall runs on whichever processor executed the `syscall`
+    // instruction; its own per-CPU scheduler owns the interrupted thread.
+    let cpu = crate::task::current_cpu();
+
+    // SAFETY: the syscall stub wrote this CPU's per-CPU cell before switching
+    // stacks, and the syscall path is serialised on this CPU so no later entry
+    // can overwrite it yet.
+    let user_stack = unsafe { crate::arch::x86_64::percpu::user_stack_pointer() };
 
     let context = Context {
         rax: registers.rax,
@@ -546,11 +552,11 @@ pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
         ss: crate::arch::x86_64::gdt::USER_DATA_SELECTOR as u64,
     };
 
-    if let Some(slot) = unsafe { state_for_cpu(0).current_slot }
-        && let Some(mut thread) = unsafe { task::thread_in_slot_for_cpu(0, slot) }
+    if let Some(slot) = unsafe { state_for_cpu(cpu).current_slot }
+        && let Some(mut thread) = unsafe { task::thread_in_slot_for_cpu(cpu, slot) }
     {
         thread.context = context;
-        unsafe { task::update_thread_for_cpu(0, slot, thread) };
+        unsafe { task::update_thread_for_cpu(cpu, slot, thread) };
     }
 }
 
@@ -561,7 +567,10 @@ pub unsafe fn save_current_syscall_context(registers: &UserRegisters) {
 /// Must be called with interrupts masked, after the outgoing thread's complete
 /// context has been saved.
 pub unsafe fn switch_to_next() -> ! {
-    unsafe { switch_to_next_for_cpu(0) }
+    // SAFETY: the caller runs on the CPU whose scheduler must pick; the
+    // hard-coded zero here used to route an AP's switch onto the bootstrap
+    // processor's state.
+    unsafe { switch_to_next_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Choose the next runnable thread on a specific CPU and resume it.
@@ -614,6 +623,10 @@ unsafe fn resume_thread_for_cpu(cpu: usize, next_id: u32) -> ! {
 
         address_space::activate(&next.space);
         crate::arch::x86_64::gdt::set_privilege_stack_for_cpu(cpu, task::kernel_stack_top(&next));
+        // The syscall stub switches stacks through this CPU's per-CPU cell,
+        // not through a global TSS: two processors must be able to enter
+        // ring 3→0 transitions at overlapping times without sharing a stack.
+        crate::arch::x86_64::percpu::set_kernel_stack(task::kernel_stack_top(&next));
         let block = task::build_resume_block(&next);
         task::resume_from_block(block)
     }
@@ -626,7 +639,7 @@ unsafe fn resume_thread_for_cpu(cpu: usize, next_id: u32) -> ! {
 /// Must be called with interrupts masked, after the current thread's complete
 /// context has been saved.
 pub unsafe fn resume_current() -> ! {
-    unsafe { resume_current_for_cpu(0) }
+    unsafe { resume_current_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Resume the already-selected current thread on a specific CPU.
@@ -657,6 +670,9 @@ pub unsafe fn resume_current_for_cpu(cpu: usize) -> ! {
             cpu,
             task::kernel_stack_top(&current),
         );
+        // As in `resume_thread_for_cpu`: the syscall stub reads this CPU's own
+        // cell.
+        crate::arch::x86_64::percpu::set_kernel_stack(task::kernel_stack_top(&current));
         let block = task::build_resume_block(&current);
         task::resume_from_block(block)
     }
@@ -669,7 +685,7 @@ pub unsafe fn resume_current_for_cpu(cpu: usize) -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn yield_current_and_switch() -> ! {
-    unsafe { yield_current_and_switch_for_cpu(0) }
+    unsafe { yield_current_and_switch_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Yield the current thread on a specific CPU and immediately schedule another.
@@ -709,7 +725,7 @@ pub unsafe fn yield_current_and_switch_for_cpu(cpu: usize) -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn block_current_and_switch() -> ! {
-    unsafe { block_current_and_switch_for_cpu(0) }
+    unsafe { block_current_and_switch_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Block the current thread on a specific CPU and immediately schedule another.
@@ -741,7 +757,7 @@ pub unsafe fn block_current_and_switch_for_cpu(cpu: usize) -> ! {
 /// Must be called with interrupts masked, from the current thread's syscall or
 /// interrupt path after its context has been saved.
 pub unsafe fn exit_current_and_switch() -> ! {
-    unsafe { exit_current_and_switch_for_cpu(0) }
+    unsafe { exit_current_and_switch_for_cpu(crate::task::current_cpu()) }
 }
 
 /// Exit the current thread on a specific CPU and immediately schedule another.

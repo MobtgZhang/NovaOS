@@ -26,6 +26,7 @@ pub mod idt;
 pub mod intr;
 pub mod msr;
 pub mod paging;
+pub mod percpu;
 pub mod pit;
 pub mod port_io;
 pub mod smp;
@@ -117,6 +118,10 @@ impl InterruptControl for Interrupts {
 pub unsafe fn arch_init() {
     // SAFETY: delegated to this function's contract.
     unsafe {
+        // The per-CPU base must exist before the first `syscall` can run; the
+        // BSP is slot 0. APs point their own base in `init_cpu`.
+        percpu::init_for_cpu(0);
+
         // The GDT goes up *first*, before the IDT.
         //
         // Every IDT gate names the kernel code selector (`0x08`). A gate is only
@@ -170,6 +175,9 @@ pub unsafe fn arch_init() {
 pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
     // SAFETY: delegated to this function's contract.
     unsafe {
+        // The per-CPU base is this AP's own identity; it must exist before
+        // anything on this processor can execute a `syscall`.
+        percpu::init_for_cpu(cpu);
         gdt::init_cpu(cpu);
         idt::load();
         apic::init_for_cpu(cpu, direct_map_offset);

@@ -188,13 +188,12 @@ pub static M6_SUITES: &[TestSuite] = &[
 // ---------------------------------------------------------------------------
 
 /// A fresh test state.
-fn fresh_state() -> &'static mut KernelState {
+fn fresh_state() -> crate::sync::SpinLockGuard<'static, crate::services::KernelState> {
     // SAFETY: the suites run one at a time in ring 0 with interrupts masked.
-    unsafe {
-        let state = crate::services::test_state();
-        state.reset();
-        state
-    }
+    let state = crate::services::test_state();
+    let mut state = state;
+    state.reset();
+    state
 }
 
 /// Create a task and return its slot.
@@ -406,23 +405,24 @@ fn key_message(surface: u32, scancode: u16, state: KeyState) -> Result<Message, 
 // ---------------------------------------------------------------------------
 
 fn two_surfaces_present_distinct_pixels() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
 
-    let first = create_surface(state, first_slot, 80, 60)?;
-    let second = create_surface(state, second_slot, 80, 60)?;
+    let first = create_surface(&mut state, first_slot, 80, 60)?;
+    let second = create_surface(&mut state, second_slot, 80, 60)?;
 
     let first_bytes = 80 * 60 * 4;
     let second_bytes = 80 * 60 * 4;
     let (first_buffer, first_base, first_size) = create_memory_object(
-        state,
+        &mut state,
         first_slot,
         first_bytes as u64,
         Rights::MAP | Rights::CONTROL,
     )?;
     let (second_buffer, second_base, second_size) = create_memory_object(
-        state,
+        &mut state,
         second_slot,
         second_bytes as u64,
         Rights::MAP | Rights::CONTROL,
@@ -431,8 +431,8 @@ fn two_surfaces_present_distinct_pixels() -> Result<(), &'static str> {
     paint(first_base, first_size, 80, 60, 0xFF, 0x00, 0x00)?;
     paint(second_base, second_size, 80, 60, 0x00, 0xFF, 0x00)?;
 
-    attach_surface(state, first_slot, first, first_buffer, 80 * 4)?;
-    attach_surface(state, second_slot, second, second_buffer, 80 * 4)?;
+    attach_surface(&mut state, first_slot, first, first_buffer, 80 * 4)?;
+    attach_surface(&mut state, second_slot, second, second_buffer, 80 * 4)?;
 
     state
         .compositor
@@ -460,20 +460,21 @@ fn two_surfaces_present_distinct_pixels() -> Result<(), &'static str> {
 }
 
 fn present_counts_one_frame_for_two_windows() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
 
-    let first = create_surface(state, first_slot, 40, 40)?;
-    let second = create_surface(state, second_slot, 40, 40)?;
+    let first = create_surface(&mut state, first_slot, 40, 40)?;
+    let second = create_surface(&mut state, second_slot, 40, 40)?;
     let (first_buffer, first_base, first_size) = create_memory_object(
-        state,
+        &mut state,
         first_slot,
         40 * 40 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
     let (second_buffer, second_base, second_size) = create_memory_object(
-        state,
+        &mut state,
         second_slot,
         40 * 40 * 4,
         Rights::MAP | Rights::CONTROL,
@@ -481,8 +482,8 @@ fn present_counts_one_frame_for_two_windows() -> Result<(), &'static str> {
     paint(first_base, first_size, 40, 40, 0x10, 0x20, 0x30)?;
     paint(second_base, second_size, 40, 40, 0x30, 0x20, 0x10)?;
 
-    attach_surface(state, first_slot, first, first_buffer, 40 * 4)?;
-    attach_surface(state, second_slot, second, second_buffer, 40 * 4)?;
+    attach_surface(&mut state, first_slot, first, first_buffer, 40 * 4)?;
+    attach_surface(&mut state, second_slot, second, second_buffer, 40 * 4)?;
     state
         .compositor
         .commit(first, first_slot, 1)
@@ -513,13 +514,14 @@ fn present_counts_one_frame_for_two_windows() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_moved_surface_draws_at_the_new_position() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 60, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 60, 40)?;
     let (buffer, base, size) =
-        create_memory_object(state, slot, 60 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+        create_memory_object(&mut state, slot, 60 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
     paint(base, size, 60, 40, 0xFF, 0x80, 0x00)?;
-    attach_surface(state, slot, id, buffer, 60 * 4)?;
+    attach_surface(&mut state, slot, id, buffer, 60 * 4)?;
     state
         .compositor
         .commit(id, slot, 1)
@@ -555,10 +557,11 @@ fn a_moved_surface_draws_at_the_new_position() -> Result<(), &'static str> {
 }
 
 fn an_owner_cannot_move_another_task_surface() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let id = create_surface(state, first_slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, first_slot, 40, 40)?;
 
     match state.compositor.move_surface(id, second_slot, 10, 10) {
         Err(ErrorCode::Denied) => {}
@@ -573,26 +576,27 @@ fn an_owner_cannot_move_another_task_surface() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_primary_click_focuses_the_topmost_surface() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let first = create_surface(state, first_slot, 70, 50)?;
-    let second = create_surface(state, second_slot, 70, 50)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
+    let first = create_surface(&mut state, first_slot, 70, 50)?;
+    let second = create_surface(&mut state, second_slot, 70, 50)?;
 
     let (first_buffer, _, _) = create_memory_object(
-        state,
+        &mut state,
         first_slot,
         70 * 50 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
     let (second_buffer, _, _) = create_memory_object(
-        state,
+        &mut state,
         second_slot,
         70 * 50 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
-    attach_surface(state, first_slot, first, first_buffer, 70 * 4)?;
-    attach_surface(state, second_slot, second, second_buffer, 70 * 4)?;
+    attach_surface(&mut state, first_slot, first, first_buffer, 70 * 4)?;
+    attach_surface(&mut state, second_slot, second, second_buffer, 70 * 4)?;
 
     // The second surface is created later, so it starts on top, but focus is
     // still the first surface until a click decides otherwise.
@@ -612,12 +616,13 @@ fn a_primary_click_focuses_the_topmost_surface() -> Result<(), &'static str> {
 }
 
 fn a_click_outside_every_window_clears_focus() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 40, 40)?;
     let (buffer, _, _) =
-        create_memory_object(state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
-    attach_surface(state, slot, id, buffer, 40 * 4)?;
+        create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+    attach_surface(&mut state, slot, id, buffer, 40 * 4)?;
 
     if state.compositor.focused() != Some(id) {
         return Err("the first surface was not focused");
@@ -636,26 +641,27 @@ fn a_click_outside_every_window_clears_focus() -> Result<(), &'static str> {
 }
 
 fn a_named_surface_does_not_claim_focus() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let first = create_surface(state, first_slot, 70, 50)?;
-    let second = create_surface(state, second_slot, 70, 50)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
+    let first = create_surface(&mut state, first_slot, 70, 50)?;
+    let second = create_surface(&mut state, second_slot, 70, 50)?;
 
     let (first_buffer, _, _) = create_memory_object(
-        state,
+        &mut state,
         first_slot,
         70 * 50 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
     let (second_buffer, _, _) = create_memory_object(
-        state,
+        &mut state,
         second_slot,
         70 * 50 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
-    attach_surface(state, first_slot, first, first_buffer, 70 * 4)?;
-    attach_surface(state, second_slot, second, second_buffer, 70 * 4)?;
+    attach_surface(&mut state, first_slot, first, first_buffer, 70 * 4)?;
+    attach_surface(&mut state, second_slot, second, second_buffer, 70 * 4)?;
 
     // The client names `first`, but the click lands on `second`. The request's
     // surface field is not trusted for focus.
@@ -676,12 +682,13 @@ fn a_named_surface_does_not_claim_focus() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn a_key_to_the_focused_surface_is_accepted() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 40, 40)?;
     let (buffer, _, _) =
-        create_memory_object(state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
-    attach_surface(state, slot, id, buffer, 40 * 4)?;
+        create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+    attach_surface(&mut state, slot, id, buffer, 40 * 4)?;
 
     let message = key_message(id, 0x1E, KeyState::Pressed)?;
     let reply = state.input.handle_message(&message, &mut state.compositor);
@@ -699,11 +706,12 @@ fn a_key_to_the_focused_surface_is_accepted() -> Result<(), &'static str> {
 }
 
 fn a_key_to_an_unfocused_surface_is_denied() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let first = create_surface(state, first_slot, 40, 40)?;
-    let second = create_surface(state, second_slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
+    let first = create_surface(&mut state, first_slot, 40, 40)?;
+    let second = create_surface(&mut state, second_slot, 40, 40)?;
 
     // The first surface is focused by creation. A key naming the second surface
     // is a refusal, not a focus change.
@@ -722,11 +730,12 @@ fn a_key_to_an_unfocused_surface_is_denied() -> Result<(), &'static str> {
 }
 
 fn a_denied_key_does_not_increment_the_delivered_count() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let first = create_surface(state, first_slot, 40, 40)?;
-    let second = create_surface(state, second_slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first_slot = new_task(&mut state)?;
+    let second_slot = new_task(&mut state)?;
+    let first = create_surface(&mut state, first_slot, 40, 40)?;
+    let second = create_surface(&mut state, second_slot, 40, 40)?;
 
     let focused = key_message(first, 0x1E, KeyState::Pressed)?;
     let reply = state.input.handle_message(&focused, &mut state.compositor);
@@ -751,12 +760,13 @@ fn a_denied_key_does_not_increment_the_delivered_count() -> Result<(), &'static 
 // ---------------------------------------------------------------------------
 
 fn a_handle_without_map_is_denied() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 40, 40)?;
-    let (buffer, _, _) = create_memory_object(state, slot, 40 * 40 * 4, Rights::CONTROL)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 40, 40)?;
+    let (buffer, _, _) = create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::CONTROL)?;
 
-    match attach_surface(state, slot, id, buffer, 40 * 4) {
+    match attach_surface(&mut state, slot, id, buffer, 40 * 4) {
         Err("the buffer attachment was denied") => {}
         Err(_) => return Err("the attach failed, but not as a rights denial"),
         Ok(_) => return Err("a buffer without MAP was attached"),
@@ -765,12 +775,14 @@ fn a_handle_without_map_is_denied() -> Result<(), &'static str> {
 }
 
 fn a_buffer_too_small_for_the_surface_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 80, 60)?;
-    let (buffer, _, _) = create_memory_object(state, slot, 128, Rights::MAP | Rights::CONTROL)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 80, 60)?;
+    let (buffer, _, _) =
+        create_memory_object(&mut state, slot, 128, Rights::MAP | Rights::CONTROL)?;
 
-    match attach_surface(state, slot, id, buffer, 80 * 4) {
+    match attach_surface(&mut state, slot, id, buffer, 80 * 4) {
         Err("the buffer attachment was invalid") => {}
         Err(_) => return Err("the attach failed, but not as an invalid buffer"),
         Ok(_) => return Err("a short buffer was attached"),
@@ -779,13 +791,14 @@ fn a_buffer_too_small_for_the_surface_is_refused() -> Result<(), &'static str> {
 }
 
 fn a_stride_not_a_multiple_of_four_is_refused() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 40, 40)?;
     let (buffer, _, _) =
-        create_memory_object(state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+        create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
 
-    match attach_surface(state, slot, id, buffer, 40 * 4 + 1) {
+    match attach_surface(&mut state, slot, id, buffer, 40 * 4 + 1) {
         Err("the buffer attachment was invalid") => {}
         Err(_) => return Err("the attach failed, but not as an invalid stride"),
         Ok(_) => return Err("a stride that does not end on a pixel was attached"),
@@ -794,15 +807,16 @@ fn a_stride_not_a_multiple_of_four_is_refused() -> Result<(), &'static str> {
 }
 
 fn two_surfaces_cannot_share_one_buffer() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let first = create_surface(state, slot, 40, 40)?;
-    let second = create_surface(state, slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let first = create_surface(&mut state, slot, 40, 40)?;
+    let second = create_surface(&mut state, slot, 40, 40)?;
     let (buffer, _, _) =
-        create_memory_object(state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+        create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
 
-    attach_surface(state, slot, first, buffer, 40 * 4)?;
-    match attach_surface(state, slot, second, buffer, 40 * 4) {
+    attach_surface(&mut state, slot, first, buffer, 40 * 4)?;
+    match attach_surface(&mut state, slot, second, buffer, 40 * 4) {
         Err("the buffer attachment was denied") => {}
         Err(_) => return Err("the second attach failed, but not as a denial"),
         Ok(_) => return Err("two surfaces shared one buffer"),
@@ -815,19 +829,19 @@ fn two_surfaces_cannot_share_one_buffer() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn build_two_windows(state: &mut KernelState) -> Result<(usize, u32, usize, u32), &'static str> {
-    let first_slot = new_task(state)?;
-    let second_slot = new_task(state)?;
-    let first = create_surface(state, first_slot, 60, 40)?;
-    let second = create_surface(state, second_slot, 60, 40)?;
+    let first_slot = new_task(&mut *state)?;
+    let second_slot = new_task(&mut *state)?;
+    let first = create_surface(&mut *state, first_slot, 60, 40)?;
+    let second = create_surface(&mut *state, second_slot, 60, 40)?;
 
     let (first_buffer, first_base, first_size) = create_memory_object(
-        state,
+        &mut *state,
         first_slot,
         60 * 40 * 4,
         Rights::MAP | Rights::CONTROL,
     )?;
     let (second_buffer, second_base, second_size) = create_memory_object(
-        state,
+        &mut *state,
         second_slot,
         60 * 40 * 4,
         Rights::MAP | Rights::CONTROL,
@@ -835,8 +849,8 @@ fn build_two_windows(state: &mut KernelState) -> Result<(usize, u32, usize, u32)
     paint(first_base, first_size, 60, 40, 0x20, 0x60, 0xC0)?;
     paint(second_base, second_size, 60, 40, 0xC0, 0x60, 0x20)?;
 
-    attach_surface(state, first_slot, first, first_buffer, 60 * 4)?;
-    attach_surface(state, second_slot, second, second_buffer, 60 * 4)?;
+    attach_surface(&mut *state, first_slot, first, first_buffer, 60 * 4)?;
+    attach_surface(&mut *state, second_slot, second, second_buffer, 60 * 4)?;
     state
         .compositor
         .commit(first, first_slot, 1)
@@ -865,8 +879,9 @@ fn build_two_windows(state: &mut KernelState) -> Result<(usize, u32, usize, u32)
 }
 
 fn a_crashed_window_owner_leaves_the_other_window() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let (first_slot, first, second_slot, second) = build_two_windows(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let (first_slot, first, second_slot, second) = build_two_windows(&mut state)?;
 
     if state.compositor.surface_count() != 2 {
         return Err("the two windows were not both present");
@@ -900,8 +915,9 @@ fn a_crashed_window_owner_leaves_the_other_window() -> Result<(), &'static str> 
 }
 
 fn focus_moves_to_the_surviving_window() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let (first_slot, first, _second_slot, second) = build_two_windows(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let (first_slot, first, _second_slot, second) = build_two_windows(&mut state)?;
 
     // Make the first window the focused one, then crash its owner.
     state
@@ -927,23 +943,24 @@ fn focus_moves_to_the_surviving_window() -> Result<(), &'static str> {
 // ---------------------------------------------------------------------------
 
 fn one_hundred_cycles_release_every_frame() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
 
     let allocator = unsafe { crate::mm::frame_allocator() };
     let free_before = allocator.free_count();
 
     for serial in 0..100u64 {
-        let id = create_surface(state, slot, 32, 32)?;
+        let id = create_surface(&mut state, slot, 32, 32)?;
         let (buffer, base, size) =
-            create_memory_object(state, slot, 32 * 32 * 4, Rights::MAP | Rights::CONTROL)?;
+            create_memory_object(&mut state, slot, 32 * 32 * 4, Rights::MAP | Rights::CONTROL)?;
         paint(base, size, 32, 32, (serial % 255) as u8, 0x20, 0x40)?;
-        attach_surface(state, slot, id, buffer, 32 * 4)?;
+        attach_surface(&mut state, slot, id, buffer, 32 * 4)?;
         state
             .compositor
             .commit(id, slot, serial)
             .map_err(|_| "commit refused")?;
-        destroy_surface(state, slot, id)?;
+        destroy_surface(&mut state, slot, id)?;
     }
 
     let free_after = allocator.free_count();
@@ -954,19 +971,20 @@ fn one_hundred_cycles_release_every_frame() -> Result<(), &'static str> {
 }
 
 fn the_surface_and_object_pools_return_to_empty() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
 
     for serial in 0..100u64 {
-        let id = create_surface(state, slot, 24, 24)?;
+        let id = create_surface(&mut state, slot, 24, 24)?;
         let (buffer, _, _) =
-            create_memory_object(state, slot, 24 * 24 * 4, Rights::MAP | Rights::CONTROL)?;
-        attach_surface(state, slot, id, buffer, 24 * 4)?;
+            create_memory_object(&mut state, slot, 24 * 24 * 4, Rights::MAP | Rights::CONTROL)?;
+        attach_surface(&mut state, slot, id, buffer, 24 * 4)?;
         state
             .compositor
             .commit(id, slot, serial)
             .map_err(|_| "commit refused")?;
-        destroy_surface(state, slot, id)?;
+        destroy_surface(&mut state, slot, id)?;
     }
 
     if state.compositor.surface_count() != 0 {
@@ -1001,13 +1019,14 @@ fn an_idle_compositor_presents_nothing() -> Result<(), &'static str> {
 }
 
 fn no_damage_does_not_increment_the_frame_count() -> Result<(), &'static str> {
-    let state = fresh_state();
-    let slot = new_task(state)?;
-    let id = create_surface(state, slot, 40, 40)?;
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = new_task(&mut state)?;
+    let id = create_surface(&mut state, slot, 40, 40)?;
     let (buffer, base, size) =
-        create_memory_object(state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
+        create_memory_object(&mut state, slot, 40 * 40 * 4, Rights::MAP | Rights::CONTROL)?;
     paint(base, size, 40, 40, 0x50, 0x80, 0xA0)?;
-    attach_surface(state, slot, id, buffer, 40 * 4)?;
+    attach_surface(&mut state, slot, id, buffer, 40 * 4)?;
     state
         .compositor
         .commit(id, slot, 1)

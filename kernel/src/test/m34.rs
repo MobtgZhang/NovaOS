@@ -390,7 +390,7 @@ fn the_boot_archive_is_valid_and_contains_init() -> Result<(), &'static str> {
 fn init_was_started() -> Result<(), &'static str> {
     // SAFETY: service state was installed during boot and the test harness
     // runs serialised on the kernel's own stack.
-    let kernel = unsafe { crate::services::state() };
+    let mut kernel = crate::services::state();
     if kernel
         .tasks
         .iter()
@@ -405,9 +405,10 @@ fn init_was_started() -> Result<(), &'static str> {
 }
 
 fn live_task_reported_by_service_name() -> Result<(), &'static str> {
-    let state = fresh_state();
+    let mut state = fresh_state();
+    let mut state = &mut *state;
     let id = state.create_task().ok_or("the task pool was empty")?;
-    let slot = slot_of(state, id).ok_or("the task had no slot")?;
+    let slot = slot_of(&state, id).ok_or("the task had no slot")?;
     state
         .task_at_slot_mut(slot)
         .ok_or("the task disappeared")?
@@ -428,9 +429,10 @@ fn live_task_reported_by_service_name() -> Result<(), &'static str> {
 }
 
 fn retired_service_releases_slot() -> Result<(), &'static str> {
-    let state = fresh_state();
+    let mut state = fresh_state();
+    let mut state = &mut *state;
     let id = state.create_task().ok_or("the task pool was empty")?;
-    let slot = slot_of(state, id).ok_or("the task had no slot")?;
+    let slot = slot_of(&state, id).ok_or("the task had no slot")?;
     state
         .task_at_slot_mut(slot)
         .ok_or("the task disappeared")?
@@ -453,7 +455,7 @@ fn retired_service_releases_slot() -> Result<(), &'static str> {
     let next = state
         .create_task()
         .ok_or("retirement did not free a slot")?;
-    if slot_of(state, next) != Some(slot) {
+    if slot_of(&state, next) != Some(slot) {
         return Err("retirement did not recycle the expected slot");
     }
     Ok(())
@@ -938,7 +940,7 @@ fn ten_thousand_create_destroy_cycles_do_not_leak() -> Result<(), &'static str> 
 /// Every case starts from a clean state, because the suites share one kernel
 /// instance and a suite that left state behind would make the next suite's
 /// counts meaningless.
-fn fresh_state() -> &'static mut KernelState {
+fn fresh_state() -> crate::sync::SpinLockGuard<'static, crate::services::KernelState> {
     // The kernel's own service state, not a second copy.
     //
     // Two things matter here. The state is large -- the file server alone
@@ -956,11 +958,10 @@ fn fresh_state() -> &'static mut KernelState {
     // SAFETY: the tests run one at a time, in ring 0, with interrupts masked.
     // The same single-CPU assumption that makes the kernel's own service
     // state sound applies here.
-    unsafe {
-        let state = crate::services::test_state();
-        state.reset();
-        state
-    }
+    let state = crate::services::test_state();
+    let mut state = state;
+    state.reset();
+    state
 }
 
 /// The slot of a task, given its identifier.
@@ -1284,8 +1285,9 @@ fn send_on_receive_only_is_denied() -> Result<(), &'static str> {
 /// than a move, the receiver would hold a handle that names the sender's
 /// slot, and the two tables would be aliasing one entry.
 fn transfer_lands_in_receiver() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, server_slot, handle, original, received) =
+    let (mut state, _client, _server, client_slot, server_slot, handle, original, received) =
         transfer_setup()?;
+    let mut state = &mut *state;
     let _ = &state;
 
     // The message the receiver collected must carry a capability.
@@ -1330,8 +1332,9 @@ fn transfer_lands_in_receiver() -> Result<(), &'static str> {
 /// authority could be handed to a second recipient, and both would believe
 /// they held the only copy of it.
 fn sender_loses_the_capability() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, _server_slot, handle, _original, _received) =
+    let (mut state, _client, _server, client_slot, _server_slot, handle, _original, _received) =
         transfer_setup()?;
+    let mut state = &mut *state;
     let client_table = state
         .caps_at(client_slot)
         .ok_or("the client has no table")?;
@@ -1347,8 +1350,9 @@ fn sender_loses_the_capability() -> Result<(), &'static str> {
 /// the object would leave the receiver holding authority over nothing, which
 /// looks like success and is not.
 fn transfer_names_same_object() -> Result<(), &'static str> {
-    let (state, _client, _server, client_slot, server_slot, handle, original, received) =
+    let (mut state, _client, _server, client_slot, server_slot, handle, original, received) =
         transfer_setup()?;
+    let mut state = &mut *state;
     let caps = received.caps();
     if caps.is_empty() {
         return Err("the received message carries no capability");
@@ -1373,7 +1377,7 @@ fn transfer_names_same_object() -> Result<(), &'static str> {
 /// it landed, the source is gone, and it names the same object.
 fn transfer_setup() -> Result<
     (
-        &'static mut KernelState,
+        crate::sync::SpinLockGuard<'static, KernelState>,
         u32,
         u32,
         usize,
