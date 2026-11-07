@@ -561,8 +561,10 @@ fn read_capacity(transport: &transport::Transport) -> Result<u64, BlockError> {
 
 /// Allocate the frame a request's stages live in.
 fn alloc_transfer_frame() -> Result<usize, BlockError> {
-    // SAFETY: `mm::init` published the allocator during boot.
-    let frame = unsafe { frame_allocator().alloc() }
+    // SAFETY: `mm::init` published the allocator during boot. The device
+    // describes this frame's address with a 32-bit DMA word, so the frame must
+    // come from the DMA-capable pool below the 4 GiB boundary.
+    let frame = unsafe { frame_allocator().alloc_dma() }
         .map_err(|_| BlockError::Queue(queue::QueueError::OutOfMemory))?;
 
     // SAFETY: the frame was just allocated, so it is this caller's; the direct

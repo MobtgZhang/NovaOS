@@ -18,13 +18,16 @@
 
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_start)
+ENTRY(nova_boot_entry)
 
 /* Higher-half virtual base for the kernel image. */
 KERNEL_VMA_BASE = 0xFFFFFFFF80100000;
 
 /* Physical load address. Low memory, above the legacy BIOS/BDA region and
- * below 1 MiB so that no conventional BIOS area is clobbered. */
+ * below 1 MiB so that no conventional BIOS area is clobbered. The boot
+ * manager loads the image at exactly this address: the frame allocator's
+ * floor and the early page tables are both derived from the linked bases,
+ * so the loader has no freedom here. */
 KERNEL_LMA_BASE = 0x00100000;
 
 /* The constant offset between VMA and LMA. Every `AT(...)` below is written as
@@ -41,33 +44,6 @@ SECTIONS
     /* ...but all symbols below refer to the virtual address. */
     . = KERNEL_VMA_BASE;
     __kernel_vma_base = KERNEL_VMA_BASE;
-
-    /* The Limine protocol requests, kept contiguous and page-aligned.
-     *
-     * NOTE: this section is a *convenience*, not the discovery mechanism.
-     * Limine 12 finds the requests by their exported `LIMINE_*` symbol names,
-     * not by section; an earlier revision of this script relied on the
-     * `.boot.rodata` placement that Limine 11 used, and the kernel then booted
-     * and reported "bootloader too old" — a misleading error caused entirely
-     * by the section being the wrong mechanism. See `kernel/src/boot/limine.rs`.
-     *
-     * The section is still worth having: it groups the requests and their
-     * alignment in one place, so the linker cannot interleave unrelated data
-     * between a marker and the requests it delimits.
-     */
-    .boot ALIGN(4K) : AT(ADDR(.boot) - KERNEL_VMA_BASE + KERNEL_LMA_BASE)
-    {
-        __boot_start = .;
-        KEEP(*(.boot.text))
-        KEEP(*(.boot.rodata))
-        __boot_end = .;
-    }
-
-    /* The requests themselves. They must live in a writable section, because
-     * the bootloader overwrites them in place with its responses; `.data.rel.ro`
-     * is writable at load time and read-only afterwards, which is exactly the
-     * contract, so `READONLY` on the containing segment is fine but `WA` on the
-     * section is required. */
 
     .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VMA_BASE + KERNEL_LMA_BASE)
     {

@@ -26,7 +26,14 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// The menu-config parser needs `alloc`; see the feature declaration in
+// `Cargo.toml`. The kernel links this crate without default features and so
+// never sees the module.
+#[cfg(feature = "menu-config")]
 pub mod menu_config;
+
+/// Page-layout math shared by the boot manager and the kernel.
+pub mod layout;
 
 /// The protocol's four-byte magic.
 pub const MAGIC: [u8; 4] = *b"NVBP";
@@ -102,7 +109,26 @@ impl BootArch {
     }
 }
 
-/// A memory-map row. `kind` is the firmware's region classification and is
+/// Memory-map row kinds the protocol defines.
+///
+/// The values are the protocol's own, not the firmware's raw classification: a
+/// UEFI memory descriptor and a devicetree "reserved" node both reduce to the
+/// same row kind, so the kernel never has to know which firmware produced the
+/// map. Every kind other than [`REGION_USABLE`] is one the kernel must not
+/// hand to its frame allocator.
+pub mod region {
+    /// Ordinary allocatable RAM.
+    pub const USABLE: u16 = 0;
+    /// Reserved by the firmware; must not be allocated or repurposed.
+    pub const RESERVED: u16 = 1;
+    /// Firmware-owned memory a re-enumerating OS may reclaim (ACPI tables,
+    /// UEFI runtime code) once it has copied what it needs.
+    pub const FIRMWARE_RECLAIMABLE: u16 = 2;
+    /// Memory-mapped device space (MMIO), never RAM.
+    pub const MMIO: u16 = 3;
+}
+
+/// A memory-map row. `kind` is one of the [`region`] constants and is
 /// carried through unchanged so the kernel can decide which rows are usable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BootMemoryRegion {
@@ -142,6 +168,59 @@ impl BootFramebuffer {
     }
 }
 
+/// Framebuffer pixel-format codes the protocol defines.
+///
+/// The firmware's own format description (masks, bitfield layout, or
+/// "blit only") is reduced by the boot manager to one of these codes, so the
+/// kernel never interprets a firmware structure. `0` is reserved so an
+/// all-zero, absent framebuffer never accidentally names a real format.
+pub mod fb_format {
+    /// 32 bits per pixel, byte order `X R G B` — red in the high bits of each
+    /// little-endian word. What QEMU's stdvga reports for a 32-bit mode.
+    pub const XRGB8888: u32 = 1;
+    /// 32 bits per pixel, byte order `R G B X` — red in the low bits.
+    pub const RGB888X: u32 = 2;
+}
+
+/// The boot mode the menu selected.
+///
+/// The menu names an intent ("Desktop" or "Safe Terminal"), the snapshot
+/// carries it as a code, and the kernel hands it to `init` through the
+/// `GET_BOOT_MODE` syscall. The codes are the contract: `0` means "no choice
+/// was made", which a real boot never reports but keeps an all-zero snapshot
+/// from naming a mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BootMode {
+    /// Boot into the full desktop: every boot service starts.
+    Desktop = 1,
+    /// Boot straight to a terminal: only the essential services start.
+    SafeTerminal = 2,
+}
+
+impl BootMode {
+    /// Turn a wire code into a mode, or `None` for an unknown code.
+    pub const fn from_code(code: u16) -> Option<Self> {
+        match code {
+            1 => Some(Self::Desktop),
+            2 => Some(Self::SafeTerminal),
+            _ => None,
+        }
+    }
+
+    /// Stable wire code.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// Human-readable name, for boot logs.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Desktop => "desktop",
+            Self::SafeTerminal => "safe-terminal",
+        }
+    }
+}
+
 /// The snapshot a bootloader publishes to the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct BootProtocol {
@@ -161,6 +240,7 @@ pub struct BootProtocol {
     pub memory: [BootMemoryRegion; MAX_MEMORY_REGIONS],
     pub framebuffer: BootFramebuffer,
     pub selected_entry: u16,
+    pub boot_mode: u16,
     pub reserved: u16,
 }
 
@@ -190,6 +270,7 @@ impl BootProtocol {
             }; MAX_MEMORY_REGIONS],
             framebuffer: BootFramebuffer::absent(),
             selected_entry: 0,
+            boot_mode: 0,
             reserved: 0,
         }
     }
@@ -207,6 +288,9 @@ impl BootProtocol {
         }
         if self.reserved != 0 {
             return Err(BootProtocolError::ReservedField);
+        }
+        if self.boot_mode != 0 && BootMode::from_code(self.boot_mode).is_none() {
+            return Err(BootProtocolError::BadBootMode);
         }
         if self.kernel_entry == 0 || self.kernel_load_address == 0 {
             return Err(BootProtocolError::MissingKernel);
@@ -296,6 +380,7 @@ pub enum BootProtocolError {
     InitramfsOverflow,
     InitramfsOutsideMemory,
     BadFramebuffer,
+    BadBootMode,
 }
 
 impl BootProtocolError {
@@ -315,6 +400,7 @@ impl BootProtocolError {
             Self::InitramfsOverflow => "initramfs-overflow",
             Self::InitramfsOutsideMemory => "initramfs-outside-memory",
             Self::BadFramebuffer => "bad-framebuffer",
+            Self::BadBootMode => "bad-boot-mode",
         }
     }
 }
@@ -439,6 +525,7 @@ mod tests {
         protocol.initramfs_start = 0x0020_0000;
         protocol.initramfs_length = 0x0001_0000;
         protocol.selected_entry = 1;
+        protocol.boot_mode = BootMode::Desktop.code();
         protocol
     }
 
@@ -528,6 +615,29 @@ mod tests {
         protocol.framebuffer.height = 10;
         protocol.framebuffer.stride = 9;
         assert_eq!(protocol.validate(), Err(BootProtocolError::BadFramebuffer));
+    }
+
+    #[test]
+    fn boot_mode_codes_round_trip() {
+        assert_eq!(
+            BootMode::from_code(BootMode::Desktop.code()),
+            Some(BootMode::Desktop)
+        );
+        assert_eq!(
+            BootMode::from_code(BootMode::SafeTerminal.code()),
+            Some(BootMode::SafeTerminal)
+        );
+        assert_eq!(BootMode::from_code(0), None);
+        assert_eq!(BootMode::from_code(3), None);
+    }
+
+    #[test]
+    fn an_unknown_boot_mode_is_refused_but_absent_is_accepted() {
+        let mut protocol = valid_protocol();
+        protocol.boot_mode = 3;
+        assert_eq!(protocol.validate(), Err(BootProtocolError::BadBootMode));
+        protocol.boot_mode = 0;
+        assert_eq!(protocol.validate(), Ok(()));
     }
 
     #[test]

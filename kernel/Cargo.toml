@@ -16,7 +16,15 @@ test = false
 bench = false
 
 [dependencies]
-limine = { workspace = true }
+# The NovaBoot protocol crate is the boot boundary: the UEFI boot manager
+# publishes a `BootProtocol` snapshot, and the kernel validates that snapshot
+# against the exact same code the publisher used. The dependency is a
+# declaration, not a convenience — the struct layout crossing the firmware
+# boundary cannot drift between the two sides without a build error.
+#
+# `default-features = false` drops the crate's `menu-config` parser, which
+# needs `alloc`; the kernel is deliberately allocation-free.
+nova-boot = { workspace = true, default-features = false }
 
 # The ABI crate is a real dependency of the kernel, not a declaration of intent.
 # It is `no_std` and architecture-neutral, so it links into the bare-metal

@@ -5,7 +5,7 @@
 //! This file has no architecture-specific code at all, and that is deliberate.
 //! It is the *only* representation of firmware facts the rest of the kernel
 //! sees: no bootloader pointers survive past [`crate::boot::capture`], and no
-//! caller ever interprets a Limine type constant directly. A field added for
+//! caller ever interprets a firmware type constant directly. A field added for
 //! AArch64 (say, the device tree pointer) lives here next to the x86-64 HHDM
 //! offset rather than in a per-architecture struct, because the frame allocator
 //! and the address-space code should not have to know which target they run on.
@@ -46,7 +46,7 @@ pub struct MemoryRegion {
     /// Length in bytes. Always non-zero for entries the kernel keeps.
     pub length: u64,
     /// Bootloader memory type (`MEMMAP_*`). Compared against
-    /// [`MEMMAP_USABLE`] rather than a Limine constant so that callers outside
+    /// [`MEMMAP_USABLE`] rather than a firmware constant so that callers outside
     /// the adapter need not depend on the crate.
     pub type_: u64,
 }
@@ -149,11 +149,11 @@ impl BootValidation {
 
 /// The firmware's linear framebuffer, normalised.
 ///
-/// Limine hands over a *virtual* address that it mapped itself; the physical
-/// address is recovered by removing the direct-map offset, because that is
-/// where the bootloader puts every physical page it exposes (the framebuffer
-/// included). Recording both keeps later code from having to redo the
-/// subtraction, and keeps the derivation in one auditable place.
+/// The boot manager hands over a *virtual* address that it mapped itself; the
+/// physical address is recovered by removing the direct-map offset, because that
+/// is where the boot manager puts every physical page it exposes (the
+/// framebuffer included). Recording both keeps later code from having to redo
+/// the subtraction, and keeps the derivation in one auditable place.
 ///
 /// The pixel format is reduced to three bit *shifts*: M6 draws XRGB8888 and
 /// nothing else, and a 32-bit pixel with 8-bit colour components is placed in
@@ -233,6 +233,12 @@ pub struct BootInfo {
     pub cpu_ids: [u32; MAX_CPUS],
     /// The bootstrap processor's local APIC identifier.
     pub bsp_lapic_id: u32,
+    /// The boot mode the menu selected, as the protocol's wire code.
+    ///
+    /// `0` means "no mode was named", which a real boot never reports. The
+    /// typed form is [`Self::boot_mode`]; the raw code is stored so this struct
+    /// stays a plain data record the host tests can construct.
+    pub boot_mode: u16,
 }
 
 impl BootInfo {
@@ -256,6 +262,7 @@ impl BootInfo {
             cpu_count: 1,
             cpu_ids: [0; MAX_CPUS],
             bsp_lapic_id: 0,
+            boot_mode: 0,
         }
     }
 
@@ -303,7 +310,6 @@ impl BootInfo {
             None
         }
     }
-
     /// The per-CPU slot whose local APIC identifier is `lapic_id`.
     ///
     /// The kernel uses this to turn the hardware's APIC ID into the index of
@@ -320,6 +326,11 @@ impl BootInfo {
     /// The firmware framebuffer, when one was captured.
     pub fn framebuffer_info(&self) -> Option<FramebufferInfo> {
         self.framebuffer
+    }
+
+    /// The boot mode the menu selected, or `None` when none was named.
+    pub fn boot_mode(&self) -> Option<nova_boot::BootMode> {
+        nova_boot::BootMode::from_code(self.boot_mode)
     }
 
     /// Check every invariant the rest of the kernel relies on.
@@ -661,5 +672,17 @@ mod tests {
     #[test]
     fn page_size_is_the_documented_value() {
         assert_eq!(PAGE_SIZE, 0x1000);
+    }
+
+    #[test]
+    fn the_boot_mode_is_typed_from_the_wire_code() {
+        let mut info = sample();
+        assert_eq!(info.boot_mode(), None, "an empty snapshot names no mode");
+
+        info.boot_mode = nova_boot::BootMode::SafeTerminal.code();
+        assert_eq!(info.boot_mode(), Some(nova_boot::BootMode::SafeTerminal));
+
+        info.boot_mode = 99;
+        assert_eq!(info.boot_mode(), None, "an unknown code is not a mode");
     }
 }

@@ -30,9 +30,13 @@ pub const DEBUG_EXIT_IOBASE: u32 = 0xf4;
 
 /// Guest memory size, in MiB.
 ///
-/// 256 MiB is comfortably above the 16 MiB floor the kernel's boot test asserts,
-/// and comfortably below what makes QEMU's TCG emulation slow enough to matter.
-pub const MEMORY_MIB: u32 = 256;
+/// 2 GiB exercises the large-memory path the kernel is built for: the frame
+/// bitmap is sized from the firmware's map at run time, the HHDM window is
+/// built from 1 GiB/2 MiB leaves, and the DMA allocator holds frames back for
+/// the 32-bit devices. It is comfortably above the 16 MiB floor the kernel's
+/// boot test asserts, and comfortably below what makes QEMU's TCG emulation
+/// slow enough to matter.
+pub const MEMORY_MIB: u32 = 2048;
 
 /// Exit status the kernel writes for a passing test suite.
 ///

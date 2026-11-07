@@ -112,6 +112,15 @@ impl AddressSpace {
 /// process's; the scheduler reloads CR3 on every switch.
 static KERNEL_SPACE_PML4: AtomicU64 = AtomicU64::new(0);
 
+/// The physical address of the directory-pointer table that backs the kernel's
+/// own HHDM window.
+///
+/// `0` until the kernel's space has been built. A process space inherits the
+/// window by PML4 entry copy, so its entry for the window names this same
+/// table; [`map_hhdm`] compares entries against this value to decide whether
+/// a space already carries the kernel's window or needs one built.
+static KERNEL_HHDM_WINDOW: AtomicU64 = AtomicU64::new(0);
+
 /// The kernel's address space.
 ///
 /// # Safety
@@ -209,10 +218,11 @@ fn build_kernel_space(boot_info: &'static BootInfo) -> AddressSpace {
     clone_kernel_half(&boot_pml4, &pml4)
         .expect("cloning the kernel half needs only the frames it already has");
 
-    // The bootloader's HHDM may not cover every usable region the firmware
-    // reported — Limine maps the HHDM over the whole physical range, but the
-    // kernel does not rely on that, and a firmware that mapped less would
-    // otherwise leave the frame allocator reaching into unmapped memory.
+    // The boot manager's HHDM may not cover every usable region the firmware
+    // reported — the snapshot maps the direct map over the whole physical
+    // range, but the kernel does not rely on that, and a firmware that mapped
+    // less would otherwise leave the frame allocator reaching into unmapped
+    // memory.
     map_hhdm(&pml4, boot_info).expect("mapping the HHDM needs frames");
 
     AddressSpace::at(pml4.phys())
@@ -242,44 +252,92 @@ fn clone_kernel_half(source: &PageTable, destination: &PageTable) -> Result<(), 
     Ok(())
 }
 
-/// Map the HHDM over the firmware's usable regions.
+/// Map the HHDM over the firmware's reported regions.
 ///
-/// The mapping covers exactly the regions the firmware called *usable*, not
-/// the whole physical range: a process must not be handed a frame the firmware
-/// said was not RAM.
+/// The mapping covers every region the firmware described, not only the
+/// usable ones: the framebuffer lives in a non-usable region, and the display
+/// service reaches it through the direct map. The frame allocator still only
+/// hands out frames from *usable* regions — the HHDM's extent and the
+/// allocator's extent are deliberately different questions.
+///
+/// # Big leaves
+///
+/// The window is built from the largest leaves the alignment allows: 1 GiB
+/// where the CPU supports `PDPE1GB` and the region's body is 1 GiB aligned,
+/// 2 MiB for the rest of every aligned body, and 4 KiB pages for the unaligned
+/// head and tail of each region. A 192 GiB machine costs a handful of table
+/// frames and a few hundred walk iterations this way; a 4 KiB-only window
+/// would cost 48 million PTE frames — more table memory than most machines
+/// have RAM.
+///
+/// # When the window already exists
+///
+/// A process space inherits the kernel's HHDM by *entry copy*: its PML4
+/// entry for the window names the same directory-pointer table the kernel
+/// built. Re-running this builder against those shared tables would re-walk
+/// and rewrite leaves it did not allocate, so the build is skipped when the
+/// window already names the kernel's own table. A space cloned from the boot
+/// manager's tables — the kernel's own space at boot — names a *different*
+/// table (the boot manager's 4 KiB chain), and that window is dropped and
+/// rebuilt here: the boot manager's mapping covered the same physical range,
+/// but at a granularity no kernel built after this one can maintain.
 ///
 /// # Errors
 ///
-/// [`VmmError::OutOfMemory`] when a frame cannot be allocated.
+/// [`VmmError::OutOfMemory`] when a table frame cannot be allocated.
 fn map_hhdm(pml4: &PageTable, boot_info: &'static BootInfo) -> Result<(), VmmError> {
     let offset = boot_info.direct_map_offset;
-    let page_size = ADDRESS_SPACE.page_size;
+    let window_index = hhdm_window_index(offset);
+
+    // A process space shares the kernel's window: nothing to build.
+    let kernel_window = KERNEL_HHDM_WINDOW.load(Ordering::Acquire);
+    if kernel_window != 0 && pml4.target(window_index) == Some(kernel_window) {
+        return Ok(());
+    }
+
+    // Drop whatever window was inherited — the boot manager's 4 KiB chain for
+    // the kernel's own space, or nothing for a fresh PML4 — so the big-leaf
+    // build below starts from an empty window rather than walking tables it
+    // did not allocate.
+    pml4.write(window_index, 0);
+
+    let one_gib_pages = crate::arch::x86_64::paging::has_1gib_pages();
+
+    // The HHDM is a kernel mapping: writable and executable, and never
+    // user-accessible. It is the kernel's own window onto physical memory,
+    // and a ring 3 mapping of it would hand every process the whole machine.
+    let flags = PageFlags::PRESENT
+        .union(PageFlags::WRITABLE)
+        .union(PageFlags::GLOBAL);
 
     for region in boot_info.regions() {
-        if !region.is_usable() {
+        let base = region.base;
+        let length = region.length;
+        if length == 0 {
             continue;
         }
 
-        let base = region.base & !(page_size - 1);
-        let end = region.end();
-        let mut address = base;
+        let virt = base + offset;
+        page_table::map_range(pml4, virt, base, length, flags, false, one_gib_pages)?;
+    }
 
-        while address < end {
-            // The HHDM is a kernel mapping: writable and executable, and never
-            // user-accessible. It is the kernel's own window onto physical
-            // memory, and a ring 3 mapping of it would hand every process the
-            // whole machine.
-            let flags = PageFlags::PRESENT
-                .union(PageFlags::WRITABLE)
-                .union(PageFlags::GLOBAL);
-
-            page_table::map(pml4, address + offset, address, flags, false)?;
-
-            address += page_size;
-        }
+    // Publish the window this build produced, so later spaces can share it by
+    // comparing entries instead of re-walking them.
+    if let Some(window) = pml4.target(window_index) {
+        KERNEL_HHDM_WINDOW.store(window, Ordering::Release);
     }
 
     Ok(())
+}
+
+/// The PML4 index of the HHDM window, derived from the direct-map offset.
+///
+/// The offset is a higher-half displacement, so its top bits *are* the index:
+/// for the x86-64 `0xFFFF_8000_0000_0000` the derivation yields entry 256.
+/// Deriving rather than hard-coding keeps a bootloader that moves its window
+/// from silently building the kernel's window somewhere else.
+fn hhdm_window_index(direct_map_offset: u64) -> usize {
+    ((direct_map_offset >> 39) & 0x1FF) as usize
 }
 
 /// The user window this kernel permits.

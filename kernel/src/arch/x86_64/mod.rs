@@ -45,7 +45,8 @@ pub const NAME: &str = "x86_64";
 ///
 /// 52 physical bits is the architectural maximum for a four-level translation:
 /// 48 bits of page table plus the reserved bits the PTE format cannot express.
-/// 48 virtual bits matches LA57 being off, which is what Limine configures.
+/// 48 virtual bits matches LA57 being off, which is what the boot manager
+/// configures.
 pub const ADDRESS_SPACE: AddressSpace = match AddressSpace::new(0x1000, Some(52), Some(48)) {
     Some(space) => space,
     None => unreachable!(),
@@ -134,8 +135,8 @@ pub unsafe fn arch_init() {
         //
         //   GDT first — the gates are then filled against a valid selector, but
         //   `lgdt` and `ltr` run with the bootloader's IDT still installed. A
-        //   fault during that window lands in Limine's flat handlers, which
-        //   cannot report anything in NovaOS's format.
+        //   fault during that window lands in the boot manager's flat handlers,
+        //   which cannot report anything in NovaOS's format.
         //
         // Neither order is safe on its own. The resolution is that the GDT is
         // built and loaded first, and `gdt::init` does its `ltr` only after the

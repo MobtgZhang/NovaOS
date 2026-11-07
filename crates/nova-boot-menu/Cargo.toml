@@ -9,6 +9,13 @@ description = "NovaOS UEFI boot menu application implementing the NovaBoot unifi
 [dependencies]
 uefi = { version = "0.30", features = ["alloc", "global_allocator", "panic_handler"] }
 
+# The protocol snapshot the menu publishes, and the ELF parser that reads the
+# kernel image off the ESP. Both are `no_std` crates shared with the kernel, so
+# the snapshot layout and the parse rules are the *same code* on both sides of
+# the hand-off.
+nova-boot = { workspace = true }
+nova-elf = { workspace = true }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

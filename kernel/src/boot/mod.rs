@@ -9,19 +9,21 @@
 //!
 //! - [`info`] — `BootInfo`, `MemoryRegion`, validation. Fully architecture-neutral:
 //!   it is a struct with bounds checks, no pointers, no asm, no hardware access.
-//! - [`limine`] — the Limine protocol requests and the adapter that fills
-//!   [`info::BootInfo`]. Limine supports both x86-64 and AArch64 behind one boot
-//!   protocol, so this module is shared rather than per-architecture; only the
-//!   `.boot.rodata` section name and the linker script that places it differ, and
-//!   both are set per target in the build configuration.
+//! - [`novaboot`] — the NovaBoot protocol reader that fills [`info::BootInfo`]
+//!   from the snapshot the UEFI boot manager (`nova-boot-menu`) published. The
+//!   protocol itself is architecture-neutral (`crates/nova-boot`), so this
+//!   module is shared rather than per-architecture; only the entry stub and the
+//!   linker script that places it differ per target.
 
 pub mod info;
-pub mod limine;
+pub mod novaboot;
 pub mod smp;
 
 pub use info::{BootInfo, MAX_CPUS, MAX_PHYSICAL_ADDRESS, PAGE_SIZE};
 
-pub use limine::{boot_info_is_ready, capture, check_protocol_revision, initramfs, read_boot_info};
+pub use novaboot::{
+    boot_info_is_ready, capture, check_protocol_revision, initramfs, read_boot_info,
+};
 
 /// The bootloader name as a NUL-trimmed string, or `"unknown"`.
 pub fn bootloader_name(info: &BootInfo) -> &str {

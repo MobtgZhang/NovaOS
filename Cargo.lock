@@ -21,12 +21,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
-name = "limine"
-version = "0.6.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29363c0f37e66e18575fadf7141c56ee7ea04ae5fecbeb25eff303f77af203a9"
-
-[[package]]
 name = "log"
 version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -55,6 +49,8 @@ version = "0.1.0"
 name = "nova-boot-menu"
 version = "0.1.0"
 dependencies = [
+ "nova-boot",
+ "nova-elf",
  "uefi",
 ]
 
@@ -98,8 +94,8 @@ dependencies = [
 name = "nova-kernel"
 version = "0.1.0"
 dependencies = [
- "limine",
  "nova-abi",
+ "nova-boot",
  "nova-cap",
  "nova-core",
  "nova-elf",

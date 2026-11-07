@@ -9,7 +9,7 @@
 //! one wait on a single atomic gate before it continues.
 //!
 //! The wait is deliberate: starting an AP after the bootloader has reclaimed
-//! the protocol pages would leave no valid `MpInfo` pointer, and continuing an
+//! the protocol pages would leave no valid processor record, and continuing an
 //! AP before `mm`, the scheduler, and the first APIC mapping exist would fault
 //! in code that has no diagnostic yet.
 //!
@@ -22,9 +22,6 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use limine::mp::MpInfo;
-
-use crate::EXIT_PANIC;
 use crate::boot::info::MAX_CPUS;
 
 /// Set after the bootstrap processor has completed the state every AP needs.
@@ -190,38 +187,14 @@ pub unsafe extern "C" fn ap_idle_entry() -> ! {
     )
 }
 
-/// Entry point the bootloader calls on an application processor.
-///
-/// # Safety
-///
-/// Reached only through Limine's MP handover, with `info` pointing at the
-/// bootloader-owned processor record. The function reads the extra argument
-/// immediately and then waits for the bootstrap-side gate; it does not retain
-/// the bootloader pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
-    let cpu = info.extra_argument() as usize;
-    if cpu == 0 || cpu >= MAX_CPUS {
-        // SAFETY: the machine must stop rather than run an AP with no table.
-        unsafe { crate::arch::exit(EXIT_PANIC) }
-    }
-
-    // SAFETY: this runs before the AP has installed its own exception table.
-    // Masking interrupts here prevents a bootloader-provided timer from landing
-    // on a gate that is not the kernel's.
-    unsafe {
-        core::arch::asm!("cli", options(nomem, nostack));
-    }
-
-    while !SMP_READY.load(Ordering::Acquire) {
-        // SAFETY: `pause` is a yield hint. It changes no memory state and is
-        // valid before the AP's GDT/TSS/IDT are installed.
-        unsafe {
-            core::arch::asm!("pause", options(nomem, nostack));
-        }
-    }
-
-    // SAFETY: the bootstrap-side state is ready, and the AP owns its own kernel
-    // stack. This abandons the bootloader-provided frame and never unwinds it.
-    unsafe { crate::arch::x86_64::gdt::switch_to_kernel_stack_for_cpu_and_continue(cpu) }
-}
+// Entry point the bootloader calls on an application processor.
+//
+// # NovaBoot status
+//
+// There is deliberately no AP entry point yet. The protocol can describe up to
+// `MAX_CPUS` processors, but no MP hand-over exists in the NovaBoot snapshot:
+// the kernel boots the bootstrap processor only, and the SMP suites skip
+// themselves when the snapshot reports one CPU. Bringing APs up through
+// NovaBoot needs the kernel's own ACPI MADT walk plus an INIT-SIPI trampoline,
+// which is the next NovaBoot milestone; the gate and diagnostics this module
+// already publishes are what that trampoline will hand the APs into.

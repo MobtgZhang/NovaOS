@@ -137,7 +137,7 @@ pub fn build_ethernet(
     payload: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    let total = ETHERNET_HEADER_BYTES + payload.len();
+    let total = ETHERNET_HEADER_BYTES.checked_add(payload.len())?;
     if total > out.len() {
         return None;
     }
@@ -231,7 +231,7 @@ pub fn build_ipv4(
     payload: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    let total = IPV4_HEADER_BYTES + payload.len();
+    let total = IPV4_HEADER_BYTES.checked_add(payload.len())?;
     if total > out.len() || total > 65535 {
         return None;
     }
@@ -304,7 +304,7 @@ pub fn build_udp(
     payload: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    let total = UDP_HEADER_BYTES + payload.len();
+    let total = UDP_HEADER_BYTES.checked_add(payload.len())?;
     if total > out.len() || total > 65535 {
         return None;
     }
@@ -354,40 +354,43 @@ pub fn build_dns_query(name: &[u8], id: u16, out: &mut [u8]) -> Option<usize> {
     let mut label_start = 0usize;
     for index in 0..name.len() {
         if name[index] == b'.' {
-            let label_length = index - label_start;
+            let label_length = index.checked_sub(label_start)?;
             if label_length == 0 || label_length > 63 {
                 return None;
             }
-            if position + 1 + label_length > out.len() {
+            let label_end = position.checked_add(1)?.checked_add(label_length)?;
+            if label_end > out.len() {
                 return None;
             }
             out[position] = label_length as u8;
-            position += 1;
-            out[position..position + label_length].copy_from_slice(&name[label_start..index]);
-            position += label_length;
-            label_start = index + 1;
+            position = position.checked_add(1)?;
+            out[position..label_end].copy_from_slice(&name[label_start..index]);
+            position = label_end;
+            label_start = index.checked_add(1)?;
         }
     }
 
-    let final_length = name.len() - label_start;
-    if final_length == 0 || final_length > 63 || position + 1 + final_length > out.len() {
+    let final_length = name.len().checked_sub(label_start)?;
+    let final_end = position.checked_add(1)?.checked_add(final_length)?;
+    if final_length == 0 || final_length > 63 || final_end > out.len() {
         return None;
     }
     out[position] = final_length as u8;
-    position += 1;
-    out[position..position + final_length].copy_from_slice(&name[label_start..]);
-    position += final_length;
+    position = position.checked_add(1)?;
+    out[position..final_end].copy_from_slice(&name[label_start..]);
+    position = final_end;
 
     // Root terminator, then QTYPE and QCLASS.
-    if position + 5 > out.len() {
+    let suffix_end = position.checked_add(1)?.checked_add(4)?;
+    if suffix_end > out.len() {
         return None;
     }
     out[position] = 0;
-    position += 1;
-    out[position..position + 2].copy_from_slice(&DNS_TYPE_A.to_be_bytes());
-    position += 2;
-    out[position..position + 2].copy_from_slice(&DNS_CLASS_IN.to_be_bytes());
-    position += 2;
+    position = position.checked_add(1)?;
+    out[position..position.checked_add(2)?].copy_from_slice(&DNS_TYPE_A.to_be_bytes());
+    position = position.checked_add(2)?;
+    out[position..position.checked_add(2)?].copy_from_slice(&DNS_CLASS_IN.to_be_bytes());
+    position = position.checked_add(2)?;
     Some(position)
 }
 
@@ -409,31 +412,34 @@ pub fn parse_dns_a_record(response: &[u8]) -> Option<Ipv4Addr> {
     let mut position = DNS_HEADER_BYTES;
     for _ in 0..question_count {
         position = skip_dns_name(response, position)?;
-        if position + 4 > response.len() {
+        let question_end = position.checked_add(4)?;
+        if question_end > response.len() {
             return None;
         }
-        position += 4; // QTYPE and QCLASS
+        position = question_end; // QTYPE and QCLASS
     }
 
     for _ in 0..answer_count {
         position = skip_dns_name(response, position)?;
-        if position + 10 > response.len() {
+        let record_end = position.checked_add(10)?;
+        if record_end > response.len() {
             return None;
         }
         let record_type = read_u16(response, position)?;
-        let record_class = read_u16(response, position + 2)?;
-        let data_length = read_u16(response, position + 8)? as usize;
-        position += 10;
-        if position + data_length > response.len() {
+        let record_class = read_u16(response, position.checked_add(2)?)?;
+        let data_length = read_u16(response, position.checked_add(8)?)? as usize;
+        position = record_end;
+        let data_end = position.checked_add(data_length)?;
+        if data_end > response.len() {
             return None;
         }
 
         if record_type == DNS_TYPE_A && record_class == DNS_CLASS_IN && data_length == 4 {
             let mut address = [0u8; 4];
-            address.copy_from_slice(&response[position..position + 4]);
+            address.copy_from_slice(&response[position..position.checked_add(4)?]);
             return Some(Ipv4Addr(address));
         }
-        position += data_length;
+        position = data_end;
     }
 
     None
@@ -488,6 +494,12 @@ impl TcpSegment<'_> {
 /// and segment length) plus the TCP header and payload. The caller supplies the
 /// source and destination addresses because the pseudo-header is not part of
 /// the segment itself.
+///
+/// The argument count is the header's own shape — two addresses, two ports,
+/// two 32-bit sequence fields, flags, payload, buffer — and a builder cannot
+/// group them without making the wire order less obvious, so the length lint
+/// is allowed here.
+#[allow(clippy::too_many_arguments)]
 pub fn build_tcp(
     source: Ipv4Addr,
     destination: Ipv4Addr,
@@ -499,7 +511,7 @@ pub fn build_tcp(
     payload: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    let total = TCP_HEADER_BYTES + payload.len();
+    let total = TCP_HEADER_BYTES.checked_add(payload.len())?;
     if total > out.len() || total > 65535 {
         return None;
     }
@@ -569,7 +581,7 @@ pub fn build_icmp_echo_request(
     payload: &[u8],
     out: &mut [u8],
 ) -> Option<usize> {
-    let total = ICMP_HEADER_BYTES + payload.len();
+    let total = ICMP_HEADER_BYTES.checked_add(payload.len())?;
     if total > out.len() || total > 65535 {
         return None;
     }
@@ -613,15 +625,17 @@ pub struct DhcpReply {
 /// Build a DHCP DISCOVER message.
 pub fn build_dhcp_discover(mac: MacAddr, xid: u32, out: &mut [u8]) -> Option<usize> {
     build_dhcp_base(mac, xid, out)?;
-    let mut position = 240;
+    // The fixed header ends at 240; the message-type option and the end
+    // marker bring the total to 244, which the length below guarantees.
+    if out.len() < 244 {
+        return None;
+    }
     // Message type 53 = DISCOVER (1).
-    out[position] = 53;
-    out[position + 1] = 1;
-    out[position + 2] = 1;
-    position += 3;
-    out[position] = 255; // end
-    position += 1;
-    Some(position)
+    out[240] = 53;
+    out[241] = 1;
+    out[242] = 1;
+    out[243] = 255; // end
+    Some(244)
 }
 
 /// Build a DHCP REQUEST message for `requested` and `server`.
@@ -633,25 +647,24 @@ pub fn build_dhcp_request(
     out: &mut [u8],
 ) -> Option<usize> {
     build_dhcp_base(mac, xid, out)?;
-    let mut position = 240;
+    // Header, message-type option, two four-byte options, end marker: 256.
+    if out.len() < 256 {
+        return None;
+    }
     // Message type 53 = REQUEST (3).
-    out[position] = 53;
-    out[position + 1] = 1;
-    out[position + 2] = 3;
-    position += 3;
+    out[240] = 53;
+    out[241] = 1;
+    out[242] = 3;
     // Requested IP address, option 50.
-    out[position] = 50;
-    out[position + 1] = 4;
-    out[position + 2..position + 6].copy_from_slice(&requested.octets());
-    position += 6;
+    out[243] = 50;
+    out[244] = 4;
+    out[245..249].copy_from_slice(&requested.octets());
     // Server identifier, option 54.
-    out[position] = 54;
-    out[position + 1] = 4;
-    out[position + 2..position + 6].copy_from_slice(&server.octets());
-    position += 6;
-    out[position] = 255;
-    position += 1;
-    Some(position)
+    out[249] = 54;
+    out[250] = 4;
+    out[251..255].copy_from_slice(&server.octets());
+    out[255] = 255;
+    Some(256)
 }
 
 /// Build the fixed DHCP header and magic cookie.
@@ -703,7 +716,7 @@ pub fn parse_dhcp_reply(packet: &[u8]) -> Option<DhcpReply> {
     let mut position = 240;
     while position < packet.len() {
         let code = packet[position];
-        position += 1;
+        position = position.checked_add(1)?;
         if code == 255 {
             break;
         }
@@ -711,18 +724,19 @@ pub fn parse_dhcp_reply(packet: &[u8]) -> Option<DhcpReply> {
             return None;
         }
         let length = packet[position] as usize;
-        position += 1;
-        if position + length > packet.len() {
+        position = position.checked_add(1)?;
+        let option_end = position.checked_add(length)?;
+        if option_end > packet.len() {
             return None;
         }
         if code == 53 && length == 1 {
             message_type = packet[position];
         } else if code == 54 && length == 4 {
             let mut bytes = [0u8; 4];
-            bytes.copy_from_slice(&packet[position..position + 4]);
+            bytes.copy_from_slice(&packet[position..position.checked_add(4)?]);
             server = Some(Ipv4Addr(bytes));
         }
-        position += length;
+        position = option_end;
     }
 
     if message_type == 0 {
@@ -736,42 +750,52 @@ pub fn parse_dhcp_reply(packet: &[u8]) -> Option<DhcpReply> {
 }
 
 /// The one's-complement checksum of an IPv4 pseudo-header plus `data`.
+///
+/// The one's-complement sum is *defined* by end-around carry: words are added
+/// with wraparound and the carry folded back at the end. `wrapping_add` here
+/// is the protocol's arithmetic, not an overflow excuse.
 fn pseudo_checksum(source: Ipv4Addr, destination: Ipv4Addr, protocol: u8, data: &[u8]) -> u16 {
+    let word = |high: u8, low: u8| -> u32 { ((high as u32) << 8) | (low as u32) };
     let mut sum = 0u32;
-    sum += ((source.0[0] as u32) << 8) | (source.0[1] as u32);
-    sum += ((source.0[2] as u32) << 8) | (source.0[3] as u32);
-    sum += ((destination.0[0] as u32) << 8) | (destination.0[1] as u32);
-    sum += ((destination.0[2] as u32) << 8) | (destination.0[3] as u32);
+    sum = sum.wrapping_add(word(source.0[0], source.0[1]));
+    sum = sum.wrapping_add(word(source.0[2], source.0[3]));
+    sum = sum.wrapping_add(word(destination.0[0], destination.0[1]));
+    sum = sum.wrapping_add(word(destination.0[2], destination.0[3]));
     // The pseudo-header is: source, destination, a zero byte, the protocol,
     // and the segment length. The protocol is the low byte of a big-endian
     // 16-bit word, so the word is `0x0006`, not `0x0600`.
-    sum += protocol as u32;
-    sum += data.len() as u32;
+    sum = sum.wrapping_add(protocol as u32);
+    sum = sum.wrapping_add(data.len() as u32);
 
-    let mut index = 0usize;
-    while index + 1 < data.len() {
-        sum += ((data[index] as u32) << 8) | (data[index + 1] as u32);
-        index += 2;
+    for pair in data.as_chunks::<2>().0 {
+        sum = sum.wrapping_add(word(pair[0], pair[1]));
     }
-    if index < data.len() {
-        sum += (data[index] as u32) << 8;
+    if let [last] = data.as_chunks::<2>().1 {
+        sum = sum.wrapping_add((*last as u32) << 8);
     }
+    fold_carry(sum)
+}
+
+/// Fold a wide one's-complement sum into 16 bits.
+///
+/// Each fold step adds the high half to the low half; the step itself can
+/// carry again, so the loop runs until the carry is gone.
+fn fold_carry(sum: u32) -> u16 {
+    let mut sum = sum;
     while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
+        sum = (sum & 0xffff).wrapping_add(sum >> 16);
     }
     !(sum as u16)
 }
 
 /// Read a big-endian `u32` at `offset`.
 fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
-    if offset + 4 > data.len() {
-        return None;
-    }
+    let window = data.get(offset..offset.checked_add(4)?)?;
     Some(
-        ((data[offset] as u32) << 24)
-            | ((data[offset + 1] as u32) << 16)
-            | ((data[offset + 2] as u32) << 8)
-            | (data[offset + 3] as u32),
+        ((window[0] as u32) << 24)
+            | ((window[1] as u32) << 16)
+            | ((window[2] as u32) << 8)
+            | (window[3] as u32),
     )
 }
 
@@ -784,53 +808,52 @@ fn skip_dns_name(data: &[u8], position: usize) -> Option<usize> {
     if first & 0xc0 == 0xc0 {
         // A compression pointer is two bytes and does not itself advance the
         // label stream; the parser only needs to skip it.
-        if position + 2 > data.len() {
+        let after = position.checked_add(2)?;
+        if after > data.len() {
             return None;
         }
-        return Some(position + 2);
+        return Some(after);
     }
 
     let mut cursor = position;
     while cursor < data.len() {
         let label_length = data[cursor] as usize;
         if label_length == 0 {
-            return Some(cursor + 1);
+            return cursor.checked_add(1);
         }
         if label_length & 0xc0 != 0 {
             return None;
         }
-        cursor += 1;
-        if cursor + label_length > data.len() {
+        cursor = cursor.checked_add(1)?;
+        let label_end = cursor.checked_add(label_length)?;
+        if label_end > data.len() {
             return None;
         }
-        cursor += label_length;
+        cursor = label_end;
     }
     None
 }
 
 /// The one's-complement checksum of a byte region.
+///
+/// See [`pseudo_checksum`] for why the additions wrap: that is the
+/// definition of the checksum, not a tolerated overflow.
 fn checksum(data: &[u8]) -> u16 {
+    let word = |high: u8, low: u8| -> u32 { ((high as u32) << 8) | (low as u32) };
     let mut sum = 0u32;
-    let mut index = 0usize;
-    while index + 1 < data.len() {
-        sum += ((data[index] as u32) << 8) | (data[index + 1] as u32);
-        index += 2;
+    for pair in data.as_chunks::<2>().0 {
+        sum = sum.wrapping_add(word(pair[0], pair[1]));
     }
-    if index < data.len() {
-        sum += (data[index] as u32) << 8;
+    if let [last] = data.as_chunks::<2>().1 {
+        sum = sum.wrapping_add((*last as u32) << 8);
     }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
+    fold_carry(sum)
 }
 
 /// Read a big-endian `u16` at `offset`.
 fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
-    if offset + 2 > data.len() {
-        return None;
-    }
-    Some(((data[offset] as u16) << 8) | (data[offset + 1] as u16))
+    let window = data.get(offset..offset.checked_add(2)?)?;
+    Some(((window[0] as u16) << 8) | (window[1] as u16))
 }
 
 #[cfg(test)]

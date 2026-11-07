@@ -47,6 +47,27 @@ pub struct TestSuite {
     pub cases: &'static [(&'static str, TestCase)],
 }
 
+/// Suites that mean something only on a multi-processor boot.
+///
+/// The SMP foundation is exercised through the boot snapshot's processor
+/// table, and the NovaBoot hand-over is single-CPU until the kernel grows its
+/// own ACPI MADT walk and INIT-SIPI trampoline. A suite listed here is
+/// reported as `SKIPPED` on a single-processor boot rather than run to a
+/// guaranteed failure — a skip is an honest statement about the machine, while
+/// a failure would read as a kernel regression that does not exist.
+static MULTI_CPU_SUITES: &[&str] = &["smp_cpu_state"];
+
+/// Whether this suite can run on the machine the snapshot describes.
+fn suite_is_runnable(suite: &TestSuite) -> bool {
+    let multi_cpu = MULTI_CPU_SUITES.contains(&suite.name);
+    if !multi_cpu {
+        return true;
+    }
+    // SAFETY: the harness runs after `boot::capture` published the snapshot.
+    let info = unsafe { crate::boot::read_boot_info() };
+    info.processor_count() >= 2
+}
+
 /// Running totals across every suite.
 #[derive(Default)]
 struct Totals {
@@ -76,6 +97,16 @@ pub fn run_all() -> ! {
     for group in SUITE_GROUPS {
         for suite in *group {
             totals.suites += 1;
+
+            if !suite_is_runnable(suite) {
+                report(format_args!(
+                    "SUITE {} SKIPPED (single-processor boot)",
+                    suite.name
+                ));
+                report(format_args!("END   {}", suite.name));
+                continue;
+            }
+
             report(format_args!("SUITE {}", suite.name));
 
             for (case_name, case) in suite.cases {
@@ -283,6 +314,23 @@ static ALL_SUITES: &[TestSuite] = &[
             ("page_flags_round_trips", page_flags_round_trips),
             ("canonical_address_check", canonical_address_check),
             ("entry_encoding_round_trips", entry_encoding_round_trips),
+        ],
+    },
+    TestSuite {
+        name: "large_memory",
+        cases: &[
+            (
+                "the_allocator_tracks_above_the_legacy_limit",
+                allocator_tracks_above_legacy_limit,
+            ),
+            (
+                "dma_allocations_stay_below_the_4gib_boundary",
+                dma_allocations_stay_below_boundary,
+            ),
+            (
+                "the_hhdm_window_uses_huge_leaves",
+                hhdm_window_uses_huge_leaves,
+            ),
         ],
     },
     TestSuite {
@@ -538,6 +586,125 @@ fn allocator_reports_exhaustion() -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+// --- Large-memory suite cases ------------------------------------------------
+
+/// The bitmap must track far more frames than a 256 MiB machine has.
+///
+/// The old allocator's pool was a compile-time array bounded at exactly the
+/// 256 MiB mark, so a bigger `-m` failed loudly at boot. The replacement sizes
+/// its bitmap from the firmware's map at run time, and the test machine boots
+/// with 2 GiB — so the allocator must both *track* frames above the legacy
+/// limit and actually *hand one out*.
+fn allocator_tracks_above_legacy_limit() -> Result<(), &'static str> {
+    // SAFETY: `mm::init` has run by the time the harness starts.
+    let allocator = unsafe { frame_allocator() };
+
+    // 256 MiB / 4 KiB: every frame the old allocator could represent.
+    const LEGACY_FRAMES: usize = 256 * 1024 * 1024 / 4096;
+    if allocator.total_frames() <= LEGACY_FRAMES {
+        return Err("the allocator still stops at the legacy 256 MiB limit");
+    }
+
+    // Walk the allocation hint forward until it names a frame the old
+    // allocator could not even represent. Freeing each frame keeps the pool
+    // intact: the hint only ever moves forward, so a freed frame below the
+    // hint is never handed out again, and each iteration advances exactly one
+    // frame. The bound is generous — twice the legacy limit — because the
+    // floor starts somewhere above frame 0.
+    let mut attempts = 0usize;
+    while attempts <= 2 * LEGACY_FRAMES {
+        attempts += 1;
+        let frame = allocator.alloc().map_err(|_| "allocation failed")?;
+        let above = frame >= LEGACY_FRAMES;
+        // SAFETY: the frame came from `alloc`, so we own it.
+        unsafe { allocator.dealloc(frame) };
+        if above {
+            return Ok(());
+        }
+    }
+
+    Err("no frame above the legacy limit was ever handed out")
+}
+
+/// A DMA allocation must land below the 4 GiB boundary.
+///
+/// VirtIO descriptors and buffers name their memory with 32-bit words, so a
+/// frame at or above the boundary would be described correctly and reached
+/// wrongly. On this machine the pool extends past the boundary — that is the
+/// point of large-memory support — so the restricted allocator is what keeps
+/// the devices working.
+fn dma_allocations_stay_below_boundary() -> Result<(), &'static str> {
+    // SAFETY: `mm::init` has run by the time the harness starts.
+    let allocator = unsafe { frame_allocator() };
+
+    const DMA_FRAME_LIMIT: usize = 0x10_0000; // 4 GiB / 4 KiB.
+    if allocator.dma_frame_limit() != DMA_FRAME_LIMIT.min(allocator.total_frames()) {
+        return Err("the DMA boundary is not the documented 4 GiB frame limit");
+    }
+
+    for _ in 0..8 {
+        let frame = allocator
+            .alloc_dma()
+            .map_err(|_| "the DMA pool has no frames free")?;
+        if frame >= allocator.dma_frame_limit() {
+            return Err("alloc_dma handed out a frame above the DMA boundary");
+        }
+        // SAFETY: the frame came from `alloc_dma`, so we own it.
+        unsafe { allocator.dealloc(frame) };
+    }
+
+    Ok(())
+}
+
+/// The kernel's HHDM window must be built from huge leaves.
+///
+/// A 4 KiB-only window over a 2 GiB machine would need half a million
+/// page-table frames; the builder maps every aligned region body with 2 MiB
+/// (or 1 GiB, where the CPU offers it) leaves. One level below the window's
+/// directory-pointer table, therefore, at least one entry must carry the
+/// `HUGE` bit — whichever leaf size the CPU ended up with.
+fn hhdm_window_uses_huge_leaves() -> Result<(), &'static str> {
+    use crate::arch::x86_64::paging::{
+        ENTRIES_PER_TABLE, PageFlags, decode_entry, entry_flags, entry_is_present,
+    };
+    use crate::mm::page_table::PageTable;
+
+    // SAFETY: the harness runs after `mm::init` built the kernel space.
+    let kernel = crate::mm::address_space::kernel_space();
+    let pml4 = kernel.pml4();
+
+    // SAFETY: the harness runs after `boot::capture` published the snapshot.
+    let info = unsafe { crate::boot::read_boot_info() };
+    let window_index = ((info.direct_map_offset >> 39) & 0x1FF) as usize;
+
+    let window = pml4.read(window_index);
+    if !entry_is_present(window) {
+        return Err("the HHDM window is not mapped in the kernel space");
+    }
+
+    // The window's directory-pointer table: its entries are either 1 GiB
+    // leaves or pointers to directories full of 2 MiB leaves. One level of
+    // descent covers both shapes.
+    let pdpt = PageTable::at(decode_entry(window));
+    for slot in 0..ENTRIES_PER_TABLE {
+        let entry = pdpt.read(slot);
+        if !entry_is_present(entry) {
+            continue;
+        }
+        if entry_flags(entry).contains(PageFlags::HUGE) {
+            return Ok(());
+        }
+        let pd = PageTable::at(decode_entry(entry));
+        for sub in 0..ENTRIES_PER_TABLE {
+            if entry_flags(pd.read(sub)).contains(PageFlags::HUGE) {
+                return Ok(());
+            }
+        }
+    }
+
+    Err("no huge leaf found below the HHDM window")
 }
 
 // --- Page table suite cases -------------------------------------------------

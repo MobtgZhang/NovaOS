@@ -57,7 +57,7 @@ BARE_TARGET=x86_64-unknown-none
 # host, but it is excluded from the *test* sweep because it is the tool driving
 # the run rather than code under test. Its own tests are run by
 # `cargo xtask test`.
-HOST_EXCLUDES='--exclude nova-kernel --exclude nova-rt --exclude nova-apps'
+HOST_EXCLUDES='--exclude nova-kernel --exclude nova-rt --exclude nova-apps --exclude nova-boot-menu'
 
 # --- Individual gates ------------------------------------------------------
 
@@ -72,12 +72,24 @@ gate_clippy() {
     echo '==> cargo clippy (host)'
     # shellcheck disable=SC2086
     cargo clippy --workspace $HOST_EXCLUDES --all-targets -- -D warnings
+    gate_clippy_uefi
+}
+
+# `nova-boot-menu` is a UEFI application: it cannot build for the host at all
+# (the `uefi` crate owns the panic lang item there), so the host sweep above
+# excludes it and this gate lints it for the target it actually ships for.
+gate_clippy_uefi() {
+    echo '==> cargo clippy (UEFI)'
+    cargo clippy --package nova-boot-menu --target x86_64-unknown-uefi -- -D warnings
 }
 
 gate_test() {
     echo '==> cargo test (host)'
+    # `nova-boot-menu` is a UEFI application and cannot build a host test
+    # harness (the `uefi` crate owns the panic lang item); its pure layout
+    # math lives in `nova-boot`, whose tests run here.
     cargo test --workspace --exclude nova-kernel --exclude nova-rt \
-        --exclude nova-apps --exclude xtask
+        --exclude nova-apps --exclude nova-boot-menu --exclude xtask
 }
 
 gate_kernel() {

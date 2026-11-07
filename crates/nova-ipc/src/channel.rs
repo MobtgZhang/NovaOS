@@ -731,10 +731,10 @@ impl Channel {
         // when there is no free one, so a stale token keeps referring to a
         // spent slot for as long as possible.
         let mut fallback = None;
-        for index in 0..MAX_REPLY_SLOTS {
-            match self.replies[index].state {
+        for (index, slot) in self.replies.iter_mut().enumerate() {
+            match slot.state {
                 ReplyState::Vacant => {
-                    self.replies[index] = ReplySlot {
+                    *slot = ReplySlot {
                         state: ReplyState::Pending,
                         nonce: 0,
                         caller_side,

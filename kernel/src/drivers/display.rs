@@ -25,8 +25,9 @@
 //!
 //! # Mapping
 //!
-//! Limine maps the framebuffer at `virtual = physical + direct_map_offset`.
-//! The kernel's own address space is built from the bootloader's kernel half,
+//! The boot manager maps the framebuffer at
+//! `virtual = physical + direct_map_offset`. The kernel's own address space is
+//! built from the boot manager's kernel half,
 //! so most of that mapping survives. This module still checks every page with
 //! `translate` and maps the missing ones with `map_kernel_mmio`, because a
 //! firmware whose framebuffer lands outside the bootloader's cloned half would

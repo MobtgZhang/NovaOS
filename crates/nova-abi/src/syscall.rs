@@ -191,6 +191,14 @@ pub mod nr {
     /// and the protocol version is the first field of every request.
     pub const SERVICE_REQUEST: Syscall = Syscall(22);
 
+    /// Report the boot mode the boot menu selected.
+    ///
+    /// Takes no arguments and returns the `BootMode` wire code from the boot
+    /// protocol snapshot: `1` is the desktop and `2` is the safe terminal.
+    /// Every process may ask — like `GET_VERSION`, knowing *how* it booted
+    /// carries no authority, and `init` needs the answer before it decides
+    /// which services to start.
+    pub const GET_BOOT_MODE: Syscall = Syscall(23);
     /// Every number currently assigned.
     pub const ALL: &[Syscall] = &[
         GET_VERSION,
@@ -216,6 +224,7 @@ pub mod nr {
         PROCESS_COUNT,
         PROCESS_STATUS,
         SERVICE_REQUEST,
+        GET_BOOT_MODE,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -244,6 +253,7 @@ pub mod nr {
             PROCESS_COUNT => "process_count",
             PROCESS_STATUS => "process_status",
             SERVICE_REQUEST => "service_request",
+            GET_BOOT_MODE => "get_boot_mode",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

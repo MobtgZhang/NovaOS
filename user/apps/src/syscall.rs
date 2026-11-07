@@ -103,3 +103,13 @@ pub fn exit_thread(status: i64) -> ! {
         core::hint::spin_loop();
     }
 }
+
+/// Report the boot mode the menu selected.
+///
+/// No arguments, no authority: knowing *how* the machine booted is an
+/// environment fact, not a capability. The result is the protocol's wire code
+/// — `1` is the desktop, `2` is the safe terminal, `0` when no mode was named
+/// (which a real NovaBoot hand-over never produces).
+pub fn boot_mode() -> Result<i64, SyscallError> {
+    call(Syscall(nr::GET_BOOT_MODE.number()).raw(), [0; 6])
+}

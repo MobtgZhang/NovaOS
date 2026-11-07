@@ -8,5 +8,13 @@ description = "Architecture-neutral NovaBoot protocol and boot menu model"
 
 [dependencies]
 
+[features]
+# The menu-config parser needs `alloc`, and the kernel is deliberately
+# allocation-free — so the kernel links this crate with `default-features =
+# false` and drops the parser, while the UEFI boot manager (which runs with
+# the `uefi` crate's allocator) keeps it.
+default = ["menu-config"]
+menu-config = []
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

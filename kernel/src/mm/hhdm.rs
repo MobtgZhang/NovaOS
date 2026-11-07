@@ -6,17 +6,17 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Captured HHDM offset, written once during `boot::limine_adapter::capture`.
+/// Captured HHDM offset, written once during `boot::novaboot::capture`.
 ///
 /// `0` means "not yet initialised"; every reader is expected to run after
 /// capture, so the atomic load is really just a compiler fence.
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-/// Store the HHDM offset, taking a writable copy from the Limine response.
+/// Store the HHDM offset, taking a writable copy from the NovaBoot snapshot.
 ///
 /// # Safety
 ///
-/// Must be called exactly once, from `boot::limine_adapter::capture`, before
+/// Must be called exactly once, from `boot::novaboot::capture`, before
 /// the bootloader reclaims its response pages.
 pub unsafe fn set(offset: u64) {
     HHDM_OFFSET.store(offset, Ordering::Release);

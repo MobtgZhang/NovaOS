@@ -70,7 +70,7 @@ pub fn text_width(text: &str) -> usize {
     for _ in text.chars() {
         w += FONT_WIDTH + CHAR_SPACING;
     }
-    w.saturating_sub(CHAR_SPACING)
+    w - CHAR_SPACING
 }
 
 /// Expand a character's bitmap into per-pixel flags, row-major

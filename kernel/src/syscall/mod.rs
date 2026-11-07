@@ -431,6 +431,10 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         return process_status(args);
     }
 
+    if number == nova_abi::nr::GET_BOOT_MODE.number() as u64 {
+        return boot_mode();
+    }
+
     stage_outgoing_payload(number, args);
 
     let context = crate::task::current_syscall_context();
@@ -773,6 +777,22 @@ fn service_request(args: [u64; 6]) -> Outcome {
 /// an arbitrary amount of memory in a loop with no way to notice the claim was
 /// absurd. The clamp is what makes the loop's cost a function of the kernel's
 /// own constant rather than of the caller's word.
+/// Report the boot mode the menu selected.
+///
+/// No arguments, no authority: knowing *how* the machine booted is an
+/// environment fact, not a capability, and `init` needs the answer before it
+/// decides which services to start. The value is the protocol's wire code —
+/// `0` when no mode was named, which a real NovaBoot hand-over never produces.
+fn boot_mode() -> Outcome {
+    // SAFETY: the boot snapshot is published and immutable after `capture`.
+    let info = unsafe { crate::boot::read_boot_info() };
+
+    Outcome {
+        result: nova_core::syscall::SyscallResult::Value(info.boot_mode as i64),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    }
+}
+
 fn write_to_console(args: [u64; 6]) -> Outcome {
     const MAX_WRITE: u64 = 4096;
 

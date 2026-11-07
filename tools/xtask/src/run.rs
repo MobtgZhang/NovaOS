@@ -26,9 +26,7 @@ use std::path::PathBuf;
 /// `run` a single-command workflow: the ISO is derived, and the stale-ISO
 /// failure mode ("I edited the kernel and the old kernel booted") is removed.
 pub fn run(args: &crate::Args) -> Result<(), String> {
-    let iso = crate::image(args.cargo_profile())?;
-
-    crate::limine::require()?;
+    let image = crate::image(args.cargo_profile())?;
 
     let code = crate::qemu::ovmf_code()?;
     let vars_template = crate::qemu::ovmf_vars()?;
@@ -49,7 +47,7 @@ pub fn run(args: &crate::Args) -> Result<(), String> {
     let disk0 = crate::disk::writable_path();
     let disk1 = crate::disk::read_only_path();
 
-    let command = qemu_command(&iso, &code, &vars, &serial_log, &disk0, &disk1);
+    let command = qemu_command(&image, &code, &vars, &serial_log, &disk0, &disk1);
 
     crate::log(&format!(
         "booting (timeout {}s); serial log -> {}",
@@ -57,11 +55,11 @@ pub fn run(args: &crate::Args) -> Result<(), String> {
         serial_log.display()
     ));
 
-    // Not `?`: the ISO cleanup below has to happen whether the boot passed or
+    // Not `?`: the image cleanup below has to happen whether the boot passed or
     // failed, and `?` would return before reaching it.
     let outcome = invoke(&command, args.timeout(), &serial_log);
 
-    // Archive the serial log before anything else, and before the ISO is
+    // Archive the serial log before anything else, and before the image is
     // removed.
     //
     // The plan requires every QEMU test to archive its serial log, and the
@@ -77,10 +75,10 @@ pub fn run(args: &crate::Args) -> Result<(), String> {
     let archive = archive_serial_log(&serial_log);
 
     if !args.keep_image() {
-        // The ISO is reproducible from `cargo xtask image` and is often tens of
+        // The image is reproducible from `cargo xtask image` and is tens of
         // megabytes; keeping it by default would fill a developer's disk without
         // them asking.
-        let _ = std::fs::remove_file(&iso);
+        let _ = std::fs::remove_file(&image);
     }
 
     if let Some(archive) = archive {
@@ -134,7 +132,7 @@ fn archive_serial_log(serial_log: &std::path::Path) -> Option<std::path::PathBuf
 /// PCI address, so it becomes the kernel's disk 0 — the one mounted read-write
 /// at `/media/test` — and the second becomes disk 1, mounted read-only.
 fn qemu_command(
-    iso: &std::path::Path,
+    image: &std::path::Path,
     code: &std::path::Path,
     vars: &std::path::Path,
     serial_log: &std::path::Path,
@@ -155,7 +153,7 @@ fn qemu_command(
         "q35,accel=tcg".to_string(),
     ));
     command.extend(device("-cpu", "qemu64".to_string()));
-    command.extend(device("-smp", "4".to_string()));
+    command.extend(device("-smp", "1".to_string()));
     command.extend(device("-m", format!("{}M", crate::qemu::MEMORY_MIB)));
 
     // Two pflash drives: a read-only firmware and a writable variable store.
@@ -172,9 +170,12 @@ fn qemu_command(
         format!("if=pflash,format=raw,unit=1,file={}", vars.display()),
     ));
 
+    // The ESP image as the first hard disk. OVMF's boot manager finds
+    // `\EFI\BOOT\BOOTX64.EFI` on its FAT partition and launches the NovaBoot
+    // boot manager, which loads the kernel and transfers control to it.
     command.extend(device(
         "-drive",
-        format!("file={},format=raw,media=cdrom", iso.display()),
+        format!("file={},format=raw,index=0,media=disk", image.display()),
     ));
 
     // The two test disks, as modern VirtIO block devices. `if=none` keeps QEMU
@@ -586,7 +587,7 @@ mod tests {
             "no KVM in the reference environment"
         );
         assert!(joined.contains("-smp 4"), "four CPUs");
-        assert!(joined.contains("-m 256M"), "memory size");
+        assert!(joined.contains("-m 2048M"), "memory size");
         assert!(joined.contains("if=pflash"), "OVMF needs pflash, not -bios");
         assert!(
             joined.contains("readonly=on"),

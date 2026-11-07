@@ -2,7 +2,8 @@
 //!
 //! NovaOS is its own operating system, not a Linux derivative: it defines its
 //! own syscall ABI, its own capability-based authority model, and its own IPC
-//! semantics. Limine is used strictly as a boot protocol, not as an OS layer.
+//! semantics. NovaBoot — the UEFI boot manager and its snapshot protocol — is
+//! the boot boundary, not an OS layer.
 //!
 //! # Boot sequence
 //!
@@ -16,7 +17,7 @@
 //! 2. Bring up the console, so a panic anywhere below is reportable.
 //! 3. Validate the boot protocol, so a mismatch is a clean message rather than a
 //!    machine that dies before it can print.
-//! 4. Capture the bootloader's memory map into kernel-owned storage.
+//! 4. Capture the boot manager's memory map into kernel-owned storage.
 //! 5. Bring up physical memory, which needs the direct map from step 4.
 //! 6. Run the test suites, which need everything above.
 //!
@@ -62,21 +63,31 @@ pub const KERNEL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Kernel name used in the boot banner and log tags.
 pub const KERNEL_NAME: &str = "NovaOS";
 
-/// Boot protocol revision this kernel requires.
-pub const LIMINE_PROTOCOL_REVISION: u64 = 6;
-
 /// Kernel entry point.
 ///
-/// Limine jumps here in whatever mode it configured: long mode on x86-64, EL1h
-/// with MMU on on AArch64. Both are described by `docs/abi/address-layout.md`.
+/// The UEFI boot manager (`nova-boot-menu`) calls this after `ExitBootServices`
+/// with the direct-map virtual address of the [`nova_boot::BootProtocol`]
+/// snapshot in `RDI` (SysV order), running on a boot-manager-provided stack in
+/// long mode with the boot manager's own page tables loaded in CR3.
+///
+/// The first job is to remember where the snapshot lives — `RDI` dies with the
+/// frame — and then everything proceeds exactly as the boot sequence documents:
+/// console first, kernel stack second, and the rest in
+/// [`boot_after_stack_switch`].
 ///
 /// # Safety
 ///
-/// Reached only by the bootloader, which guarantees an initialised environment
-/// (stack, console-visible state, and populated response areas for every request
-/// the backend issued) and a valid address space.
+/// Reached only by the boot manager, which guarantees an initialised
+/// environment: long mode, interrupts masked by the jump path, a valid address
+/// space that maps the kernel image and the snapshot through the direct map,
+/// and a stack the stub abandons immediately.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub unsafe extern "C" fn nova_boot_entry(snapshot: u64) -> ! {
+    // The pointer is all this frame receives; store it before anything can
+    // clobber `rdi`. SAFETY: the entry path is single-CPU with interrupts
+    // masked, and this is the only writer.
+    unsafe { boot::novaboot::store_snapshot_pointer(snapshot) };
+
     // SAFETY: this is the kernel's entry point; every call below is made with
     // interrupts masked and the exception table installed first where required.
     unsafe {
@@ -95,44 +106,44 @@ pub unsafe extern "C" fn _start() -> ! {
         // precise diagnostic into a silent `EXIT_PANIC` with an empty log.
         arch::console_init();
 
-        // Move off the bootloader's stack, and from here on never unwind through
-        // the frame this function has already built on it.
+        // Move off the boot manager's stack, and from here on never unwind
+        // through the frame this function has already built on it.
         //
         // This ordering is load-bearing for two independent reasons, and both
         // have produced faults whose symptoms pointed elsewhere entirely.
         //
         // First, `arch::init` builds a 4 KiB IDT, fills a TSS, and reloads `CS`,
         // and until the IDT is installed a fault inside that work lands on the
-        // bootloader's stack — the stack the faulting code had already pushed
+        // boot manager's stack — the stack the faulting code had already pushed
         // past its end. The `#PF` handler then reports a frame with an `RIP`
-        // inside the bootloader and an `RSP` in the direct map, which reads as
+        // inside the boot manager and an `RSP` in the direct map, which reads as
         // a stack-overflow in unrelated code.
         //
-        // Second, and far less obviously, `_start` itself must not return
-        // through the frame it has already opened. The switch below is `-> !`
-        // precisely so that LLVM emits no epilogue for it; see
+        // Second, and far less obviously, `nova_boot_entry` itself must not
+        // return through the frame it has already opened. The switch below is
+        // `-> !` precisely so that LLVM emits no epilogue for it; see
         // `arch::switch_to_kernel_stack_and_continue`, whose comment records the
         // `#PF` that came from getting this wrong — a faulting address inside the
         // stack buffer, blamed on a callee that returned perfectly.
         //
         // Nothing is lost by switching before the tables exist: `KERNEL_STACK`
-        // is a `.bss` static, and the bootloader has already mapped the kernel
-        // image's zero-filled pages, so it is writable before any table is
-        // built. Loading `CS` is still the last thing `gdt::init` does.
+        // is a `.bss` static, and the boot manager has already mapped the
+        // kernel image's zero-filled pages, so it is writable before any table
+        // is built. Loading `CS` is still the last thing `gdt::init` does.
         // SAFETY: interrupts are still masked. The function abandons this frame,
-        // so nothing that lives on the bootloader's stack may be read afterwards.
+        // so nothing that lives on the boot manager's stack may be read afterwards.
         arch::switch_to_kernel_stack_and_continue();
     }
 }
 
 /// Continue the boot sequence on the kernel's own stack.
 ///
-/// Split out of [`_start`] for one reason that is easy to miss: `_start` has
-/// already built a frame on the bootloader's stack, and moving `rsp` abandons
-/// it. If the rest of boot lived in `_start`, its epilogue would eventually run
-/// and read that abandoned frame back through the *new* stack pointer. Here
-/// there is no such epilogue — this function is called fresh, with the stack
-/// already switched, and never returns.
+/// Split out of [`nova_boot_entry`] for one reason that is easy to miss:
+/// `nova_boot_entry` has already built a frame on the boot manager's stack, and
+/// moving `rsp` abandons it. If the rest of boot lived in the entry function,
+/// its epilogue would eventually run and read that abandoned frame back through
+/// the *new* stack pointer. Here there is no such epilogue — this function is
+/// called fresh, with the stack already switched, and never returns.
 ///
 /// # Safety
 ///
@@ -153,12 +164,12 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // SAFETY: as above; every call runs with interrupts masked and the
     // exception table installed.
     unsafe {
-        // Reject an unsupported bootloader before touching hardware, so a
+        // Reject an unsupported boot protocol before touching hardware, so a
         // mismatch is a clean diagnostic rather than a machine that dies before
         // it can print anything.
         boot::check_protocol_revision();
 
-        // Validates and copies the bootloader responses into kernel-owned
+        // Validates and copies the boot manager's snapshot into kernel-owned
         // storage. Nothing reads the protocol structures again after this.
         let boot_info: &'static BootInfo = boot::capture();
 

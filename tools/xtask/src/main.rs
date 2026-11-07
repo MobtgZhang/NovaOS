@@ -33,8 +33,6 @@
 mod boot;
 mod build;
 mod disk;
-mod iso;
-mod limine;
 mod qemu;
 mod run;
 mod test;
@@ -54,10 +52,9 @@ USAGE:
 
 COMMANDS:
     build           Build the kernel and every host-side crate
-    image           Package the kernel into a bootable Limine ISO
+    image           Package the kernel into a bootable ESP FAT image
     run             Build, then boot the image in QEMU with a serial console
     test            Run xtask's tests, the host unit tests, then the QEMU boot suite
-    fetch-limine    Download and verify the pinned Limine release
     clean           Remove build artifacts
 
 OPTIONS:
@@ -65,7 +62,7 @@ OPTIONS:
     --profile <p>   Use a named profile
     --timeout <s>   QEMU run timeout in seconds (default: 30)
     --headless      Do not open a graphical window (default)
-    --keep-image    Do not delete the ISO after `run`
+    --keep-image    Do not delete the image after `run`
     -h, --help      Show this message
 ";
 
@@ -180,7 +177,6 @@ fn main() -> ExitCode {
         Some("image") => image(args.cargo_profile()).map(|_| ()),
         Some("run") => run::run(&args),
         Some("test") => test_all(&args),
-        Some("fetch-limine") => limine::fetch(),
         Some("clean") => clean(),
         // Unreachable in practice: `args.command.is_none()` returned above. Kept
         // as a catch-all rather than `unreachable!()` so that adding a command
@@ -216,20 +212,36 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
     let kernel = boot::kernel_artifact(Some(&profile))?;
     log(&format!("kernel: {}", kernel.display()));
 
-    let user = boot::user_artifact(Some(&profile))?;
-    log(&format!("user image: {}", user.display()));
+    // The NovaBoot boot manager UEFI application.
+    run_command_owned(
+        &[
+            "cargo".to_string(),
+            "build".to_string(),
+            "--package".to_string(),
+            boot::BOOT_MANAGER_PACKAGE.to_string(),
+            "--target".to_string(),
+            "x86_64-unknown-uefi".to_string(),
+            "--profile".to_string(),
+            profile.as_str().to_string(),
+        ],
+        "boot manager build",
+    )?;
+    let boot_manager = boot::target_dir()
+        .join("x86_64-unknown-uefi")
+        .join(profile.as_str())
+        .join(format!("{}.efi", boot::BOOT_MANAGER_PACKAGE));
+    log(&format!("boot manager: {}", boot_manager.display()));
 
-    limine::require()?;
     let apps = boot::application_directory(Some(&profile))?;
     let initramfs = boot::build_initramfs(&apps)?;
-    let stage = boot::stage_image_with_initramfs(&kernel, Some(&user), Some(&initramfs))?;
+    let stage = boot::stage_esp(&kernel, &initramfs, &boot_manager)?;
 
-    boot::build_iso(&stage)?;
-    let iso = boot::iso_path();
-    log(&format!("image: {}", iso.display()));
+    let image = boot::esp_path();
+    boot::build_esp_image(&stage, &image)?;
+    log(&format!("image: {}", image.display()));
 
     // The two M5 test disks. They are build artifacts of the same run as the
-    // ISO — generated, not committed — so that a change to the on-disk format
+    // image — generated, not committed — so that a change to the on-disk format
     // cannot leave a stale image behind for the kernel to refuse to mount.
     // `run` regenerates them too, so a boot always tests the current format.
     let disks = disk::generate()?;
@@ -237,7 +249,7 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
         log(&format!("disk: {}", disk.display()));
     }
 
-    Ok(iso)
+    Ok(image)
 }
 
 /// Run the host tests, then the QEMU boot suite.
@@ -311,7 +323,7 @@ mod tests {
 
     #[test]
     fn each_subcommand_parses() {
-        for command in ["build", "image", "run", "test", "fetch-limine", "clean"] {
+        for command in ["build", "image", "run", "test", "clean"] {
             let args = parse(&[command]).expect("a known command parses");
             assert_eq!(args.command.as_deref(), Some(command));
         }
@@ -393,7 +405,7 @@ mod tests {
     fn the_usage_text_documents_every_subcommand() {
         // A subcommand added without a usage line is a command nobody can
         // discover, so the two lists are cross-checked here.
-        for command in ["build", "image", "run", "test", "fetch-limine", "clean"] {
+        for command in ["build", "image", "run", "test", "clean"] {
             assert!(USAGE.contains(command), "{command} is missing from USAGE");
         }
     }

@@ -490,8 +490,9 @@ fn alloc_ring_frame(bytes: usize) -> Result<usize, QueueError> {
     }
 
     // SAFETY: `mm::init` published the allocator during boot, and every queue
-    // is built after that.
-    let frame = unsafe { frame_allocator().alloc() }.map_err(|_| QueueError::OutOfMemory)?;
+    // is built after that. Ring and descriptor addresses cross to the device
+    // as 32-bit DMA words, so the frame must sit below the 4 GiB boundary.
+    let frame = unsafe { frame_allocator().alloc_dma() }.map_err(|_| QueueError::OutOfMemory)?;
     let phys = frame_phys(frame);
 
     // SAFETY: the frame was just allocated, so it is this caller's; the direct

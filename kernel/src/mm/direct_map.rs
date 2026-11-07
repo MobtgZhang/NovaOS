@@ -11,8 +11,8 @@
 //!
 //! x86-64 bootloaders call this the HHDM (Higher-Half Direct Map) and AArch64
 //! bootloaders provide the equivalent mapping, but the concept is one idea. This
-//! module uses the architecture-neutral name; the Limine adapter's request is
-//! still called `HhdmRequest` because that is the protocol's own field.
+//! module uses the architecture-neutral name; the NovaBoot snapshot's
+//! `direct_map_offset` field is the protocol's own name for it.
 //!
 //! # Lifecycle
 //!

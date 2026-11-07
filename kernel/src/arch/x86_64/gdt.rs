@@ -642,13 +642,12 @@ static KERNEL_STACK: AlignedStack<KERNEL_STACK_SIZE> = AlignedStack::new();
 ///
 /// # Why the kernel must switch stacks rather than run on the bootloader's
 ///
-/// `_start` arrives on whatever stack the bootloader set up — Limine's, in the
-/// direct-map region. Nothing requires the kernel to stay there, and several
-/// things go wrong if it does.
+/// `_start` arrives on whatever stack the boot manager set up — the boot
+/// manager's, in the direct-map region. Nothing requires the kernel to stay
+/// there, and several things go wrong if it does.
 ///
-/// The bootloader's stack is sized to `LIMINE_STACK_SIZE` and is shared with the
-/// protocol structures Limine left on it. Worse, it lives in the *direct map*,
-/// so its address has no relationship to the kernel image: a fault report that
+/// The boot manager's stack is sized by the boot manager and shared with the
+/// snapshot pages it allocated. Worse, it lives in the *direct map*, so its address has no relationship to the kernel image: a fault report that
 /// prints `RSP` then shows an address that looks like it is outside the kernel,
 /// and the real stack-depth problem is masked by the surprise.
 ///
@@ -771,7 +770,7 @@ pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
 ///
 /// # Safety
 ///
-/// Called only from Limine's AP entry, with interrupts masked, after the AP's
+/// Called only from an AP startup path, with interrupts masked, after the AP's
 /// readiness gate has opened.
 pub unsafe fn switch_to_kernel_stack_for_cpu_and_continue(cpu: usize) -> ! {
     assert!(cpu < MAX_CPUS, "CPU index exceeds the static stack table");
@@ -1073,8 +1072,8 @@ pub unsafe fn init() {
         load_tss(KERNEL_TSS_SELECTOR);
 
         // Reload `CS` *last*, after every other instruction that still refers to
-        // the bootloader's segment table. Until this point the CPU is running in
-        // Limine's `CS = 0x28`, which no IDT gate names.
+        // the boot manager's segment table. Until this point the CPU is running
+        // in the boot manager's `CS = 0x28`, which no IDT gate names.
         //
         // The trampoline has no frame of its own: it reads the caller's return
         // address off the stack and returns to it with `CS` reloaded, popping

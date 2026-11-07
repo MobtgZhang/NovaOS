@@ -224,6 +224,30 @@ pub fn read_state() -> PagingState {
     }
 }
 
+/// Whether the CPU can form 1 GiB leaves.
+///
+/// 2 MiB leaves are part of every long-mode implementation, but a 1 GiB leaf
+/// is an *optional* extension (CPUID leaf `0x80000001`, `EDX` bit 26,
+/// `PDPE1GB`). The HHDM builder asks before it tries to use one: mapping a
+/// 1 GiB leaf on a CPU that cannot walk it is a reserved-bit `#PF` at the
+/// first access rather than an error anyone can see at map time.
+///
+/// # Why the extended leaf is checked first
+///
+/// `0x80000001` is only valid when `0x80000000` reports a maximum at least as
+/// high. Every long-mode CPU implements the extended leaf, but the guard costs
+/// one `cpuid` and turns a would-be undefined query into a defined `false`.
+pub fn has_1gib_pages() -> bool {
+    // `cpuid` writes only its four documented result registers, and this
+    // toolchain exposes it as a safe intrinsic.
+    let extended = core::arch::x86_64::__cpuid(0x8000_0000);
+    if extended.eax < 0x8000_0001 {
+        return false;
+    }
+    let features = core::arch::x86_64::__cpuid(0x8000_0001);
+    features.edx & (1 << 26) != 0
+}
+
 /// Whether 5-level paging is currently active.
 ///
 /// This kernel targets 4-level paging, but a bootloader that negotiated 5-level

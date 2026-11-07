@@ -2,9 +2,10 @@
 //!
 //! # Why the kernel does not hard-code these
 //!
-//! The boot protocol already knows the answer — Limine reports a paging mode on
-//! x86-64 and a granule size everywhere — and a hard-coded `0x1000` would be
-//! wrong on any target with a larger granule. Worse, the *interpretation*
+//! The boot protocol already knows the answer — the boot manager reports a
+//! paging mode on x86-64 and a granule size everywhere — and a hard-coded
+//! `0x1000` would be wrong on any target with a larger granule. Worse, the
+//! *interpretation*
 //! differs even where the number matches: on x86-64 a page address is a 4 KiB
 //! frame index times 4096, while on AArch64 with 4 KiB granules the same holds,
 //! but with 64 KiB granules only the low 16 bits are the offset and the rest

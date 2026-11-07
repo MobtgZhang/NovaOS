@@ -1287,8 +1287,10 @@ fn read_mac(transport: &transport::Transport) -> Result<MacAddr, NetError> {
 
 /// Allocate one zeroed page for a network buffer.
 fn alloc_frame() -> Result<usize, NetError> {
-    // SAFETY: `mm::init` published the allocator during boot.
-    let frame = unsafe { frame_allocator().alloc() }
+    // SAFETY: `mm::init` published the allocator during boot. The device reads
+    // this frame's address as a 32-bit DMA word, so it must come from the
+    // DMA-capable pool below the 4 GiB boundary.
+    let frame = unsafe { frame_allocator().alloc_dma() }
         .map_err(|_| NetError::Queue(queue::QueueError::OutOfMemory))?;
 
     // SAFETY: the frame was just allocated, so it is this caller's; the direct

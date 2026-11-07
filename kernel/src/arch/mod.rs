@@ -17,8 +17,8 @@
 //!
 //! | Backend | Target | Boot path | Console | Exit |
 //! | --- | --- | --- | --- | --- |
-//! | [`x86_64`] | `x86_64-unknown-none` | Limine BIOS/UEFI → long mode | 16550 @ 0x3f8 | `isa-debug-exit` @ 0xf4 |
-//! | [`aarch64`] | `aarch64-unknown-none` | Limine UEFI → EL1 | PL011 @ 0x0900_0000 | PSCI `SYSTEM_OFF` |
+//! | [`x86_64`] | `x86_64-unknown-none` | NovaBoot UEFI → long mode | 16550 @ 0x3f8 | `isa-debug-exit` @ 0xf4 |
+//! | [`aarch64`] | `aarch64-unknown-none` | NovaBoot UEFI → EL1 (planned) | PL011 @ 0x0900_0000 | PSCI `SYSTEM_OFF` |
 //!
 //! # Adding a target
 //!

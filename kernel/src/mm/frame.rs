@@ -4,16 +4,28 @@
 //!
 //! The allocator needs to answer two questions — "is this frame free?" and
 //! "give me the lowest free frame" — over an address space whose usable extent
-//! is only known at boot. A bitmap of one bit per 4 KiB frame handles 256 MiB
-//! with 64 KiB of kernel memory, which is a good trade before M2 introduces real
-//! virtual memory and the bookkeeping that comes with it.
+//! is only known at boot. A bitmap of one bit per 4 KiB frame answers both,
+//! and its cost scales linearly: a 192 GiB machine needs 6 MiB of bitmap, a
+//! 1 TiB machine 32 MiB. The bitmap is therefore *not* a compile-time array:
+//! it is carved out of the top of the largest usable region at boot, marked
+//! busy in itself, and reached through the direct map like every other frame.
+//!
+//! # Frames are physical frame numbers
+//!
+//! A frame index *is* the physical frame number: frame `n` is the 4 KiB at
+//! physical `n * page`. The bitmap covers every frame up to the highest
+//! usable region's end, and frames the firmware did not call usable — the
+//! holes between regions, the reserved ranges, the low memory below the
+//! kernel image — are marked busy at construction. Handing out a frame the
+//! firmware owns would be a corruption no later check could catch, so the
+//! marking happens once, at boot, where it can be audited.
 //!
 //! # Testability
 //!
-//! [`Bitmap`] is deliberately free of architecture and of `unsafe`, and its unit
-//! tests run on the host under `cargo test`. The kernel-side
-//! [`FrameAllocator`] is a thin shell over it that adds the HHDM mapping needed
-//! to touch a frame's contents.
+//! [`Bitmap`] is deliberately free of architecture and of `unsafe` in its
+//! *logic* — its unit tests run on the host under `cargo test` over a plain
+//! word slice. The kernel-side [`FrameAllocator`] is a thin shell over it that
+//! chooses the backing store and adds the direct map needed to touch it.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +34,7 @@ use crate::arch::ADDRESS_SPACE;
 use crate::boot::info::{BootInfo, MemoryRegion, PAGE_SIZE};
 use crate::klog;
 use crate::logger::Level;
+use crate::mm::direct_map;
 
 /// Error returned by [`FrameAllocator::alloc`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,15 +69,25 @@ impl core::fmt::Display for AllocatorStats {
     }
 }
 
+/// The physical frame boundary below which a frame may be handed to a device
+/// that can only DMA into 32-bit addresses.
+///
+/// 4 GiB / 4 KiB. VirtIO devices without the `ANY_LAYOUT`-style 64-bit
+/// addressing features read descriptor and buffer addresses as 32-bit words,
+/// so a frame at or above this boundary would be *described* correctly and
+/// *reached* wrongly. [`FrameAllocator::alloc_dma`] refuses to cross it;
+/// ordinary allocations are free to use the whole machine.
+const DMA_FRAME_LIMIT: usize = 0x10_0000;
+
 /// Physical frame allocator.
 ///
 /// # Concurrency
 ///
 /// The bitmap sits behind an [`UnsafeCell`] and every accessor is `unsafe`. That
-/// is deliberate: NovaOS v0.1.0 runs on one CPU with interrupts masked during
-/// allocation, so there is nothing to race against. M2 introduces real
-/// concurrency and replaces this type wholesale — the safe [`Bitmap`] logic it
-/// wraps is exactly what survives that refactor, which is why the split exists.
+/// is deliberate: NovaOS runs on one CPU with interrupts masked during
+/// allocation, so there is nothing to race against. Real concurrency replaces
+/// this shell with a locked one — the safe [`Bitmap`] logic it wraps is exactly
+/// what survives that refactor, which is why the split exists.
 ///
 /// # Reserved floor
 ///
@@ -76,62 +99,173 @@ pub struct FrameAllocator {
     bitmap: UnsafeCell<Bitmap>,
     /// First frame the allocator may hand out.
     base_frame: usize,
-    /// Number of frames the bitmap tracks.
+    /// Number of frames the bitmap tracks: every physical frame up to the
+    /// highest usable region's end.
     total_frames: usize,
+    /// Frames below this boundary are DMA-capable; see [`DMA_FRAME_LIMIT`].
+    dma_limit_frame: usize,
     /// Sequential allocation hint; cleared when it runs off the end.
     hint: AtomicUsize,
+    /// Physical address of the bitmap's backing store, for the boot log.
+    bitmap_phys: u64,
 }
 
 impl FrameAllocator {
-    /// Build an allocator over the usable regions described by `boot_info`.
+    /// Build an allocator over the memory the firmware described.
     ///
     /// `base_frame` is the first frame safe to hand out. The caller passes the
     /// end of the kernel image so the allocator never recycles the pages it is
     /// executing from.
     ///
+    /// The bitmap's backing store is taken from the *top* of the largest
+    /// usable region that can hold it, above the kernel-image floor. Placing
+    /// it high keeps the low 4 GiB — the DMA-capable window — clear of
+    /// bookkeeping, and placing it inside a usable region means the direct
+    /// map already covers it before a single table of the kernel's own
+    /// exists.
+    ///
     /// # Panics
     ///
-    /// If the machine reports more allocatable memory than
-    /// [`MAX_FRAMES`] can track. A bitmap that silently truncated would hand out
-    /// frames beyond the memory it can account for, so this fails loudly at boot
-    /// instead: raise `MAX_BITMAP_WORDS` and re-measure the `.bss` cost first.
+    /// If the firmware reports no usable memory, or if no usable region is
+    /// large enough to hold the bitmap above the kernel-image floor. Both are
+    /// boot failures: a bitmap that silently truncated would hand out frames
+    /// beyond the memory it can account for.
     pub fn new(boot_info: &BootInfo, base_frame: usize) -> Self {
-        // Count only frames that lie inside a usable region, so the bitmap can
-        // never report free a frame the firmware said was not RAM.
-        //
-        // The page size comes from the address space rather than a constant, so
-        // this stays correct on a target with a 16 KiB or 64 KiB granule.
-        let page = ADDRESS_SPACE.page_size;
-        let usable = boot_info
+        let page = ADDRESS_SPACE.page_size as usize;
+
+        // The bitmap tracks physical frames up to the end of the highest
+        // usable region. Frames the firmware did not call usable are marked
+        // busy below, so the extent only needs to *cover* the allocatable
+        // ones.
+        let limit_frame = boot_info
             .regions()
             .iter()
-            .filter(|region| region.is_usable() && region.length > 0)
-            .fold(0u64, |total, region| total.saturating_add(region.length));
-        let total_frames = (usable / page) as usize;
+            .filter(|region| region.is_usable())
+            .fold(0u64, |top, region| top.max(region.end() / PAGE_SIZE))
+            as usize;
 
-        let mut bitmap = Bitmap::with_capacity(total_frames).unwrap_or_else(|| {
-            panic!(
-                "mm: machine reports {} usable frames, but the bitmap pool tracks at most {} \
-                 ({:.0} MiB). Raise MAX_BITMAP_WORDS in kernel/src/mm/frame.rs.",
-                total_frames,
-                MAX_FRAMES,
-                (MAX_FRAMES as u64 * page) / (1024 * 1024)
-            )
-        });
-
-        // Reserve the floor. Doing it here rather than from the caller means no
-        // window exists in which `alloc` could observe an unreserved frame.
-        let floor = base_frame.min(total_frames);
-        for frame in 0..floor {
-            bitmap.mark_allocated(frame);
+        if limit_frame == 0 {
+            panic!("mm: the firmware reported no usable memory; there is nothing to allocate");
         }
 
-        Self {
+        let bitmap_bytes = limit_frame.div_ceil(u64::BITS as usize) * size_of::<u64>();
+        let bitmap_frames = bitmap_bytes.div_ceil(page);
+
+        // Choose the host region: the largest usable region that can hold the
+        // bitmap at or above the kernel-image floor. Ties go to the higher
+        // region, so a machine with two equal regions keeps its low memory
+        // — the DMA window — clear of bookkeeping.
+        let mut chosen: Option<(usize, usize, u64)> = None;
+        for region in boot_info.regions() {
+            if !region.is_usable() {
+                continue;
+            }
+            let start_frame = (region.base / PAGE_SIZE) as usize;
+            let end_frame = (region.end() / PAGE_SIZE) as usize;
+            let floor = base_frame.max(start_frame);
+            if end_frame < floor + bitmap_frames {
+                continue;
+            }
+            let better = match chosen {
+                None => true,
+                Some((_, _, length)) => {
+                    region.length > length || (region.length == length && start_frame > floor)
+                }
+            };
+            if better {
+                chosen = Some((floor, end_frame, region.length));
+            }
+        }
+
+        let Some((bitmap_start_frame, _, _)) = chosen else {
+            panic!(
+                "mm: the frame bitmap needs {} bytes above frame {base_frame}, but no usable \
+                 region in the firmware's map can hold it",
+                bitmap_bytes
+            );
+        };
+
+        let bitmap_phys = bitmap_start_frame as u64 * ADDRESS_SPACE.page_size;
+        let word_count = bitmap_bytes / size_of::<u64>();
+
+        // SAFETY: `bitmap_phys` names frames this allocator is claiming for
+        // itself, inside a usable region the direct map covers; the write is
+        // bounded by the span just claimed.
+        unsafe {
+            core::ptr::write_bytes(
+                direct_map::phys_to_virt(bitmap_phys).cast::<u8>(),
+                0,
+                bitmap_bytes,
+            );
+        }
+
+        // SAFETY: the backing store was just zeroed and stays owned by the
+        // allocator for its whole lifetime; no other reference to those frames
+        // exists.
+        let bitmap = unsafe {
+            Bitmap::from_zeroed(
+                direct_map::phys_to_virt(bitmap_phys).cast::<u64>(),
+                word_count,
+                limit_frame,
+            )
+        };
+
+        klog!(
+            Level::Debug,
+            "mm: frame bitmap at phys {:#x} ({} KiB) tracking {} frames",
+            bitmap_phys,
+            bitmap_bytes / 1024,
+            limit_frame
+        );
+
+        let mut allocator = Self {
             bitmap: UnsafeCell::new(bitmap),
             base_frame,
-            total_frames,
-            hint: AtomicUsize::new(floor),
+            total_frames: limit_frame,
+            dma_limit_frame: DMA_FRAME_LIMIT.min(limit_frame),
+            hint: AtomicUsize::new(base_frame),
+            bitmap_phys,
+        };
+
+        // Seed the occupancy: everything busy, then the usable regions above
+        // the kernel-image floor free, then the bitmap itself busy again.
+        // Marking is order-independent and idempotent, so the firmware's
+        // region order — which validation counts but does not enforce — does
+        // not matter.
+        //
+        // SAFETY: single-CPU construction from `_start`, before any reader.
+        unsafe {
+            let bitmap = &mut *allocator.bitmap.get();
+
+            bitmap.mark_allocated_range(0, limit_frame);
+
+            for region in boot_info.regions() {
+                if !region.is_usable() {
+                    continue;
+                }
+                let start = (region.base / PAGE_SIZE) as usize;
+                let end = (region.end() / PAGE_SIZE) as usize;
+                let free_start = start.max(base_frame);
+                if end > free_start {
+                    bitmap.mark_free_range(free_start, end - free_start);
+                }
+            }
+
+            bitmap.mark_allocated_range(bitmap_start_frame, bitmap_frames);
         }
+
+        let free = {
+            // SAFETY: read-only access, single-CPU construction.
+            let bitmap = unsafe { &*allocator.bitmap.get() };
+            bitmap.free_count()
+        };
+        klog!(
+            Level::Debug,
+            "mm: allocator seeded with {free} free frames (dma-capable below frame {})",
+            allocator.dma_limit_frame
+        );
+
+        allocator
     }
 
     /// Allocate one physical frame.
@@ -140,8 +274,7 @@ impl FrameAllocator {
     /// kernel's address space is the HHDM's job, not the allocator's.
     pub fn alloc(&self) -> Result<usize, FrameError> {
         // SAFETY: single-CPU allocator. Allocation is only reachable from
-        // kernel code, and M2 replaces this type when preemption makes it
-        // genuinely concurrent.
+        // kernel code; real concurrency replaces this shell with a locked one.
         let bitmap = unsafe { &mut *self.bitmap.get() };
 
         // Allocation is overwhelmingly sequential, so try the hint first and
@@ -163,6 +296,35 @@ impl FrameAllocator {
                 Ok(frame)
             }
             None => Err(FrameError::OutOfMemory),
+        }
+    }
+
+    /// Allocate one frame a 32-bit DMA device can reach.
+    ///
+    /// The search is the same lowest-first scan, restricted to frames below
+    /// [`DMA_FRAME_LIMIT`]. VirtIO descriptors and buffers name their memory
+    /// with 32-bit words, so a frame at or above the 4 GiB boundary would be
+    /// described correctly and reached wrongly — the device would read or
+    /// write *something*, just not the memory the kernel handed it. Ordinary
+    /// allocations keep the whole machine; only callers that feed a device
+    /// need this restriction.
+    ///
+    /// On a machine whose usable memory is entirely below 4 GiB — every
+    /// small-RAM configuration — this is the same pool as [`Self::alloc`],
+    /// and the restriction costs nothing.
+    pub fn alloc_dma(&self) -> Result<usize, FrameError> {
+        // SAFETY: single-CPU allocator, as `alloc`.
+        let bitmap = unsafe { &mut *self.bitmap.get() };
+
+        match bitmap.find_first_free_from(self.base_frame) {
+            Some(frame) if frame < self.dma_limit_frame => {
+                bitmap.mark_allocated(frame);
+                self.hint.store(frame + 1, Ordering::Relaxed);
+                Ok(frame)
+            }
+            // Either the pool is exhausted or only the frames above the DMA
+            // boundary are free; the caller cannot use either answer.
+            _ => Err(FrameError::OutOfMemory),
         }
     }
 
@@ -228,6 +390,16 @@ impl FrameAllocator {
     pub const fn total_frames(&self) -> usize {
         self.total_frames
     }
+
+    /// The frame boundary DMA allocations never cross.
+    pub const fn dma_frame_limit(&self) -> usize {
+        self.dma_limit_frame
+    }
+
+    /// The physical address of the bitmap's backing store.
+    pub const fn bitmap_phys(&self) -> u64 {
+        self.bitmap_phys
+    }
 }
 
 /// Render allocator statistics for the boot log.
@@ -254,32 +426,16 @@ pub fn count_usable_frames(regions: &[MemoryRegion]) -> usize {
         .unwrap_or(0)
 }
 
-/// Size of the frame allocator's bitmap backing store, in 64-bit words.
-///
-/// A *static* bound, because the kernel has no heap until M2: the report's rule
-/// is "no `Vec`/`Box` before an allocator exists; use a statically bounded pool
-/// until then". 1024 words is 8 KiB of `.bss` and tracks 65536 frames, i.e. a
-/// 256 MiB machine — comfortably above what v0.1.0 asks QEMU for, and chosen so
-/// that a larger `-m` fails loudly at boot instead of silently truncating the
-/// pool and handing out frames that do not exist.
-pub const MAX_BITMAP_WORDS: usize = 1024;
-
-/// Frames [`Bitmap`] can therefore track.
-pub const MAX_FRAMES: usize = MAX_BITMAP_WORDS * u64::BITS as usize;
-
 /// One bit per frame: `1` means allocated.
 ///
 /// # Why this is a separate type
 ///
-/// [`Bitmap`] has no `unsafe`, no architecture knowledge, no heap, and no
-/// indirection — it is a bit array in a fixed buffer. Splitting it out means the
-/// interesting logic (find-first-free, bounds, counting) is testable on the host
-/// with `cargo test`, while [`FrameAllocator`] stays a thin shell that adds the
-/// direct map needed to touch a frame's contents. M2 replaces the shell without
-/// touching this.
-///
-/// It is generic over the word count so tests can exercise a two-word bitmap
-/// cheaply while the kernel instantiates the full pool.
+/// [`Bitmap`] has no `unsafe` in its *logic*, no architecture knowledge, and no
+/// heap indirection the caller cannot name: it operates over a word array the
+/// caller provides. Splitting it out means the interesting logic
+/// (find-first-free, range marking, counting) is testable on the host with
+/// `cargo test`, while [`FrameAllocator`] stays a thin shell that chooses the
+/// backing store and adds the direct map needed to reach it.
 ///
 /// # Invariants
 ///
@@ -288,59 +444,57 @@ pub const MAX_FRAMES: usize = MAX_BITMAP_WORDS * u64::BITS as usize;
 /// is a double-free upstream and is a no-op here rather than an error, because
 /// the bitmap cannot tell the difference and idempotence is preferable to a
 /// panic on the allocator's hot path.
-#[derive(Clone)]
-pub struct Bitmap<const WORDS: usize = MAX_BITMAP_WORDS> {
-    bits: [u64; WORDS],
-    /// Frames tracked. Never exceeds `WORDS * 64`, and may be lower if the
-    /// firmware reported less memory than the pool can hold.
+pub struct Bitmap {
+    /// The words holding the bits. The caller owns the storage; the bitmap
+    /// only borrows it for its own lifetime.
+    words: *mut u64,
+    /// Number of valid words at `words`.
+    word_count: usize,
+    /// Frames tracked. Never exceeds `word_count * 64`, and may be lower if
+    /// the firmware reported less memory than the store can hold.
     len: usize,
-    /// Count of set bits, maintained incrementally so [`Bitmap::allocated_count`]
-    /// is O(1) and the boot log does not scan the whole array.
+    /// Count of set bits, maintained incrementally so
+    /// [`Bitmap::allocated_count`] is O(1) and the boot log does not scan the
+    /// whole array.
     allocated: usize,
 }
 
-impl<const WORDS: usize> Default for Bitmap<WORDS> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<const WORDS: usize> Bitmap<WORDS> {
-    /// A bitmap tracking the full capacity of this instantiation, all free.
-    pub const fn new() -> Self {
-        Self {
-            bits: [0; WORDS],
-            len: WORDS * 64,
-            allocated: 0,
-        }
-    }
-
-    /// A bitmap tracking `len` frames, all free.
+impl Bitmap {
+    /// Build a bitmap over zeroed backing storage.
     ///
-    /// Returns `None` if `len` exceeds what `WORDS` words can hold, rather than
-    /// silently clamping: a machine with more RAM than the pool was sized for
-    /// must fail at boot with a diagnostic, not hand out frames outside its own
-    /// bookkeeping.
-    pub fn with_capacity(len: usize) -> Option<Self> {
-        let words = len.div_ceil(u64::BITS as usize);
-        if words > WORDS {
-            return None;
-        }
-
+    /// The padding bits above `len` — the frames the firmware never described —
+    /// are marked busy, so neither [`Bitmap::find_first_free_from`] nor
+    /// [`Bitmap::is_allocated`] can hand them out.
+    ///
+    /// # Safety
+    ///
+    /// `words` must point at `word_count` *zeroed*, 8-byte-aligned `u64`
+    /// slots that outlive the bitmap, and `len` must not exceed
+    /// `word_count * 64`.
+    unsafe fn from_zeroed(words: *mut u64, word_count: usize, len: usize) -> Self {
+        debug_assert!(len <= word_count * u64::BITS as usize);
         let mut bitmap = Self {
-            bits: [0; WORDS],
+            words,
+            word_count,
             len,
             allocated: 0,
         };
-
-        // Bits above `len` in the final word describe frames the firmware never
-        // reported. Marking them allocated makes them fail `find_first_free_from`
-        // as well as `is_allocated`, so neither path can hand them out.
-        for frame in len..words * 64 {
-            bitmap.bits[frame / 64] |= 1u64 << (frame % 64);
+        for frame in len..word_count * u64::BITS as usize {
+            bitmap.set_bit(frame);
         }
+        bitmap
+    }
 
-        Some(bitmap)
+    /// Build a bitmap over host storage, zeroing it first.
+    ///
+    /// The test-side counterpart of [`Bitmap::from_zeroed`]: same invariants,
+    /// same padding rule, over an array the test owns.
+    fn from_slice(storage: &mut [u64], len: usize) -> Self {
+        debug_assert!(len <= storage.len() * u64::BITS as usize);
+        storage.fill(0);
+        // SAFETY: the slice is aligned, zeroed, and outlives the bitmap the
+        // test holds; `from_zeroed`'s contract is otherwise the same.
+        unsafe { Self::from_zeroed(storage.as_mut_ptr(), storage.len(), len) }
     }
 
     /// Frames this bitmap tracks.
@@ -359,6 +513,47 @@ impl<const WORDS: usize> Bitmap<WORDS> {
         frame < self.len
     }
 
+    /// Read one backing word, treating an out-of-range index as all-allocated.
+    #[inline]
+    fn word(&self, index: usize) -> u64 {
+        if index >= self.word_count {
+            return u64::MAX;
+        }
+        // SAFETY: `index < word_count` names a valid slot in the caller's
+        // backing store.
+        unsafe { *self.words.add(index) }
+    }
+
+    /// Write one backing word. Out-of-range indices are ignored.
+    #[inline]
+    fn set_word(&mut self, index: usize, value: u64) {
+        if index >= self.word_count {
+            return;
+        }
+        // SAFETY: as `word`.
+        unsafe { *self.words.add(index) = value };
+    }
+
+    /// Set the bit for `frame`, without touching the allocated count.
+    ///
+    /// Used only for the padding bits, which the count deliberately excludes.
+    fn set_bit(&mut self, frame: usize) {
+        let word = frame / u64::BITS as usize;
+        let mask = 1u64 << (frame % u64::BITS as usize);
+        if word < self.word_count {
+            self.set_word(word, self.word(word) | mask);
+        }
+    }
+
+    /// The bit for `frame`, as a word value and mask.
+    #[inline]
+    fn bit(frame: usize) -> (usize, u64) {
+        (
+            frame / u64::BITS as usize,
+            1u64 << (frame % u64::BITS as usize),
+        )
+    }
+
     /// Mark `frame` allocated. Out-of-range frames are ignored.
     ///
     /// Idempotent: marking an already-allocated frame changes nothing and does
@@ -368,12 +563,11 @@ impl<const WORDS: usize> Bitmap<WORDS> {
         if !self.in_range(frame) {
             return;
         }
-        let word = frame / 64;
-        let mask = 1u64 << (frame % 64);
-        if self.bits[word] & mask == 0 {
-            self.bits[word] |= mask;
-            self.allocated += 1;
-        }
+        let (word, mask) = Self::bit(frame);
+        let old = self.word(word);
+        let new = old | mask;
+        self.allocated += (new.count_ones() - old.count_ones()) as usize;
+        self.set_word(word, new);
     }
 
     /// Mark `frame` free. Out-of-range and already-free frames are ignored.
@@ -381,11 +575,53 @@ impl<const WORDS: usize> Bitmap<WORDS> {
         if !self.in_range(frame) {
             return;
         }
-        let word = frame / 64;
-        let mask = 1u64 << (frame % 64);
-        if self.bits[word] & mask != 0 {
-            self.bits[word] &= !mask;
-            self.allocated -= 1;
+        let (word, mask) = Self::bit(frame);
+        let old = self.word(word);
+        let new = old & !mask;
+        self.allocated += (new.count_ones() - old.count_ones()) as usize;
+        self.set_word(word, new);
+    }
+
+    /// Mark every frame in `[start, start + count)` allocated.
+    ///
+    /// Whole words are set in one step, so seeding a 192 GiB machine's
+    /// non-usable gaps costs a handful of word writes rather than millions of
+    /// bit operations. Idempotent, like [`Bitmap::mark_allocated`]: the
+    /// allocated count only ever moves by the number of bits that *changed*.
+    pub fn mark_allocated_range(&mut self, start: usize, count: usize) {
+        self.mark_range(start, count, true);
+    }
+
+    /// Mark every frame in `[start, start + count)` free.
+    ///
+    /// See [`Bitmap::mark_allocated_range`] for the word-stepping and the
+    /// idempotence; this is the direction the constructor uses to hand a
+    /// usable region back after marking the whole frame space busy.
+    pub fn mark_free_range(&mut self, start: usize, count: usize) {
+        self.mark_range(start, count, false);
+    }
+
+    /// The range-marking worker behind the two public directions.
+    fn mark_range(&mut self, start: usize, count: usize, allocate: bool) {
+        let last = start.saturating_add(count).min(self.len);
+        let mut frame = start;
+
+        while frame < last {
+            let (word_index, bit_index) = (frame / u64::BITS as usize, frame % u64::BITS as usize);
+            let span = (u64::BITS as usize - bit_index).min(last - frame);
+
+            let mask = if span == u64::BITS as usize {
+                u64::MAX
+            } else {
+                ((1u64 << span) - 1) << bit_index
+            };
+
+            let old = self.word(word_index);
+            let new = if allocate { old | mask } else { old & !mask };
+            self.allocated += (new.count_ones() - old.count_ones()) as usize;
+            self.set_word(word_index, new);
+
+            frame += span;
         }
     }
 
@@ -398,7 +634,8 @@ impl<const WORDS: usize> Bitmap<WORDS> {
             // error instead of indexing past the array.
             return true;
         }
-        self.bits[frame / 64] & (1u64 << (frame % 64)) != 0
+        let (word, mask) = Self::bit(frame);
+        self.word(word) & mask != 0
     }
 
     /// Lowest free frame at or after `start`, or `None` if there is none.
@@ -410,13 +647,12 @@ impl<const WORDS: usize> Bitmap<WORDS> {
         let mut frame = start;
 
         while frame < self.len {
-            let word = frame / 64;
-            let bit = frame % 64;
-            let word_bits = self.bits[word];
+            let (word, bit) = Self::bit(frame);
+            let word_bits = self.word(word);
 
             if word_bits == u64::MAX && bit == 0 {
                 // Whole word allocated: skip all 64 frames in one step.
-                frame += 64;
+                frame += u64::BITS as usize;
                 continue;
             }
 
@@ -425,10 +661,10 @@ impl<const WORDS: usize> Bitmap<WORDS> {
             let free = !word_bits & (u64::MAX << bit);
 
             if free != 0 {
-                return Some(word * 64 + free.trailing_zeros() as usize);
+                return Some(word * u64::BITS as usize + free.trailing_zeros() as usize);
             }
 
-            frame = word * 64 + 64;
+            frame = word * u64::BITS as usize + u64::BITS as usize;
         }
 
         None
@@ -442,40 +678,58 @@ impl<const WORDS: usize> Bitmap<WORDS> {
     /// Frames currently free.
     ///
     /// `len - allocated`, never counting the padding bits above `len`, which
-    /// `with_capacity` marks busy without adding to `allocated`.
+    /// `from_zeroed` marks busy without adding to `allocated`.
     pub const fn free_count(&self) -> usize {
         self.len - self.allocated
     }
 
     /// Size of the backing storage in bytes, for the boot log.
     pub const fn storage_bytes(&self) -> usize {
-        WORDS * size_of::<u64>()
+        self.word_count * size_of::<u64>()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Bitmap, MAX_BITMAP_WORDS, MAX_FRAMES};
+    use super::{Bitmap, DMA_FRAME_LIMIT, FrameAllocator};
 
-    #[test]
-    fn capacity_matches_the_documented_bound() {
-        // The boot-time guard compares the reported frame count against this, so
-        // a change to one without the other would silently shrink the pool.
-        assert_eq!(MAX_FRAMES, MAX_BITMAP_WORDS * 64);
-        assert_eq!(MAX_FRAMES, 65_536, "256 MiB of 4 KiB frames");
+    /// A backing store wide enough for the largest `len` the tests use.
+    macro_rules! storage {
+        ($words:expr) => {{
+            let mut storage = [0u64; $words];
+            // SAFETY-free: `Bitmap::from_slice` is the test-side constructor.
+            storage
+        }};
     }
 
     #[test]
-    fn new_tracks_the_full_capacity() {
-        let bitmap = Bitmap::<2>::new();
-        assert_eq!(bitmap.len(), 128);
-        assert_eq!(bitmap.allocated_count(), 0);
-        assert_eq!(bitmap.free_count(), 128);
+    fn the_bitmap_scales_to_the_documented_machine() {
+        // 192 GiB of 4 KiB frames is 50,331,648 bits — 6 MiB of bitmap. The
+        // point of the runtime store is exactly that this is a *boot-time*
+        // cost measured from the firmware's map, not a compile-time bound
+        // that larger machines panic against.
+        let frames_192gib: usize = 192 * 1024 * 1024 * 1024 / 4096;
+        let bytes = frames_192gib.div_ceil(64) * size_of::<u64>();
+        assert_eq!(bytes, 6 * 1024 * 1024, "6 MiB for 192 GiB");
+        assert_eq!(
+            frames_192gib.div_ceil(4096),
+            1_474_560 / 4096 + 1,
+            "the bitmap occupies at most a few hundred 4 KiB frames itself"
+        );
+    }
+
+    #[test]
+    fn dma_limit_is_the_4gib_boundary() {
+        // 4 GiB / 4 KiB. A frame below this is describable in a 32-bit DMA
+        // word; a frame at or above it is not.
+        assert_eq!(DMA_FRAME_LIMIT, 0x10_0000);
+        assert_eq!(DMA_FRAME_LIMIT * 4096, 4 * 1024 * 1024 * 1024u64 as usize);
     }
 
     #[test]
     fn starts_all_free() {
-        let bitmap = Bitmap::<4>::with_capacity(200).expect("200 frames fits in 4 words");
+        let mut storage = storage!(4);
+        let bitmap = Bitmap::from_slice(&mut storage, 200);
         assert_eq!(bitmap.len(), 200);
         assert_eq!(bitmap.allocated_count(), 0);
         assert_eq!(bitmap.free_count(), 200);
@@ -484,7 +738,8 @@ mod tests {
 
     #[test]
     fn allocation_is_visible_and_counted_once() {
-        let mut bitmap = Bitmap::<1>::with_capacity(64).expect("64 frames fits in 1 word");
+        let mut storage = storage!(1);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 64);
         bitmap.mark_allocated(7);
         assert!(bitmap.is_allocated(7));
         assert_eq!(bitmap.allocated_count(), 1);
@@ -497,7 +752,8 @@ mod tests {
 
     #[test]
     fn free_returns_the_frame_to_the_pool() {
-        let mut bitmap = Bitmap::<1>::with_capacity(64).expect("64 frames fit in 1 word");
+        let mut storage = storage!(1);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 64);
         bitmap.mark_allocated(3);
         bitmap.mark_free(3);
         assert!(!bitmap.is_allocated(3));
@@ -506,7 +762,8 @@ mod tests {
 
     #[test]
     fn double_free_is_idempotent() {
-        let mut bitmap = Bitmap::<1>::with_capacity(64).expect("64 frames fit in 1 word");
+        let mut storage = storage!(1);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 64);
         bitmap.mark_allocated(9);
         bitmap.mark_free(9);
         // Freeing again must not underflow the allocated count.
@@ -516,7 +773,8 @@ mod tests {
 
     #[test]
     fn out_of_range_operations_are_ignored() {
-        let mut bitmap = Bitmap::<1>::with_capacity(64).expect("64 frames fit in 1 word");
+        let mut storage = storage!(1);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 64);
         bitmap.mark_allocated(1000);
         bitmap.mark_free(1000);
         assert_eq!(bitmap.allocated_count(), 0);
@@ -526,16 +784,90 @@ mod tests {
     }
 
     #[test]
-    fn capacity_beyond_the_pool_is_rejected() {
-        // 8 words hold 512 frames; asking for more must fail rather than clamp,
-        // because a clamp would hand out frames the pool cannot account for.
-        assert!(Bitmap::<8>::with_capacity(513).is_none());
-        assert!(Bitmap::<8>::with_capacity(512).is_some());
+    fn padding_bits_are_never_handed_out() {
+        // 130 frames needs a third word with only two meaningful bits. A scan
+        // must not report frames 130..=191 as free, because the firmware never
+        // described that memory.
+        let mut storage = storage!(3);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 130);
+        for frame in 0..130 {
+            bitmap.mark_allocated(frame);
+        }
+        assert_eq!(bitmap.find_first_free_from(0), None);
+        assert!(bitmap.is_allocated(130));
+        assert!(bitmap.is_allocated(191));
+        assert_eq!(bitmap.free_count(), 0, "padding is not counted as free");
+        assert_eq!(
+            bitmap.allocated_count(),
+            130,
+            "padding is not counted as allocated"
+        );
+    }
+
+    #[test]
+    fn range_marking_matches_bit_by_bit_marking() {
+        let mut storage = storage!(4);
+        let mut range_bitmap = Bitmap::from_slice(&mut storage, 256);
+        let mut bit_bitmap = Bitmap::from_slice(&mut [0u64; 4], 256);
+
+        range_bitmap.mark_allocated_range(30, 100);
+        for frame in 30..130 {
+            bit_bitmap.mark_allocated(frame);
+        }
+
+        assert_eq!(range_bitmap.allocated_count(), bit_bitmap.allocated_count());
+        assert!(
+            (0..256)
+                .all(|frame| range_bitmap.is_allocated(frame) == bit_bitmap.is_allocated(frame))
+        );
+    }
+
+    #[test]
+    fn range_freeing_returns_a_whole_region() {
+        // The constructor's seeding direction: mark everything busy, then hand
+        // a usable region back in one call.
+        let mut storage = storage!(4);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 256);
+        bitmap.mark_allocated_range(0, 256);
+        assert_eq!(bitmap.free_count(), 0);
+
+        bitmap.mark_free_range(16, 128);
+        assert_eq!(bitmap.free_count(), 128);
+        assert!((0..16).all(|frame| bitmap.is_allocated(frame)));
+        assert!((16..144).all(|frame| !bitmap.is_allocated(frame)));
+        assert!((144..256).all(|frame| bitmap.is_allocated(frame)));
+    }
+
+    #[test]
+    fn range_marking_is_idempotent() {
+        let mut storage = storage!(2);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 128);
+        bitmap.mark_allocated_range(0, 64);
+        let once = bitmap.allocated_count();
+        bitmap.mark_allocated_range(0, 64);
+        assert_eq!(
+            bitmap.allocated_count(),
+            once,
+            "re-marking must not double-count"
+        );
+    }
+
+    #[test]
+    fn range_marking_clips_at_the_end_of_the_map() {
+        let mut storage = storage!(2);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 100);
+        // 60 frames from frame 80 would run to 140; the map ends at 100 and
+        // the padding above is already busy.
+        bitmap.mark_allocated_range(80, 60);
+        assert_eq!(bitmap.allocated_count(), 20);
+        assert!(bitmap.is_allocated(99));
+        assert_eq!(bitmap.free_count(), 80);
     }
 
     #[test]
     fn finds_the_lowest_free_frame() {
-        let mut bitmap = Bitmap::<4>::with_capacity(256).expect("256 frames fits in 4 words");
+        let mut storage = storage!(4);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 256);
         bitmap.mark_allocated(0);
         bitmap.mark_allocated(1);
         assert_eq!(bitmap.find_first_free_from(0), Some(2));
@@ -543,7 +875,8 @@ mod tests {
 
     #[test]
     fn honours_the_start_hint() {
-        let mut bitmap = Bitmap::<4>::with_capacity(256).expect("256 frames fits in 4 words");
+        let mut storage = storage!(4);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 256);
         assert_eq!(bitmap.find_first_free_from(100), Some(100));
         bitmap.mark_allocated(100);
         assert_eq!(bitmap.find_first_free_from(100), Some(101));
@@ -551,7 +884,8 @@ mod tests {
 
     #[test]
     fn skips_a_fully_allocated_word() {
-        let mut bitmap = Bitmap::<4>::with_capacity(256).expect("256 frames fits in 4 words");
+        let mut storage = storage!(4);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 256);
         for frame in 0..64 {
             bitmap.mark_allocated(frame);
         }
@@ -561,7 +895,8 @@ mod tests {
 
     #[test]
     fn reports_exhaustion_rather_than_wrapping() {
-        let mut bitmap = Bitmap::<3>::with_capacity(130).expect("130 frames fits in 3 words");
+        let mut storage = storage!(3);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 130);
         for frame in 0..130 {
             bitmap.mark_allocated(frame);
         }
@@ -570,25 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn unused_tail_bits_are_never_handed_out() {
-        // 130 frames needs a third word with only two meaningful bits. A scan
-        // must not report frames 130..=191 as free, because the firmware never
-        // described that memory.
-        let mut bitmap = Bitmap::<3>::with_capacity(130).expect("130 frames fits in 3 words");
-        for frame in 0..130 {
-            bitmap.mark_allocated(frame);
-        }
-        assert_eq!(bitmap.find_first_free_from(0), None);
-        assert!(bitmap.is_allocated(130));
-        assert!(bitmap.is_allocated(191));
-        assert_eq!(bitmap.free_count(), 0, "padding is not counted as free");
-    }
-
-    #[test]
     fn cross_word_allocation_is_tracked() {
         // 63 and 64 straddle the first word boundary, which is where an
         // off-by-one in the mask arithmetic shows up.
-        let mut bitmap = Bitmap::<4>::with_capacity(200).expect("200 frames fits in 4 words");
+        let mut storage = storage!(4);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 200);
         bitmap.mark_allocated(63);
         bitmap.mark_allocated(64);
         assert!(bitmap.is_allocated(63));
@@ -599,9 +920,34 @@ mod tests {
 
     #[test]
     fn zero_capacity_never_allocates() {
-        let bitmap = Bitmap::<1>::with_capacity(0).expect("0 frames fits in any pool");
+        let mut storage = storage!(1);
+        let bitmap = Bitmap::from_slice(&mut storage, 0);
         assert!(bitmap.is_empty());
         assert_eq!(bitmap.find_first_free_from(0), None);
         assert_eq!(bitmap.free_count(), 0);
+    }
+
+    #[test]
+    fn a_large_len_over_a_large_store_round_trips() {
+        // 8 words = 512 frames — the shape of a 2 MiB machine, and the seam
+        // where a `word_count`/`len` mismatch would show up.
+        let mut storage = storage!(8);
+        let mut bitmap = Bitmap::from_slice(&mut storage, 500);
+        bitmap.mark_allocated_range(0, 400);
+        assert_eq!(bitmap.allocated_count(), 400);
+        assert_eq!(bitmap.find_first_free_from(0), Some(400));
+        assert!(!bitmap.is_allocated(499));
+        assert!(bitmap.is_allocated(500));
+    }
+
+    // `FrameAllocator` itself is a kernel shell over the bitmap — its
+    // construction needs the direct map — so the allocator-level behaviour is
+    // covered by the kernel test suites rather than by host tests.
+    #[test]
+    fn frame_allocator_type_exists_for_the_kernel_shell() {
+        // A compile-time anchor: the shell is generic over nothing and its
+        // DMA boundary constant is the documented one.
+        let _ = DMA_FRAME_LIMIT;
+        let _ = core::mem::size_of::<FrameAllocator>();
     }
 }

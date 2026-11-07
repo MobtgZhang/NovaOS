@@ -60,8 +60,8 @@ rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-limine = "0.6.5"
 nova-abi = { path = "crates/nova-abi" }
+nova-boot = { path = "crates/nova-boot" }
 nova-cap = { path = "crates/nova-cap" }
 nova-core = { path = "crates/nova-core" }
 nova-elf = { path = "crates/nova-elf" }

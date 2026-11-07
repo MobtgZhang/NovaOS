@@ -208,22 +208,65 @@ impl WalkLevel {
 
 /// The result of walking to a leaf.
 struct Leaf {
-    /// The leaf table.
+    /// The table holding the leaf entry.
     table: PageTable,
     /// The index of the entry within it.
     index: usize,
+    /// The byte size of the page the entry describes: 4 KiB for an ordinary
+    /// leaf, 2 MiB for a directory leaf (`PS` at the directory level), or
+    /// 1 GiB for a directory-pointer leaf (`PS` one level up).
+    size: u64,
 }
 
-/// Walk `root` down to the leaf table that holds `address`.
+/// The leaf sizes a walk can produce, named for the call sites that compare
+/// against them.
+pub const P1_PAGE_BYTES: u64 = 0x1000;
+pub const P2_PAGE_BYTES: u64 = 0x20_0000;
+pub const P3_PAGE_BYTES: u64 = 0x4000_0000;
+
+/// The physical address a leaf entry maps for a virtual address.
+///
+/// A huge leaf names the base of its whole 2 MiB or 1 GiB region, so the
+/// offset within the page has to be added back; an ordinary leaf's frame
+/// address *is* the mapped address of the page base. Callers that want a
+/// frame base mask the result themselves.
+fn leaf_physical(entry: u64, virt: u64, size: u64) -> u64 {
+    if size == P1_PAGE_BYTES {
+        return decode_entry(entry);
+    }
+    decode_entry(entry) | (virt & (size - 1))
+}
+
+/// Walk `root` down to the leaf entry that holds `address`.
 ///
 /// Allocates the intermediate tables that do not exist yet. `user` selects
 /// whether the intermediate tables are user-accessible, which is true only for
 /// the user half of an address space.
+///
+/// # Huge pages
+///
+/// The walk stops at the first level whose entry carries the `PS` bit: a
+/// directory-pointer leaf means the walk is over at the *second* level, and a
+/// directory leaf at the third. The returned [`Leaf`]'s `size` field tells the
+/// caller which level it stopped at, and every write through the leaf goes to
+/// that entry rather than to a fourth-level entry that does not exist.
 fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmError> {
     let mut table = *root;
 
-    for level in [WalkLevel::Pml4, WalkLevel::Pdpt, WalkLevel::Pd] {
+    for (level, size) in [
+        (WalkLevel::Pml4, P3_PAGE_BYTES),
+        (WalkLevel::Pdpt, P2_PAGE_BYTES),
+        (WalkLevel::Pd, P1_PAGE_BYTES),
+    ] {
         let index = level.index_of(address);
+
+        let entry = table.read(index);
+        if entry_is_present(entry) && entry_flags(entry).contains(PageFlags::HUGE) {
+            // The entry is itself a leaf. The walk cannot descend further, and
+            // a caller that wanted a fourth-level entry is answered with the
+            // huge entry that *is* the leaf for this address.
+            return Ok(Leaf { table, index, size });
+        }
 
         let child = match table.target(index) {
             Some(phys) => PageTable::at(phys),
@@ -254,6 +297,7 @@ fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmE
     Ok(Leaf {
         table,
         index: WalkLevel::Pt.index_of(address),
+        size: P1_PAGE_BYTES,
     })
 }
 
@@ -263,9 +307,21 @@ fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmE
 /// architectural bit is not part of the ordinary flag word — see
 /// [`NO_EXECUTE`].
 ///
+/// # Huge pages
+///
+/// When the walk reaches a huge leaf (an HHDM built from 2 MiB or 1 GiB
+/// leaves), the entry it reaches *is* the mapping for `virt`. If that mapping
+/// already names `phys`, the call is a no-op — remapping the same address is
+/// idempotent. If it names something else, the call fails with
+/// [`VmmError::AlreadyMapped`] rather than silently splitting the huge page:
+/// a split would unmap the 511 neighbouring pages a caller may still be
+/// using, and no caller here needs one.
+///
 /// # Errors
 ///
-/// [`VmmError::OutOfMemory`] when an intermediate table cannot be allocated.
+/// [`VmmError::OutOfMemory`] when an intermediate table cannot be allocated,
+/// [`VmmError::AlreadyMapped`] when a huge leaf covers `virt` with a
+/// different frame.
 pub fn map(
     root: &PageTable,
     virt: u64,
@@ -275,12 +331,141 @@ pub fn map(
 ) -> Result<(), VmmError> {
     let leaf = walk_to_leaf(root, virt, flags.contains(PageFlags::USER))?;
 
+    if leaf.size != P1_PAGE_BYTES {
+        let entry = leaf.table.read(leaf.index);
+        if leaf_physical(entry, virt, leaf.size) == phys {
+            return Ok(());
+        }
+        return Err(VmmError::AlreadyMapped);
+    }
+
     let mut entry = phys | flags.bits();
     if no_execute {
         entry |= NO_EXECUTE;
     }
 
     leaf.table.write(leaf.index, entry);
+
+    Ok(())
+}
+
+/// Map one huge leaf of `size` bytes at `virt`.
+///
+/// `size` is [`P3_PAGE_BYTES`] for a directory-pointer leaf or
+/// [`P2_PAGE_BYTES`] for a directory leaf; the walk allocates every
+/// intermediate table above the leaf level that does not exist yet. The leaf
+/// entry carries the `HUGE` bit, which is what makes the hardware treat it as
+/// a page rather than a table.
+///
+/// # Errors
+///
+/// [`VmmError::OutOfMemory`] when an intermediate table cannot be allocated.
+fn map_huge(
+    root: &PageTable,
+    virt: u64,
+    phys: u64,
+    size: u64,
+    flags: PageFlags,
+    no_execute: bool,
+) -> Result<(), VmmError> {
+    // The tables *above* the leaf level: the PML4 for a 1 GiB leaf, and the
+    // PML4 plus the directory-pointer table for a 2 MiB one.
+    let above: &[WalkLevel] = if size == P3_PAGE_BYTES {
+        &[WalkLevel::Pml4]
+    } else {
+        &[WalkLevel::Pml4, WalkLevel::Pdpt]
+    };
+
+    let mut table = *root;
+    for level in above {
+        let index = level.index_of(virt);
+        let child = match table.target(index) {
+            Some(child) => PageTable::at(child),
+            None => {
+                let child = allocate_table()?;
+                // The HHDM is a kernel mapping, so the intermediates are
+                // supervisor-only and global, exactly as `walk_to_leaf`
+                // builds them for the kernel half.
+                let entry = encode_entry(
+                    child.phys(),
+                    KERNEL_INTERMEDIATE_FLAGS.union(PageFlags::GLOBAL),
+                );
+                table.write(index, entry);
+                child
+            }
+        };
+        table = child;
+    }
+
+    let index = if size == P3_PAGE_BYTES {
+        WalkLevel::Pdpt.index_of(virt)
+    } else {
+        WalkLevel::Pd.index_of(virt)
+    };
+
+    let mut entry = phys | flags.union(PageFlags::HUGE).bits();
+    if no_execute {
+        entry |= NO_EXECUTE;
+    }
+    table.write(index, entry);
+
+    Ok(())
+}
+
+/// Map a physical range at `virt` using the largest leaves possible.
+///
+/// Each aligned 1 GiB chunk becomes a directory-pointer leaf (when
+/// `one_gib_pages` says the CPU can form one), each aligned 2 MiB chunk a
+/// directory leaf, and everything else 4 KiB pages. A region's unaligned head
+/// and tail therefore cost a handful of 4 KiB pages, and the *body* costs one
+/// entry per 1 GiB or 2 MiB — which is the difference between a handful of
+/// table frames for a 192 GiB machine and the 48 million page-table frames a
+/// 4 KiB-only direct map would need.
+///
+/// The caller guarantees `virt`, `phys`, and `len` are page aligned and that
+/// the range does not overlap an existing mapping: the walk never splits a
+/// huge leaf, so a range that crosses one is answered by [`VmmError::AlreadyMapped`]
+/// from [`map`] rather than by a silent partial mapping.
+///
+/// # Errors
+///
+/// [`VmmError::OutOfMemory`] when a table cannot be allocated, and
+/// [`VmmError::AlreadyMapped`] when any part of the range hits a huge leaf
+/// mapping a different frame.
+pub fn map_range(
+    root: &PageTable,
+    virt: u64,
+    phys: u64,
+    len: u64,
+    flags: PageFlags,
+    no_execute: bool,
+    one_gib_pages: bool,
+) -> Result<(), VmmError> {
+    let mut done = 0u64;
+    while done < len {
+        let v = virt + done;
+        let p = phys + done;
+        let left = len - done;
+
+        if one_gib_pages
+            && v % P3_PAGE_BYTES == 0
+            && p % P3_PAGE_BYTES == 0
+            && left >= P3_PAGE_BYTES
+        {
+            map_huge(root, v, p, P3_PAGE_BYTES, flags, no_execute)?;
+            done += P3_PAGE_BYTES;
+            continue;
+        }
+
+        if v % P2_PAGE_BYTES == 0 && p % P2_PAGE_BYTES == 0 && left >= P2_PAGE_BYTES {
+            map_huge(root, v, p, P2_PAGE_BYTES, flags, no_execute)?;
+            done += P2_PAGE_BYTES;
+            continue;
+        }
+
+        map(root, v, p, flags, no_execute)?;
+        done += P1_PAGE_BYTES;
+    }
 
     Ok(())
 }
@@ -330,15 +515,27 @@ pub fn write_leaf(root: &PageTable, virt: u64, entry: u64) -> Result<(), VmmErro
 }
 
 /// The physical frame mapped at `virt`, if any.
+///
+/// Huge leaves are handled: a 2 MiB or 1 GiB leaf contributes the offset
+/// within its page, so the result is the exact physical address of `virt`
+/// rather than the base of the region it falls in.
 pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
     let mut table = *root;
 
-    for level in [WalkLevel::Pml4, WalkLevel::Pdpt, WalkLevel::Pd] {
+    for (level, size) in [
+        (WalkLevel::Pml4, P3_PAGE_BYTES),
+        (WalkLevel::Pdpt, P2_PAGE_BYTES),
+        (WalkLevel::Pd, P1_PAGE_BYTES),
+    ] {
         let index = level.index_of(virt);
-        match table.target(index) {
-            Some(phys) => table = PageTable::at(phys),
-            None => return None,
+        let entry = table.read(index);
+        if !entry_is_present(entry) {
+            return None;
         }
+        if entry_flags(entry).contains(PageFlags::HUGE) {
+            return Some(leaf_physical(entry, virt, size));
+        }
+        table = PageTable::at(decode_entry(entry));
     }
 
     let index = WalkLevel::Pt.index_of(virt);
