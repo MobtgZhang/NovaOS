@@ -82,9 +82,9 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - `kernel/src/mm/frame.rs:112-120`：机器可用内存超过上限时 `Bitmap::with_capacity` 失败即 `panic!`，并提示"raise MAX_BITMAP_WORDS"。**现代任何一台真实电脑都会在此崩溃**。这是移植性的头号阻塞项。
 - 位图是编译期定长、落在 `.bss`；正确做法是启动期从可用内存里划出位图（或切换到多级空闲列表/buddy）。
 
-### 2.2 `FrameAllocator` 是单 CPU 的 `UnsafeCell`〔设计张力〕**Medium**
+### 2.2 `FrameAllocator` 是单 CPU 的 `UnsafeCell`〔设计张力〕**Medium** → **已修复（2026-11-08）**
 
-- `kernel/src/mm/frame.rs:130`：`bitmap: UnsafeCell<Bitmap>`，文档自认 "M2 replaces this type when preemption makes it genuinely concurrent"。当前靠"中断屏蔽 + 单 CPU"契约成立；一旦 SMP 真正落地（§4），这里是第一个要改的（需要自旋锁或 per-CPU 池）。
+> **已修复**：`bitmap: UnsafeCell<Bitmap>` 改为 `SpinLock<Bitmap>`（与 §3.2 同一把递归 irq-safe 锁）。锁覆盖 `alloc`/`alloc_dma` 的整个 hint-then-rescan 序列（否则两个 CPU 可同时看中同一个空闲位、把一页发给两个主人），seeding/`dealloc`/`stats`/`free_count` 同锁；安全的 `Bitmap` 逻辑未动。virtio net/block 单例同批迁移。
 
 ### 2.3 HHDM 逐 4K 映射、无巨页〔缺陷〕**High**（与 1.2 同根）→ **HHDM 已修（2026-11-08）**
 
@@ -97,7 +97,7 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 - `mm/address_space.rs`：每进程 PML4 只复制上半区（内核区）条目，中间表共享——省内存，但意味着**内核映射的修改必须立即在所有 CPU/所有进程生效**（单 CPU 下天然成立；SMP + 多进程下，改内核页表需要 IPI 或约定只在启动期修改）。文档已意识到，但 SMP 落地时这是隐蔽正确性雷区。
 
-### 2.5 没有内核堆分配器〔未实现〕**High**
+### 2.5 没有内核堆分配器〔未实现〕**High**（下一步）
 
 - 内核没有任何通用 `alloc`：线程栈（`task/mod.rs:336-389` StackPool）、能力表、IPC 通道、socket、mount 表……全部是编译期定长静态数组。这导致：
   - 所有资源都有硬上限（§9.4 汇总），任何超限都是拒绝服务而不是退化降速；
