@@ -16,6 +16,12 @@ uefi = { version = "0.30", features = ["alloc", "global_allocator", "panic_handl
 nova-boot = { workspace = true }
 nova-elf = { workspace = true }
 
+# The menu's text is rendered from the same embedded Iosevka outlines the
+# kernel console draws with — vector glyphs, any size, anti-aliased. A pixel
+# font in the boot manager would make the first screen the user sees the only
+# blurry screen in the system.
+nova-type = { workspace = true }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

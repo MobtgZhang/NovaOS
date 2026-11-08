@@ -32,6 +32,7 @@ pub mod input;
 pub mod mmio;
 pub mod net;
 pub mod pci;
+pub mod screen;
 pub mod virtio;
 
 use crate::klog;

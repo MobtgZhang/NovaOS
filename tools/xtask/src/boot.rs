@@ -268,6 +268,34 @@ pub fn build_esp_image(stage: &Path, image: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Stamp `\EFI\NovaOS\boot-mode` on the built ESP image with `mode`
+/// ("desktop" / "safe" / "test"), so the boot manager's menu selects that
+/// entry directly and skips the interactive wait.
+///
+/// `cargo xtask image` regenerates the image from a fresh `mkfs.fat` every
+/// run, so a marker stamped here can never leak into a later, markerless
+/// build: the next image build starts from an empty filesystem.
+pub fn inject_boot_mode_marker(image: &Path, mode: &str) -> Result<(), String> {
+    // The local holder for the marker's content, written into the target
+    // directory so `mcopy` has a real file to read from.
+    let holder = target_dir().join("novaos").join("boot-mode-marker");
+    fs::write(&holder, mode).map_err(|error| format!("cannot write marker: {error}"))?;
+
+    run_command(
+        &[
+            "mcopy",
+            "-i",
+            image.to_str().ok_or("invalid image path")?,
+            holder.to_str().ok_or("invalid marker path")?,
+            ESP_BOOT_MODE_MARKER_PATH,
+        ],
+        "stamp boot-mode marker",
+    )
+}
+
+/// The marker file's path on the ESP, in mtools' `::`-prefixed spelling.
+const ESP_BOOT_MODE_MARKER_PATH: &str = "::EFI/NovaOS/boot-mode";
+
 /// Run a command, inheriting stdio so the user sees compiler output.
 pub fn run_command(program: &[&str], what: &str) -> Result<(), String> {
     crate::log(&format!("{}: {}", what, program.join(" ")));

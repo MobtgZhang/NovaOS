@@ -850,7 +850,12 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
         // usable physical frame.
         unsafe {
             let source = crate::mm::direct_map::phys_to_virt(phys + offset);
-            crate::arch::console().send_bytes(core::slice::from_raw_parts(source, chunk as usize));
+            let bytes = core::slice::from_raw_parts(source, chunk as usize);
+            crate::arch::console().send_bytes(bytes);
+            // The same bytes go to the screen: a user program's output is
+            // visible on the display the boot manager left behind, not just
+            // over the serial port a test harness reads.
+            crate::drivers::screen::push_bytes(bytes);
         }
 
         copied += chunk;

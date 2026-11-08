@@ -56,7 +56,7 @@ use nova_boot::{
     PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
-use crate::font::{CHAR_SPACING, FONT_HEIGHT, FONT_WIDTH, char_rows, text_width};
+use crate::font::Typeface;
 use crate::load::{
     kernel_entry_vaddr, kernel_page_count, open_esp, parse_kernel_segments, read_file,
 };
@@ -72,6 +72,12 @@ const KERNEL_ELF_PATH: &str = "\\EFI\\NovaOS\\nova-kernel.elf";
 /// `\EFI\NovaOS\initramfs` on the ESP.
 const INITRAMFS_PATH: &str = "\\EFI\\NovaOS\\initramfs";
 
+/// `\EFI\NovaOS\boot-mode` on the ESP: an optional marker file whose content
+/// ("desktop" / "safe" / "test") selects a menu entry directly, skipping the
+/// interactive menu. The test runner writes it so an unattended boot runs the
+/// kernel's suite on the same image a developer boots.
+const BOOT_MODE_MARKER: &str = "\\EFI\\NovaOS\\boot-mode";
+
 /// Snapshot page: one page holds the [`BootProtocol`].
 const SNAPSHOT_PAGES: u64 = 1;
 
@@ -84,6 +90,22 @@ const COLOR_HIGHLIGHT: BltPixel = BltPixel::new(100, 150, 255);
 const COLOR_HIGHLIGHT_TEXT: BltPixel = BltPixel::new(255, 255, 255);
 const COLOR_DIM: BltPixel = BltPixel::new(150, 150, 170);
 const COLOR_BORDER: BltPixel = BltPixel::new(90, 90, 120);
+
+/// Foreground/background pair for one run of blended text.
+#[derive(Clone, Copy)]
+struct TextStyle {
+    /// The ink colour.
+    fg: BltPixel,
+    /// The solid colour behind the text, which the coverage blends against.
+    bg: BltPixel,
+}
+
+impl TextStyle {
+    /// A style over a known flat background.
+    const fn new(fg: BltPixel, bg: BltPixel) -> Self {
+        Self { fg, bg }
+    }
+}
 
 /// A menu entry.
 #[derive(Clone, Copy)]
@@ -107,6 +129,12 @@ const MENU_ITEMS: &[MenuItem] = &[
         label: "Safe Terminal",
         desc: "Boot straight to a terminal",
         boot_mode: BootMode::SafeTerminal.code(),
+    },
+    MenuItem {
+        key: '3',
+        label: "Kernel Test Suite",
+        desc: "Run the kernel test suites and exit",
+        boot_mode: BootMode::Tests.code(),
     },
 ];
 
@@ -243,76 +271,112 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
             }
         };
 
-        // ---------- 5. Main loop: draw the menu, wait for keys ----------
+        // ---------- 5. Marker direct selection, else the interactive menu ----------
+        //
+        // A `boot-mode` marker file on the ESP (written by the test runner)
+        // selects an entry outright and skips the key wait, so an unattended
+        // boot reaches the same hand-off a human picks. Without one, the menu
+        // is interactive as always.
+        let direct_index: Option<usize> =
+            read_file(&mut fs, BOOT_MODE_MARKER).ok().and_then(|data| {
+                let text = core::str::from_utf8(&data).ok()?;
+                match text.trim() {
+                    "desktop" => Some(0),
+                    "safe" => Some(1),
+                    "test" => Some(2),
+                    _ => None,
+                }
+            });
+        if let Some(index) = direct_index {
+            uefi::println!("boot-mode marker: selecting {}", MENU_ITEMS[index].label);
+        }
+
+        let mut typeface = Typeface::new();
         let mut selected_index: usize = 0;
         loop {
+            // Resolve one entry: from the marker once, or from the keyboard.
+            let chosen = match direct_index {
+                Some(index) => index,
+                None => {
+                    {
+                        let mut screen =
+                            borrow_framebuffer(&mut gop, stride, screen_w, screen_h, fmt);
+                        draw_menu(&mut screen, &mut typeface, selected_index);
+                    }
+
+                    let key = wait_for_key(&stdin_handles, bs);
+
+                    match key {
+                        Key::Special(ScanCode::UP) => {
+                            selected_index = selected_index.saturating_sub(1);
+                            continue;
+                        }
+                        Key::Special(ScanCode::DOWN) => {
+                            selected_index = (selected_index + 1).min(MENU_ITEMS.len() - 1);
+                            continue;
+                        }
+                        Key::Printable(ch) => {
+                            let c = char::from(ch);
+                            let picked = match c {
+                                '1' => Some(0),
+                                '2' => Some(1),
+                                '3' => Some(2),
+                                '\r' | '\n' => Some(selected_index),
+                                _ => None,
+                            };
+                            match picked {
+                                Some(index) => index,
+                                None => continue,
+                            }
+                        }
+                        Key::Special(ScanCode::ESCAPE) => {
+                            uefi::println!("boot aborted by user");
+                            return Err(Status::ABORTED);
+                        }
+                        _ => continue,
+                    }
+                }
+            };
+
+            // Redraw with the selection applied so the user sees the result —
+            // and, on a marker boot, paint the menu once so the screen is not
+            // left blank for the duration of the load.
             {
                 let mut screen = borrow_framebuffer(&mut gop, stride, screen_w, screen_h, fmt);
-                draw_menu(&mut screen, selected_index);
+                draw_menu(&mut screen, &mut typeface, chosen);
             }
+            uefi::println!(
+                "selected: {} ({})",
+                MENU_ITEMS[chosen].label,
+                MENU_ITEMS[chosen].desc
+            );
 
-            let key = wait_for_key(&stdin_handles, bs);
-
-            let mut should_boot = false;
-            match key {
-                Key::Special(ScanCode::UP) => {
-                    selected_index = selected_index.saturating_sub(1);
-                }
-                Key::Special(ScanCode::DOWN) => {
-                    selected_index = (selected_index + 1).min(MENU_ITEMS.len() - 1);
-                }
-                Key::Printable(ch) => {
-                    let c = char::from(ch);
-                    if c == '\r' || c == '\n' || c == '1' || c == '2' {
-                        if c == '1' {
-                            selected_index = 0;
-                        } else if c == '2' {
-                            selected_index = 1;
-                        }
-                        should_boot = true;
-                    } else {
-                        continue;
+            // ---------- 6. Load the kernel and initramfs ----------
+            let boot_mode = MENU_ITEMS[chosen].boot_mode;
+            match boot_kernel(
+                bs,
+                &mut gop,
+                &mut fs,
+                screen_w,
+                screen_h,
+                stride,
+                fmt,
+                chosen as u16,
+                boot_mode,
+                processors,
+                &mut typeface,
+            ) {
+                Ok(handoff) => return Ok(handoff),
+                Err(error) => {
+                    uefi::println!("boot failed: {:?}", error);
+                    if direct_index.is_some() {
+                        // An unattended boot cannot be asked to retry: report
+                        // the failure rather than looping on the same marker
+                        // forever.
+                        return Err(Status::UNSUPPORTED);
                     }
-                }
-                Key::Special(ScanCode::ESCAPE) => {
-                    uefi::println!("boot aborted by user");
-                    return Err(Status::ABORTED);
-                }
-                _ => {}
-            }
-
-            if should_boot {
-                // Redraw with the selection applied so the user sees the result.
-                {
-                    let mut screen = borrow_framebuffer(&mut gop, stride, screen_w, screen_h, fmt);
-                    draw_menu(&mut screen, selected_index);
-                }
-                uefi::println!(
-                    "selected: {} ({})",
-                    MENU_ITEMS[selected_index].label,
-                    MENU_ITEMS[selected_index].desc
-                );
-
-                // ---------- 6. Load the kernel and initramfs ----------
-                let boot_mode = MENU_ITEMS[selected_index].boot_mode;
-                match boot_kernel(
-                    bs,
-                    &mut gop,
-                    &mut fs,
-                    screen_w,
-                    screen_h,
-                    stride,
-                    fmt,
-                    selected_index as u16,
-                    boot_mode,
-                    processors,
-                ) {
-                    Ok(handoff) => return Ok(handoff),
-                    Err(error) => {
-                        uefi::println!("boot failed: {:?}", error);
-                        uefi::println!("press any key to retry");
-                        let _ = wait_for_key(&stdin_handles, bs);
-                    }
+                    uefi::println!("press any key to retry");
+                    let _ = wait_for_key(&stdin_handles, bs);
                 }
             }
         }
@@ -411,34 +475,97 @@ impl Screen<'_> {
         }
     }
 
-    /// Draw text, scaling each 5x7 glyph by `scale`, clipped.
-    fn draw_text(&mut self, mut x: usize, y: usize, text: &str, color: BltPixel, scale: usize) {
+    /// Write one raw RGB triple, clipped, in the framebuffer's component
+    /// order. Text blending composites in RGB space and lands here.
+    fn put_rgb(&mut self, x: usize, y: usize, red: u8, green: u8, blue: u8) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let base = (y * self.stride + x) * 4;
+        if base + 3 >= self.fb.len() {
+            return;
+        }
+        let (c0, c1, c2) = if self.fmt == PixelFormat::Rgb {
+            (red, green, blue)
+        } else {
+            (blue, green, red)
+        };
+        self.fb[base] = c0;
+        self.fb[base + 1] = c1;
+        self.fb[base + 2] = c2;
+        self.fb[base + 3] = 0;
+    }
+
+    /// Draw one line of vector text from `typeface`, anti-aliased.
+    ///
+    /// `y` is the top of the text's ascent box; the baseline sits `ascent`
+    /// pixels below it. Every glyph's coverage alpha-blends between the
+    /// style's background (the solid colour behind the text — passed
+    /// explicitly because menu text is always drawn over a known flat fill)
+    /// and its foreground, computed in RGB space before the framebuffer's
+    /// component order is applied.
+    fn draw_text(
+        &mut self,
+        typeface: &mut Typeface,
+        mut pen_x: usize,
+        y: usize,
+        text: &str,
+        style: TextStyle,
+        size: u32,
+    ) {
+        let baseline = y as i64 + i64::from(typeface.ascent(size));
+        let fg = (style.fg.red, style.fg.green, style.fg.blue);
+        let bg = (style.bg.red, style.bg.green, style.bg.blue);
+
         for ch in text.chars() {
-            if let Some(rows) = char_rows(ch) {
-                for row in 0..FONT_HEIGHT {
-                    for col in 0..FONT_WIDTH {
-                        if rows[row * FONT_WIDTH + col] {
-                            let px = x + col * scale;
-                            let py = y + row * scale;
-                            for dy in 0..scale {
-                                for dx in 0..scale {
-                                    self.set_pixel(px + dx, py + dy, color);
-                                }
-                            }
-                        }
+            let Some((bitmap, advance)) = typeface.glyph(ch, size) else {
+                continue;
+            };
+
+            let origin_x = pen_x as i64 + i64::from(bitmap.left);
+            let origin_y = baseline - i64::from(bitmap.top);
+
+            for row in 0..bitmap.height {
+                let py = origin_y + i64::from(row);
+                for column in 0..bitmap.width {
+                    let alpha =
+                        bitmap.coverage[row as usize * bitmap.width as usize + column as usize];
+                    if alpha == 0 {
+                        continue;
                     }
+                    let px = origin_x + i64::from(column);
+                    // `put_rgb` clips against unsigned bounds, so negative
+                    // coordinates are filtered here first.
+                    if px < 0 || py < 0 {
+                        continue;
+                    }
+                    let (r, g, b) = mix(fg, bg, alpha);
+                    self.put_rgb(px as usize, py as usize, r, g, b);
                 }
             }
-            x = x.saturating_add((FONT_WIDTH + CHAR_SPACING) * scale);
-            if x >= self.width {
+
+            pen_x = pen_x.saturating_add(advance as usize);
+            if pen_x >= self.width {
                 break;
             }
         }
     }
 }
 
+/// Composite one sRGB channel pair at `alpha` coverage (0..=255).
+fn mix(fg: (u8, u8, u8), bg: (u8, u8, u8), alpha: u8) -> (u8, u8, u8) {
+    let a = u32::from(alpha);
+    let channel =
+        |f: u8, b: u8| -> u8 { ((u32::from(f) * a + u32::from(b) * (255 - a) + 127) / 255) as u8 };
+    (
+        channel(fg.0, bg.0),
+        channel(fg.1, bg.1),
+        channel(fg.2, bg.2),
+    )
+}
+
 /// Draw the complete menu screen.
-fn draw_menu(screen: &mut Screen, selected: usize) {
+fn draw_menu(screen: &mut Screen, typeface: &mut Typeface, selected: usize) {
     let (screen_w, screen_h) = (screen.width, screen.height);
 
     screen.fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
@@ -453,11 +580,12 @@ fn draw_menu(screen: &mut Screen, selected: usize) {
     let title_h = 56;
     screen.fill_rect(panel_x, panel_y, panel_w, title_h, COLOR_TITLE_BG);
     screen.draw_text(
+        typeface,
         panel_x + 24,
-        panel_y + 16,
+        panel_y + 12,
         "NovaOS Boot Menu",
-        COLOR_TEXT,
-        2,
+        TextStyle::new(COLOR_TEXT, COLOR_TITLE_BG),
+        32,
     );
 
     let item_h = 64;
@@ -467,6 +595,11 @@ fn draw_menu(screen: &mut Screen, selected: usize) {
     for (index, item) in MENU_ITEMS.iter().enumerate() {
         let item_y = item_y0 + index * (item_h + gap);
         let is_selected = index == selected;
+        let row_bg = if is_selected {
+            COLOR_HIGHLIGHT
+        } else {
+            COLOR_PANEL
+        };
 
         if is_selected {
             screen.fill_rect(panel_x + 40, item_y, panel_w - 80, item_h, COLOR_HIGHLIGHT);
@@ -477,40 +610,56 @@ fn draw_menu(screen: &mut Screen, selected: usize) {
         key_text.push('.');
         key_text.push(' ');
         screen.draw_text(
+            typeface,
             panel_x + 64,
-            item_y + 14,
+            item_y + 12,
             &key_text,
-            if is_selected {
-                COLOR_HIGHLIGHT_TEXT
-            } else {
-                COLOR_DIM
-            },
-            2,
+            TextStyle::new(
+                if is_selected {
+                    COLOR_HIGHLIGHT_TEXT
+                } else {
+                    COLOR_DIM
+                },
+                row_bg,
+            ),
+            24,
         );
 
         screen.draw_text(
+            typeface,
             panel_x + 110,
-            item_y + 14,
+            item_y + 12,
             item.label,
-            if is_selected {
-                COLOR_HIGHLIGHT_TEXT
-            } else {
-                COLOR_TEXT
-            },
-            2,
+            TextStyle::new(
+                if is_selected {
+                    COLOR_HIGHLIGHT_TEXT
+                } else {
+                    COLOR_TEXT
+                },
+                row_bg,
+            ),
+            24,
         );
 
-        screen.draw_text(panel_x + 110, item_y + 38, item.desc, COLOR_DIM, 1);
+        screen.draw_text(
+            typeface,
+            panel_x + 110,
+            item_y + 42,
+            item.desc,
+            TextStyle::new(COLOR_DIM, row_bg),
+            16,
+        );
     }
 
-    let hint = "Up/Down: navigate   Enter: select   1/2: direct   Esc: abort";
-    let hint_w = text_width(hint);
+    let hint = "Up/Down: navigate   Enter: select   1/2/3: direct   Esc: abort";
+    let hint_w = typeface.text_width(hint, 16);
     screen.draw_text(
-        panel_x + (panel_w - hint_w) / 2,
+        typeface,
+        panel_x + (panel_w.saturating_sub(hint_w)) / 2,
         panel_y + panel_h - 32,
         hint,
-        COLOR_DIM,
-        1,
+        TextStyle::new(COLOR_DIM, COLOR_PANEL),
+        16,
     );
 }
 
@@ -574,6 +723,7 @@ fn boot_kernel(
     selected_entry: u16,
     boot_mode: u16,
     processors: acpi::ProcessorTable,
+    typeface: &mut Typeface,
 ) -> Result<BootHandoff, String> {
     // ---- 6a. Read the kernel ELF and initramfs ----
     let elf_data = read_file(fs, KERNEL_ELF_PATH)
@@ -757,6 +907,25 @@ fn boot_kernel(
         count,
         entry_vaddr
     );
+
+    // The last screen the boot manager paints: the menu is gone and the
+    // kernel has not drawn yet, so say what the pause is. Clearing to the
+    // background colour first keeps the hand-off screen legible even when
+    // the kernel's console never comes up (headless, no GOP hand-off).
+    {
+        let mut screen = borrow_framebuffer(gop, stride, screen_w, screen_h, fmt);
+        screen.fill_rect(0, 0, screen_w, screen_h, COLOR_BG);
+        let message = "loading kernel...";
+        let text_w = typeface.text_width(message, 24);
+        screen.draw_text(
+            typeface,
+            (screen_w.saturating_sub(text_w)) / 2,
+            screen_h / 2,
+            message,
+            TextStyle::new(COLOR_TEXT, COLOR_BG),
+            24,
+        );
+    }
 
     // Return the hand-off data; `main` performs ExitBootServices and the jump,
     // so that the `system_table` borrow from `boot_services()` ends first.

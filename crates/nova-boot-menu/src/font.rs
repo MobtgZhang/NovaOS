@@ -1,87 +1,105 @@
-//! Minimal 5x7 bitmap font containing only the ASCII characters the menu needs.
+//! The boot menu's typeface: embedded Iosevka, rendered through `nova-type`.
 //!
-//! Each glyph is 5 columns x 7 rows. `data`'s 7 `u8`s go top-to-bottom for the
-//! 7 rows; each `u8`'s low 5 bits go left-to-right for the 5 pixels
-//! (bit 0 = leftmost column). Missing glyphs render as a blank cell.
+//! # Why vector here
 //!
-//! The table was verified against a rendered preview of every string the menu
-//! draws, so all glyphs below are known-correct.
+//! The boot manager is the first screen a person sees; it draws its text from
+//! the same embedded Iosevka outlines the kernel console and the userland
+//! render with — any pixel size, anti-aliased by 4×4 super-sampling. There is
+//! no bitmap font anywhere in the system to fork at boot time.
+//!
+//! # Ownership shape
+//!
+//! The renderer is a plain struct, not a static: the UEFI application has an
+//! allocator, but the menu draws from one owned [`Typeface`] passed by
+//! `&mut` through the draw calls, which keeps the borrow graph obvious and
+//! costs no global state.
 
-/// Glyph cell width in pixels.
-pub const FONT_WIDTH: usize = 5;
-/// Glyph cell height in pixels.
-pub const FONT_HEIGHT: usize = 7;
-/// Horizontal gap between glyphs.
-pub const CHAR_SPACING: usize = 1;
+use nova_type::parser::{Font, Outline};
+use nova_type::raster::{GlyphBuffer, rasterize};
+use nova_type::{GlyphBitmap, GlyphCache};
 
-/// (character, 7-row bitmap data)
-pub const FONT_DATA: &[(char, [u8; FONT_HEIGHT])] = &[
-    (' ', [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
-    ('(', [0x08, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08]),
-    (')', [0x02, 0x04, 0x04, 0x04, 0x04, 0x04, 0x02]),
-    ('.', [0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c]),
-    ('/', [0x10, 0x08, 0x04, 0x04, 0x02, 0x01, 0x00]),
-    ('1', [0x04, 0x06, 0x04, 0x04, 0x04, 0x04, 0x16]),
-    ('2', [0x0e, 0x11, 0x10, 0x08, 0x04, 0x02, 0x1f]),
-    (':', [0x00, 0x04, 0x00, 0x00, 0x04, 0x00, 0x00]),
-    ('A', [0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11]),
-    ('B', [0x0f, 0x11, 0x11, 0x0f, 0x11, 0x11, 0x0f]),
-    ('D', [0x0f, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0f]),
-    ('E', [0x1f, 0x01, 0x01, 0x0f, 0x01, 0x01, 0x1f]),
-    ('M', [0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11]),
-    ('N', [0x11, 0x13, 0x15, 0x19, 0x11, 0x11, 0x11]),
-    ('O', [0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e]),
-    ('P', [0x0f, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x01]),
-    ('S', [0x1e, 0x01, 0x01, 0x0e, 0x10, 0x10, 0x0f]),
-    ('T', [0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04]),
-    ('U', [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e]),
-    ('a', [0x00, 0x00, 0x0e, 0x10, 0x1e, 0x11, 0x1e]),
-    ('b', [0x01, 0x01, 0x01, 0x0f, 0x11, 0x11, 0x0f]),
-    ('c', [0x00, 0x00, 0x0e, 0x11, 0x01, 0x01, 0x0e]),
-    ('d', [0x10, 0x10, 0x10, 0x0f, 0x11, 0x11, 0x0f]),
-    ('e', [0x00, 0x00, 0x0e, 0x11, 0x1f, 0x01, 0x0e]),
-    ('f', [0x0c, 0x02, 0x02, 0x0f, 0x02, 0x02, 0x02]),
-    ('g', [0x00, 0x00, 0x1e, 0x11, 0x11, 0x11, 0x0e]),
-    ('h', [0x01, 0x01, 0x01, 0x0f, 0x11, 0x11, 0x11]),
-    ('i', [0x00, 0x04, 0x00, 0x04, 0x04, 0x04, 0x04]),
-    ('k', [0x01, 0x01, 0x01, 0x09, 0x05, 0x03, 0x09]),
-    ('l', [0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04]),
-    ('m', [0x00, 0x00, 0x0b, 0x15, 0x15, 0x15, 0x15]),
-    ('n', [0x00, 0x00, 0x01, 0x0f, 0x11, 0x11, 0x11]),
-    ('o', [0x00, 0x00, 0x0e, 0x11, 0x11, 0x11, 0x0e]),
-    ('p', [0x00, 0x00, 0x0f, 0x11, 0x11, 0x0f, 0x01]),
-    ('r', [0x00, 0x00, 0x01, 0x0f, 0x01, 0x01, 0x01]),
-    ('s', [0x00, 0x00, 0x1e, 0x01, 0x0e, 0x10, 0x0f]),
-    ('t', [0x04, 0x04, 0x1f, 0x04, 0x04, 0x04, 0x0c]),
-    ('u', [0x00, 0x00, 0x11, 0x11, 0x11, 0x11, 0x1e]),
-    ('v', [0x00, 0x00, 0x11, 0x11, 0x11, 0x0e, 0x04]),
-    ('w', [0x00, 0x00, 0x11, 0x11, 0x15, 0x15, 0x0a]),
-    ('x', [0x00, 0x00, 0x11, 0x0e, 0x04, 0x0e, 0x11]),
-];
+/// The embedded menu face: Iosevka, subset to ASCII, arrows, and box drawing
+/// by `tools/fonts/build.py` — the same bytes the kernel console embeds.
+pub const FONT_BYTES: &[u8] = include_bytes!("../../../assets/fonts/iosevka-console.ttf");
 
-/// Look up the 5x7 bitmap for a character; returns `None` if the glyph is absent.
-pub fn bitmap(ch: char) -> Option<[u8; FONT_HEIGHT]> {
-    FONT_DATA.iter().find(|(c, _)| *c == ch).map(|(_, b)| *b)
+/// One menu text renderer: parsed font, glyph cache, and scratch buffers.
+pub struct Typeface {
+    /// Parsed once on first use; `None` until then.
+    font: Option<Font<'static>>,
+    /// Rasterized-glyph memo shared across every character drawn.
+    cache: GlyphCache,
+    /// Scratch one rasterization renders into.
+    scratch: GlyphBuffer,
+    /// Scratch one glyph's outline decodes into.
+    outline: Outline,
 }
 
-/// Text width in pixels.
-pub fn text_width(text: &str) -> usize {
-    let mut w = 0;
-    for _ in text.chars() {
-        w += FONT_WIDTH + CHAR_SPACING;
+impl Default for Typeface {
+    fn default() -> Self {
+        Self::new()
     }
-    w - CHAR_SPACING
 }
 
-/// Expand a character's bitmap into per-pixel flags, row-major
-/// (`row * FONT_WIDTH + col`), `true` = foreground.
-pub fn char_rows(ch: char) -> Option<[bool; FONT_WIDTH * FONT_HEIGHT]> {
-    let bm = bitmap(ch)?;
-    let mut rows = [false; FONT_WIDTH * FONT_HEIGHT];
-    for (row, byte) in bm.iter().enumerate() {
-        for col in 0..FONT_WIDTH {
-            rows[row * FONT_WIDTH + col] = (byte >> col) & 1 == 1;
+impl Typeface {
+    /// An empty renderer; the font parses on first draw.
+    pub const fn new() -> Self {
+        Self {
+            font: None,
+            cache: GlyphCache::new(),
+            scratch: GlyphBuffer::new(),
+            outline: Outline::empty(),
         }
     }
-    Some(rows)
+
+    /// The width of `text` at `size`, in pixels: Iosevka is monospaced, so
+    /// the advance of one glyph times the character count.
+    pub fn text_width(&mut self, text: &str, size: u32) -> usize {
+        self.ensure_font();
+        let Some(font) = self.font.as_ref() else {
+            return 0;
+        };
+        let advance = font
+            .glyph_for_char('N')
+            .map(|glyph| font.advance(glyph, size))
+            .unwrap_or(size / 2);
+        text.chars().count() * advance as usize
+    }
+
+    /// Rasterize one character at `size`, returning the copied bitmap and the
+    /// character's horizontal advance in pixels.
+    ///
+    /// `None` for a character the subset does not cover: the caller skips it.
+    pub fn glyph(&mut self, ch: char, size: u32) -> Option<(GlyphBitmap, u32)> {
+        self.ensure_font();
+        let font = self.font.as_ref()?;
+        let glyph = font.glyph_for_char(ch)?;
+        if let Some(cached) = self.cache.lookup(glyph, size) {
+            return Some((*cached, font.advance(glyph, size)));
+        }
+        font.outline(glyph, &mut self.outline).ok()?;
+        rasterize(&self.outline, font.units_per_em(), size, &mut self.scratch);
+        let rendered = *self.scratch.bitmap();
+        self.cache.remember(glyph, size, &rendered);
+        Some((rendered, font.advance(glyph, size)))
+    }
+
+    /// Parse the embedded font if it has not been yet.
+    ///
+    /// The embedded bytes come from the committed build pipeline, so a parse
+    /// failure is a broken build; the menu falls back to drawing nothing
+    /// rather than panicking in firmware.
+    fn ensure_font(&mut self) {
+        if self.font.is_none() {
+            self.font = Font::parse(FONT_BYTES).ok();
+        }
+    }
+
+    /// The pixels a line of text occupies above the baseline at `size`.
+    pub fn ascent(&mut self, size: u32) -> u32 {
+        self.ensure_font();
+        self.font
+            .as_ref()
+            .map(|font| font.line_metrics(size).ascent)
+            .unwrap_or(size)
+    }
 }

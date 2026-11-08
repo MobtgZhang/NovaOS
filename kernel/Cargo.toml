@@ -44,6 +44,10 @@ nova-abi = { workspace = true }
 # policy.
 nova-core = { workspace = true }
 
+# The on-screen console renders vector glyphs through the shared typography
+# crate — the same engine the UEFI menu and user applications draw with.
+nova-type = { workspace = true }
+
 # The ELF64 parser and image builder. The kernel loads a user image with it,
 # and the host tests validate malformed images with the same parser the kernel
 # uses, so a rejected image is rejected for the same reason in both places.

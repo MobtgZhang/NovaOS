@@ -270,7 +270,11 @@ pub fn image(profile: Option<&str>) -> Result<std::path::PathBuf, String> {
 fn test_all(args: &Args) -> Result<(), String> {
     test::driver()?;
     test::host()?;
-    run::run(args)?;
+    // The QEMU suite boots in the kernel-test mode: the boot-mode marker the
+    // runner stamps onto the ESP makes the boot manager select the test
+    // entry without a keypress, so the harness — not the desktop — is the
+    // destination of this boot.
+    run::run_with_mode(args, Some("test"))?;
     log("all tests passed");
     Ok(())
 }

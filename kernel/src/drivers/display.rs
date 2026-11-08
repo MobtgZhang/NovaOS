@@ -361,6 +361,82 @@ pub fn clear(red: u8, green: u8, blue: u8) -> Result<(), DisplayError> {
     fill_rect(0, 0, mode.right(), mode.bottom(), red, green, blue)
 }
 
+/// Move every row up by `rows` pixels and fill the gap at the bottom.
+///
+/// This is how the on-screen console scrolls: the rows above the cursor are
+/// already on screen, and re-rendering them glyph by glyph would cost
+/// hundreds of rasterizations per line feed. One bulk move costs a fraction
+/// of that and is exactly what a terminal shift does.
+///
+/// The copy runs chunk by chunk through a stack scratch: the framebuffer is
+/// device memory, and `core::ptr::copy` on MMIO is neither allowed nor
+/// ordered the way a volatile read/write pair is.
+pub fn scroll_up(rows: u64, red: u8, green: u8, blue: u8) -> Result<(), DisplayError> {
+    let Some(mode) = mode() else {
+        return Err(DisplayError::NoDisplay);
+    };
+    let height = mode.bottom();
+    if rows == 0 {
+        return Ok(());
+    }
+    if rows >= height {
+        return clear(red, green, blue);
+    }
+
+    // Chunked volatile row move: read a strip from the source row, write it
+    // to the destination row, then advance. 256 words = 1 KiB of stack.
+    const CHUNK: u64 = 256;
+    let mut scratch = [0u32; CHUNK as usize];
+    let width = mode.right();
+    let mut row = rows;
+    while row < height {
+        let mut column = 0;
+        while column < width {
+            let take = (width - column).min(CHUNK);
+            for index in 0..take {
+                // SAFETY: `row < height` and `column + index < width` bound
+                // both pixels inside the mapped framebuffer.
+                scratch[index as usize] = unsafe { read_volatile_word(mode, column + index, row) };
+            }
+            for index in 0..take {
+                // SAFETY: the destination row `row - rows` is inside the
+                // framebuffer by the same bounds as the source.
+                unsafe {
+                    write_volatile_word(mode, column + index, row - rows, scratch[index as usize])
+                };
+            }
+            column += take;
+        }
+        row += 1;
+    }
+
+    fill_rect(0, height - rows, width, rows, red, green, blue)
+}
+
+/// Read one pixel word at `(x, y)`.
+///
+/// # Safety
+///
+/// The pixel must be inside the mapped framebuffer.
+unsafe fn read_volatile_word(mode: DisplayMode, x: u64, y: u64) -> u32 {
+    let offset = pixel_offset(mode, x, y).expect("display: pixel offset overflow");
+    // SAFETY: the caller checked the coordinates against the mode, and
+    // `init` mapped the visible framebuffer readable.
+    unsafe { read_volatile((mode.base_virtual + offset) as *const u32) }
+}
+
+/// Write one pixel word at `(x, y)`.
+///
+/// # Safety
+///
+/// The pixel must be inside the mapped framebuffer.
+unsafe fn write_volatile_word(mode: DisplayMode, x: u64, y: u64, word: u32) {
+    let offset = pixel_offset(mode, x, y).expect("display: pixel offset overflow");
+    // SAFETY: the caller checked the coordinates against the mode, and
+    // `init` mapped the visible framebuffer writable.
+    unsafe { write_volatile((mode.base_virtual + offset) as *mut u32, word) }
+}
+
 /// Copy an XRGB8888 surface buffer into the framebuffer, clipped.
 ///
 /// `source_stride` is the row length in the source buffer. The source must have

@@ -206,6 +206,10 @@ pub enum BootMode {
     Desktop = 1,
     /// Boot straight to a terminal: only the essential services start.
     SafeTerminal = 2,
+    /// Run the kernel's on-machine test suite and exit. The boot manager
+    /// selects this from a marker file so `cargo xtask test` boots the same
+    /// image a developer boots, with the harness as the destination.
+    Tests = 3,
 }
 
 impl BootMode {
@@ -214,6 +218,7 @@ impl BootMode {
         match code {
             1 => Some(Self::Desktop),
             2 => Some(Self::SafeTerminal),
+            3 => Some(Self::Tests),
             _ => None,
         }
     }
@@ -228,6 +233,7 @@ impl BootMode {
         match self {
             Self::Desktop => "desktop",
             Self::SafeTerminal => "safe-terminal",
+            Self::Tests => "kernel-tests",
         }
     }
 }
@@ -709,14 +715,18 @@ mod tests {
             BootMode::from_code(BootMode::SafeTerminal.code()),
             Some(BootMode::SafeTerminal)
         );
+        assert_eq!(
+            BootMode::from_code(BootMode::Tests.code()),
+            Some(BootMode::Tests)
+        );
         assert_eq!(BootMode::from_code(0), None);
-        assert_eq!(BootMode::from_code(3), None);
+        assert_eq!(BootMode::from_code(4), None);
     }
 
     #[test]
     fn an_unknown_boot_mode_is_refused_but_absent_is_accepted() {
         let mut protocol = valid_protocol();
-        protocol.boot_mode = 3;
+        protocol.boot_mode = 4;
         assert_eq!(protocol.validate(), Err(BootProtocolError::BadBootMode));
         protocol.boot_mode = 0;
         assert_eq!(protocol.validate(), Ok(()));

@@ -238,7 +238,10 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - `iosevka-console.ttf` 17.8 KB（be5invis/Iosevka：ASCII + 制表符 + 箭头）→ 内核控制台 + UEFI 菜单；
   - `sarasa-terminal.ttf` 1.03 MB（be5invis/Sarasa-Gothic Mono SC：ASCII + GB2312 一级汉字 3755 + CJK 标点）→ 终端字体（用户指定）；
   - `han-sans-gui.ttf` 1.03 MB（adobe-fonts/source-han-sans SC：经 cu2qu CFF→glyf 转换后子集化）→ GUI 应用（editor/file-manager）。
-- **集成进度**：`nova-ui` 已挂依赖；内核屏显控制台、UEFI 菜单矢量字、终端 `nova>` 界面的接入随后续阶段提交。
+- **集成进度**：
+  - **内核屏显控制台（2026-11-09）**：`kernel/src/drivers/screen.rs`——Iosevka 16px 矢量渲染、α 混合逐像素合成、`SpinLock` 重入安全、GlyphCache 32 槽；display 映射前日志进 8 KiB pending 缓冲、`on_display_ready()` 排水重放（启动日志开头而非尾部可见）；滚屏 + 制表符 + ASCII-only。`logger::log`/`panic_report` 与 WRITE syscall 双发（串口+屏显），用户态输出同样上屏。main.rs：`display::init` 前移到 banner 之前；新增 `BootMode::Tests=3` 分支（wait_for_aps + `run_all()`），desktop/safe 走 `switch_to_next_for_cpu(0)` 交权给 init——测试套件不再无条件随每次启动运行。QEMU 截图验证：矢量字、抗锯齿、回放、滚屏全部正确。
+  - **UEFI 菜单矢量字 + 第三入口（2026-11-09）**：`crates/nova-boot-menu/src/font.rs` 重写为矢量 `Typeface`（嵌入 iosevka-console.ttf，经 nova-type）；`Screen::draw_text` 改为矢量混色（fg*α+bg*(1-α) 在 RGB 空间合成，bg 显式传入）；菜单加第三项 "Kernel Test Suite"（键 '3'）；读 ESP `\EFI\NovaOS\boot-mode` 标记文件（"desktop"/"safe"/"test"）直选并跳过交互；`boot_kernel` 尾部清屏画居中 "loading kernel..."。xtask 侧 `run::run_with_mode` 在镜像构建后 `mcopy` 注入 marker；`cargo xtask test` 走 Tests 模式（同一镜像、测试为目的地），`cargo xtask run` 保持 desktop。QEMU 验证：菜单三项矢量渲染正确、marker 直选 → 70 套件 251 用例全过、desktop 启动到 init 交权且不再跑测试套件。
+  - 用户态终端（Sarasa Gothic）与 GUI（han-sans）接入随后续阶段提交。
 
 ---
 

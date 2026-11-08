@@ -167,3 +167,10 @@ impl<const N: usize> Default for ByteSink<N> {
         Self::new()
     }
 }
+
+impl<const N: usize> core::fmt::Write for ByteSink<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.push(s.as_bytes());
+        Ok(())
+    }
+}

@@ -26,7 +26,23 @@ use std::path::PathBuf;
 /// `run` a single-command workflow: the ISO is derived, and the stale-ISO
 /// failure mode ("I edited the kernel and the old kernel booted") is removed.
 pub fn run(args: &crate::Args) -> Result<(), String> {
+    run_with_mode(args, None)
+}
+
+/// Like [`run`], but stamping an optional boot-mode marker onto the ESP
+/// before booting, so the boot manager's menu selects a fixed entry without a
+/// keypress. `None` boots whatever the interactive menu (or its auto-boot
+/// timeout) picks — the desktop, for a plain `cargo xtask run`.
+///
+/// The kernel test suite is reached through `Some("test")`: the same image a
+/// developer boots, with the harness as the destination.
+pub fn run_with_mode(args: &crate::Args, boot_mode: Option<&str>) -> Result<(), String> {
     let image = crate::image(args.cargo_profile())?;
+
+    if let Some(mode) = boot_mode {
+        crate::boot::inject_boot_mode_marker(&image, mode)?;
+        crate::log(&format!("boot-mode marker stamped: {mode}"));
+    }
 
     let code = crate::qemu::ovmf_code()?;
     let vars_template = crate::qemu::ovmf_vars()?;

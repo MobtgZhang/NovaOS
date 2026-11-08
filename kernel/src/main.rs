@@ -179,6 +179,21 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         mm::init(boot_info);
     }
 
+    // SAFETY: `boot::capture` ran above, so the snapshot is published and
+    // immutable from here on.
+    let boot_info = unsafe { boot::read_boot_info() };
+
+    // The framebuffer is mapped before the banner prints, so the whole boot
+    // log — the banner included — is visible on screen, and the on-screen
+    // console replays whatever was logged before the display existed. A
+    // headless boot is normal and leaves the display unavailable; the console
+    // then buffers (and eventually truncates) instead of drawing.
+    //
+    // SAFETY: runs once from the boot path, with the address space live and
+    // no draw call before it.
+    unsafe { drivers::display::init(boot_info) };
+    drivers::screen::on_display_ready();
+
     logger::print_banner();
 
     // The service layer's state is installed here, before anything can
@@ -254,19 +269,6 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         }
     }
 
-    // SAFETY: `boot::capture` ran above, so the snapshot is published and
-    // immutable from here on.
-    let boot_info = unsafe { boot::read_boot_info() };
-
-    // The framebuffer is mapped here, after `mm::init` built and activated the
-    // kernel's address space and after `services::init` published the display
-    // service's state. `init` records the mode and logs it; a headless boot is
-    // normal and leaves the display unavailable rather than failing.
-    //
-    // SAFETY: runs once from the boot path, with the address space live and no
-    // draw call before it.
-    unsafe { drivers::display::init(boot_info) };
-
     // SAFETY: the driver's mode is a boot fact; copying it into the service
     // state is a placement, not an allocation.
     unsafe {
@@ -281,6 +283,14 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         boot::bootloader_name(boot_info),
         boot::bootloader_version(boot_info),
         boot_info.protocol_revision
+    );
+    klog!(
+        Level::Info,
+        "boot: mode {}",
+        boot_info
+            .boot_mode()
+            .map(|mode| mode.name())
+            .unwrap_or("unspecified")
     );
     klog!(
         Level::Info,
@@ -327,21 +337,44 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         );
     }
 
-    // Wait for the AP startup paths before the suites assert on them. This is a
-    // bounded spin rather than an unbounded block: a machine whose APs fail to
-    // start reports a failed SMP suite instead of hanging the boot forever.
-    if !boot::smp::wait_for_aps(10_000_000) {
-        klog!(
-            Level::Error,
-            "smp: application processors did not reach their startup path"
-        );
-    }
+    // The boot's destination decides what the bootstrap processor does next.
+    // In the test mode the boot manager selected, the harness is the whole
+    // point: wait for the application processors (the SMP suites assert on
+    // them), run every suite, and terminate QEMU with the result. In a real
+    // boot the harness never runs — the boot thread hands the processor to
+    // the scheduler, which picks up `init`'s already-spawned thread.
+    match boot_info.boot_mode() {
+        Some(nova_boot::BootMode::Tests) => {
+            // A bounded spin rather than an unbounded block: a machine whose
+            // APs fail to start reports a failed SMP suite instead of hanging
+            // the boot forever.
+            if !boot::smp::wait_for_aps(10_000_000) {
+                klog!(
+                    Level::Error,
+                    "smp: application processors did not reach their startup path"
+                );
+            }
 
-    // `run_all` is `-> !`: it terminates the machine via `arch::exit`, so there is
-    // deliberately no epilogue here. An `arch::exit` fallback would be dead code
-    // that the compiler correctly rejects to write, which is the better outcome —
-    // it forces the harness's exit path to stay the single terminating branch.
-    test::harness::run_all();
+            // `run_all` is `-> !`: it terminates the machine via `arch::exit`,
+            // so there is deliberately no epilogue here. An `arch::exit`
+            // fallback would be dead code that the compiler correctly rejects
+            // to write, which is the better outcome — it forces the harness's
+            // exit path to stay the single terminating branch.
+            test::harness::run_all();
+        }
+        _ => {
+            // The boot thread was never a scheduler thread — the bootstrap
+            // processor's `current_slot` is still `None` — so there is no
+            // context to save and no thread to exit: the scheduler simply
+            // selects the first runnable thread, which is `init`'s. This
+            // never returns; the boot stack is abandoned here, exactly as an
+            // application processor abandons its trampoline stack.
+            //
+            // SAFETY: interrupts are masked, the scheduler and its thread
+            // pool are initialised, and `init` was spawned above.
+            unsafe { sched::switch_to_next_for_cpu(0) };
+        }
+    }
 }
 
 /// Continue an application processor on its own kernel stack.

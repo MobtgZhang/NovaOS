@@ -32,7 +32,7 @@ macro_rules! klog {
 
 use core::fmt::Write as _;
 
-use crate::arch::capabilities::{Console, ConsoleWriter};
+use crate::arch::capabilities::{ByteSink, Console};
 
 /// Severity of a log line.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -80,6 +80,12 @@ pub fn init() {
 
 /// Emit one log line.
 ///
+/// The line is formatted in full into a bounded stack sink first, then the
+/// same bytes go to the serial console and the on-screen console. Formatting
+/// first is what keeps the two outputs byte-identical — a draw on screen can
+/// never interleave with a serial byte mid-line — and what lets a formatting
+/// panic inside `args` be caught before either output has been touched.
+///
 /// # Re-entrancy
 ///
 /// If an interrupt handler or a nested panic tries to log while a message is
@@ -91,21 +97,25 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
         return;
     }
 
-    let mut writer = ConsoleWriter::new(crate::arch::console());
-    let _ = write!(writer, "[NOVA] {} | ", level.tag());
+    let mut sink = ByteSink::<256>::new();
+    let _ = write!(sink, "[NOVA] {} | ", level.tag());
     // Write the body directly so a formatting panic inside `args` cannot recurse
     // back through the logger.
-    let _ = writer.write_fmt(args);
-    let _ = writer.write_str("\r\n");
+    let _ = write!(sink, "{args}");
+    sink.push(b"\r\n");
+
+    crate::arch::console().send_bytes(sink.as_bytes());
+    crate::drivers::screen::push_bytes(sink.as_bytes());
 }
 
 /// Write a line with no level prefix and no filtering.
 ///
 /// Used on the panic path, where re-entering the level filter could recurse.
 pub fn panic_report(message: &str) {
-    let console = crate::arch::console();
-    console.send_bytes(message.as_bytes());
-    console.send_bytes(b"\r\n");
+    crate::arch::console().send_bytes(message.as_bytes());
+    crate::arch::console().send_bytes(b"\r\n");
+    crate::drivers::screen::push_bytes(message.as_bytes());
+    crate::drivers::screen::push_bytes(b"\r\n");
 }
 
 /// Render a [`core::panic::PanicInfo`] into `sink`.
