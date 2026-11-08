@@ -87,6 +87,8 @@ pub const SUITE_NAMES: &[&str] = &[
     "block_timeout",
     "driver_crash_mid_io",
     "read_only_mount",
+    // PCI configuration through the ECAM window, with the ports as fallback.
+    "pci_ecam",
     // The disk format's delete and rename, and the generation that makes a
     // stale disk handle refuse. Runs after the M5 suites, which share the
     // disk image with it.

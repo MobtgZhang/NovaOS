@@ -737,6 +737,10 @@ fn boot_kernel(
         // The FADT's wall-clock century register, for the kernel's CMOS
         // reader. Zero when no FADT was found — the kernel infers instead.
         addr_of_mut!((*snapshot).acpi_century).write(processors.rtc_century);
+        // The PCIe ECAM window, for the kernel's configuration access. Zero
+        // when no MCFG was found — the kernel keeps the port mechanism.
+        addr_of_mut!((*snapshot).ecam_base).write(processors.ecam_base);
+        addr_of_mut!((*snapshot).ecam_bus_end).write(processors.ecam_bus_end);
     }
 
     // Validate the snapshot before committing.

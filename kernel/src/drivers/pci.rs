@@ -1,13 +1,15 @@
-//! PCI enumeration through configuration mechanism #1.
+//! PCI enumeration through the ECAM window and configuration mechanism #1.
 //!
 //! # What this is
 //!
 //! PCI devices are found by reading a small window of configuration space —
-//! 256 bytes per function — through two IO ports. Mechanism #1 is the one the
-//! reference machine has: `0xCF8` takes an address, `0xCFC` returns (or takes)
-//! the data at it. Everything the kernel needs about a device comes from that
-//! window: which device it is, where its BARs are, what capabilities it
-//! advertises, and which interrupt it wires to.
+//! 256 bytes per function through the ports, the full 4 KiB per function
+//! through the ECAM window. When the boot protocol's MCFG walk found a window,
+//! every bus it covers is read through memory-mapped access; the two I/O ports
+//! of mechanism #1 — `0xCF8` takes an address, `0xCFC` returns (or takes) the
+//! data at it — remain for what the window cannot reach. Both mechanisms
+//! answer the same question: which device it is, where its BARs are, what
+//! capabilities it advertises, and which interrupt it wires to.
 //!
 //! # Why enumeration is bounded
 //!
@@ -29,12 +31,190 @@
 use crate::arch::x86_64::port_io::{inl, outl};
 use crate::klog;
 use crate::logger::Level;
+use crate::mm::{address_space, direct_map};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// The configuration *address* port of mechanism #1.
 const CONFIG_ADDRESS: u16 = 0xCF8;
 
 /// The configuration *data* port of mechanism #1.
 const CONFIG_DATA: u16 = 0xCFC;
+
+/// The physical base of the ECAM/MMCONFIG window, once installed.
+///
+/// Zero means "no window": the boot protocol reported none, and every
+/// configuration access goes through mechanism #1's ports.
+static ECAM_BASE: AtomicU64 = AtomicU64::new(0);
+
+/// The last bus the window covers, when `ECAM_BASE` is nonzero.
+static ECAM_BUS_END: AtomicU32 = AtomicU32::new(0);
+
+/// One bit per bus whose 1-MiB window slice has been mapped into the kernel
+/// half. The window can span 256 MiB — every bus the ports can reach — and
+/// mapping all of it eagerly would be 65,536 page-table walks for an answer
+/// the topology bounds to a handful of buses, so each bus's slice is mapped
+/// on first access instead.
+static ECAM_MAPPED_BUSES: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Install the ECAM window the boot protocol discovered.
+///
+/// After this, configuration reads for buses the window covers go through
+/// memory-mapped access — the mechanism modern firmware wires up and the ports
+/// are the compatibility leftover of — and reads for buses past the window
+/// fall back to the ports. Calling twice replaces the window, which the tests
+/// do deliberately; the boot path calls it once.
+pub fn install_ecam(base: u64, bus_end: u8) {
+    // A window that is not page-aligned cannot be real: the spec sizes it
+    // 4 KiB per function, and the boot protocol's validation refuses one
+    // already. The check is repeated here because this function is also the
+    // tests' entry point.
+    if base & 0xFFF != 0 {
+        klog!(Level::Warn, "pci: refusing unaligned ECAM base {:#x}", base);
+        return;
+    }
+    // Forget any slices an earlier window had mapped: the mappings live in
+    // the shared kernel half, and a reinstalled window names new addresses.
+    for slice in &ECAM_MAPPED_BUSES {
+        slice.store(0, Ordering::Relaxed);
+    }
+    ECAM_BASE.store(base, Ordering::Relaxed);
+    ECAM_BUS_END.store(bus_end as u32, Ordering::Relaxed);
+    klog!(
+        Level::Info,
+        "pci: ECAM window {:#x}.. covering buses 0..={}",
+        base,
+        bus_end
+    );
+}
+
+/// The installed ECAM window's physical base, if one is installed.
+pub fn ecam_base() -> Option<u64> {
+    match ECAM_BASE.load(Ordering::Relaxed) {
+        0 => None,
+        base => Some(base),
+    }
+}
+
+/// The installed ECAM window's last covered bus, if one is installed.
+pub fn ecam_bus_end() -> Option<u8> {
+    match ECAM_BASE.load(Ordering::Relaxed) {
+        0 => None,
+        _ => Some(ECAM_BUS_END.load(Ordering::Relaxed) as u8),
+    }
+}
+
+/// The physical address of one dword of config space in the ECAM window.
+///
+/// The window is 4 KiB per function: the bus number selects one of the 1-MiB
+/// slices a bus occupies, the slot one of the thirty-two 32-KiB pages in it,
+/// the function one of the eight 4-KiB pages in that, and the offset the dword
+/// in the page. This is pure arithmetic — the one part of the mechanism a
+/// test can pin without touching hardware.
+fn ecam_address(base: u64, location: Location, offset: u8) -> u64 {
+    base | ((location.bus as u64) << 20)
+        | ((location.slot as u64) << 15)
+        | ((location.func as u64) << 12)
+        | (offset as u64)
+}
+
+/// Bytes of the window one bus occupies: 4 KiB per function × 8 functions
+/// × 32 slots.
+const ECAM_SLICE_BYTES: u64 = 1 << 20;
+
+/// Bytes per mapped page — the leaf `map_kernel_mmio` installs.
+const MMIO_PAGE_BYTES: u64 = 0x1000;
+
+/// Map the bus's 1-MiB slice of the window into the shared kernel half.
+///
+/// The direct map covers the memory the boot protocol reported as RAM — the
+/// ECAM window lives in a PCI MMIO hole the HHDM never mapped, and a read
+/// through it faults. This is the same fix the virtio transport applies to
+/// its BARs: an explicit kernel-half mapping, installed once per bus and
+/// remembered, so repeated configuration reads are pure memory accesses.
+///
+/// Returns `false` when the mapping could not be installed — the frame
+/// allocator is out of page-table frames, say — and the caller should take
+/// the port fallback rather than fault.
+fn ecam_map_bus(bus: u8) -> bool {
+    let index = (bus >> 6) as usize;
+    let bit = 1u64 << (bus & 63);
+    if ECAM_MAPPED_BUSES[index].load(Ordering::Acquire) & bit != 0 {
+        return true;
+    }
+
+    let base = ECAM_BASE.load(Ordering::Relaxed);
+    let slice_phys = base + ((bus as u64) << 20);
+    // SAFETY: each call maps one page of the window the boot protocol
+    // validated, at its own direct-map alias — the exact pair
+    // `map_kernel_mmio` exists to install. `AlreadyMapped` is tolerated: the
+    // slice is idempotently mapped, either by a previous window or by an
+    // earlier call that recorded nothing.
+    for page in 0..(ECAM_SLICE_BYTES / MMIO_PAGE_BYTES) {
+        let offset = page * MMIO_PAGE_BYTES;
+        match address_space::map_kernel_mmio(
+            direct_map::phys_to_virt(slice_phys + offset) as u64,
+            slice_phys + offset,
+        ) {
+            Ok(()) | Err(nova_core::address_space::VmmError::AlreadyMapped) => {}
+            Err(_) => {
+                klog!(Level::Warn, "pci: could not map ECAM slice for bus {}", bus);
+                return false;
+            }
+        }
+    }
+    ECAM_MAPPED_BUSES[index].fetch_or(bit, Ordering::Release);
+    true
+}
+
+/// Read one dword through the ECAM window, or `None` when the bus's slice
+/// could not be mapped.
+///
+/// # Safety
+///
+/// The window must be installed and cover `location`'s bus, and `mm` must be
+/// up — the mapping goes through the frame allocator.
+unsafe fn read_u32_ecam(location: Location, offset: u8) -> Option<u32> {
+    if !ecam_map_bus(location.bus) {
+        return None;
+    }
+    let base = ECAM_BASE.load(Ordering::Relaxed);
+    let address = ecam_address(base, location, offset & 0xFC);
+    // SAFETY: the slice was mapped by `ecam_map_bus`, and `mmio::read_u32`
+    // performs the single aligned volatile load.
+    Some(unsafe { crate::drivers::mmio::read_u32(direct_map::phys_to_virt(address), 0) })
+}
+
+/// Write one dword through the ECAM window, or `None` when the bus's slice
+/// could not be mapped.
+///
+/// # Safety
+///
+/// As [`read_u32_ecam`], plus this function's own contract for the value — a
+/// configuration write is device control.
+unsafe fn write_u32_ecam(location: Location, offset: u8, value: u32) -> Option<()> {
+    if !ecam_map_bus(location.bus) {
+        return None;
+    }
+    let base = ECAM_BASE.load(Ordering::Relaxed);
+    let address = ecam_address(base, location, offset & 0xFC);
+    // SAFETY: as `read_u32_ecam`.
+    unsafe { crate::drivers::mmio::write_u32(direct_map::phys_to_virt(address), 0, value) };
+    Some(())
+}
+
+/// Whether the ECAM window covers this bus.
+///
+/// The window is the *only* mechanism that reaches past bus 255, and it is
+/// also the only one that reaches a bus a bridge-following walk cannot name
+/// through the ports' 8-bit bus field — though this walk never goes there.
+fn ecam_covers(bus: u8) -> bool {
+    ECAM_BASE.load(Ordering::Relaxed) != 0 && (bus as u32) <= ECAM_BUS_END.load(Ordering::Relaxed)
+}
 
 /// Enable bit the address port requires before any access is decoded.
 const CONFIG_ENABLE: u32 = 1 << 31;
@@ -382,10 +562,30 @@ pub const VIRTIO_CAP_DEVICE: u8 = 4;
 
 /// Read a 32-bit word of a function's configuration space.
 ///
-/// `offset` must be dword-aligned; bits 0-1 are dropped, because mechanism #1
-/// decodes on word boundaries and an unaligned request would address a
-/// neighbouring register.
+/// `offset` must be dword-aligned; bits 0-1 are dropped, because both
+/// mechanisms decode on word boundaries and an unaligned request would address
+/// a neighbouring register.
+///
+/// The access goes through the ECAM window when one is installed and covers
+/// the bus, and through mechanism #1's ports otherwise — the two return the
+/// same dword for any bus both can reach, which is what the test suite pins.
 pub fn read_u32(location: Location, offset: u8) -> u32 {
+    if ecam_covers(location.bus) {
+        // SAFETY: the window covers this bus; see `read_u32_ecam`.
+        if let Some(word) = (unsafe { read_u32_ecam(location, offset) }) {
+            return word;
+        }
+        // The slice could not be mapped; the ports below still answer for
+        // every bus they reach, which is every bus this walk can name.
+    }
+    read_u32_ports(location, offset)
+}
+
+/// Read one dword through mechanism #1's ports — the fallback path.
+///
+/// Kept separate from [`read_u32`] so the test suite can read the same
+/// register through both mechanisms and pin their agreement.
+pub fn read_u32_ports(location: Location, offset: u8) -> u32 {
     let address = CONFIG_ENABLE
         | ((location.bus as u32) << 16)
         | ((location.slot as u32) << 11)
@@ -412,6 +612,13 @@ pub fn read_u32(location: Location, offset: u8) -> u32 {
 ///
 /// `offset` must be dword-aligned; see [`read_u32`].
 pub unsafe fn write_u32(location: Location, offset: u8, value: u32) {
+    if ecam_covers(location.bus) {
+        // SAFETY: the window covers this bus; see `write_u32_ecam`.
+        if unsafe { write_u32_ecam(location, offset, value) }.is_some() {
+            return;
+        }
+        // As `read_u32`: fall through to the ports rather than fault.
+    }
     let address = CONFIG_ENABLE
         | ((location.bus as u32) << 16)
         | ((location.slot as u32) << 11)

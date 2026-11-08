@@ -1,5 +1,6 @@
-//! The M5 suites: PCI enumeration, the VirtIO block driver, the block cache,
-//! and read/write mounts into the file namespace.
+//! The M5 suites: PCI enumeration (through the ECAM window, with the ports as
+//! fallback), the VirtIO block driver, the block cache, and read/write mounts
+//! into the file namespace.
 //!
 //! # Why these tests exist at all
 //!
@@ -141,7 +142,99 @@ pub static M5_SUITES: &[TestSuite] = &[
             ),
         ],
     },
+    TestSuite {
+        name: "pci_ecam",
+        cases: &[
+            (
+                "the_boot_reports_an_ecam_window",
+                the_boot_reports_an_ecam_window,
+            ),
+            (
+                "an_ecam_read_agrees_with_the_port_window",
+                an_ecam_read_agrees_with_the_port_window,
+            ),
+            (
+                "enumeration_through_the_window_finds_the_devices",
+                enumeration_through_the_window_finds_the_devices,
+            ),
+        ],
+    },
 ];
+
+// --- pci_ecam ---------------------------------------------------------------
+//
+// §5.1: configuration access through the ECAM window the boot protocol's MCFG
+// walk reports, with mechanism #1's ports as the fallback. The window is
+// installed during `drivers::init`, before any device is enumerated, so every
+// case below reads through it whenever it covers the bus.
+
+fn the_boot_reports_an_ecam_window() -> Result<(), &'static str> {
+    // The reference machine is q35 with OVMF, whose XSDT carries an MCFG; a
+    // boot that found none is a boot whose ECAM walk silently broke.
+    let base = pci::ecam_base().ok_or("the boot protocol reported no ECAM window")?;
+    // The window is page-granular by construction — 4 KiB per function — so
+    // an unaligned base cannot be a real one.
+    if base & 0xFFF != 0 {
+        return Err("the ECAM base was not page-aligned");
+    }
+    // The window must at least cover bus 0, or the walk's very first reads
+    // would be silently taking the port fallback with no way to notice. A
+    // window that exists at all covers bus 0 — the MCFG entry names a range
+    // whose start is bus 0 — so the bus accessor returning is the check.
+    pci::ecam_bus_end()
+        .ok_or("the window reported no bus range")
+        .map(|_| ())
+}
+
+fn an_ecam_read_agrees_with_the_port_window() -> Result<(), &'static str> {
+    // The host bridge at 0:0.0 is the one function every machine has, and its
+    // vendor/device dword is the one register every reader starts from.
+    let host_bridge = pci::Location {
+        bus: 0,
+        slot: 0,
+        func: 0,
+    };
+    let through_window = pci::read_u32(host_bridge, 0);
+    let through_ports = pci::read_u32_ports(host_bridge, 0);
+    if through_window != through_ports {
+        return Err("the ECAM and port windows disagreed on the host bridge");
+    }
+    if through_window & 0xFFFF == 0 || through_window & 0xFFFF == 0xFFFF {
+        return Err("the host bridge's vendor id read as absent");
+    }
+
+    // The same agreement on a device the walk found, not just one at a fixed
+    // location: the encoding has to hold across the whole window, not at
+    // bus 0 slot 0.
+    let devices = pci::enumerate();
+    let virtio = devices
+        .find(|device| device.is_virtio_block())
+        .ok_or("no virtio block device was enumerated")?;
+    let through_window = pci::read_u32(virtio.location, 0);
+    let through_ports = pci::read_u32_ports(virtio.location, 0);
+    if through_window != through_ports {
+        return Err("the ECAM and port windows disagreed on a virtio device");
+    }
+    Ok(())
+}
+
+fn enumeration_through_the_window_finds_the_devices() -> Result<(), &'static str> {
+    // Every configuration read in this walk goes through the window (q35's
+    // covers bus 0), so a walk that found devices through the ports but
+    // cannot find them through the window would strand every driver the
+    // moment the mechanism switched.
+    let devices = pci::enumerate();
+    if devices.is_empty() {
+        return Err("the walk through the ECAM window found no functions");
+    }
+    if !devices.iter().any(|device| device.is_virtio_block()) {
+        return Err("the walk through the ECAM window found no block device");
+    }
+    if !devices.iter().any(|device| device.is_virtio_net()) {
+        return Err("the walk through the ECAM window found no network device");
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // pci_enumeration

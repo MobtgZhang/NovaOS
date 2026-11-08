@@ -201,9 +201,10 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 ## 5. 驱动管理
 
-### 5.1 PCI 仅限传统端口枚举〔未实现〕**Medium**
+### 5.1 PCI 仅限传统端口枚举〔部分修复（2026-11-08）：ECAM/MMCONFIG 已实现；深层 PCIe 拓扑仍开放〕**Medium**
 
-- `kernel/src/drivers/pci.rs:34-40`：只有 `0xCF8/0xCFC` 端口式配置访问；无 PCIe ECAM/MMCONFIG（现代固件常把端口式访问保留在最小编置上，ECAM 才是正道）；`MAX_BUSES=8`、`MAX_DEVICES=32`（pci.rs:54,61），不支持多层级 PCIe 拓扑。
+- ~~只有 `0xCF8/0xCFC` 端口式配置访问；无 PCIe ECAM/MMCONFIG~~ → **已实现并验证（2026-11-08）**：boot 协议 minor 1→2 新增 `ecam_base: u64` + `ecam_bus_end: u8`（零 = 无窗口，旧 menu 的零页快照天然兼容）；nova-boot-menu 在 XSDT 三表并行遍历（MADT+FADT+MCFG）中解析 MCFG——注意 MCFG 的条目不在 offset 36，PCI Firmware Spec §4.1.2 在公共头后放 8 字节保留区，条目在 44（base u64）/52（segment u16）/54-55（起止 bus），单条目表长 60，QEMU 的 `build_mcfg` 正是此布局；kernel `pci.rs` 用 atomics 持有窗口，`read_u32`/`write_u32` 覆盖到的总线走 ECAM（`bus<<20|slot<<15|func<<12|offset`），否则走端口；HHDM 只映射 RAM，窗口按总线懒映射进内核半区（每总线 1 MiB=256 页，`map_kernel_mmio`，与 virtio BAR 同一模式），映射失败回落端口路径；端口路径保留为 `read_u32_ports` 供双机制一致性测试。内核测试新套件 `pci_ecam`（3 用例：窗口存在性 + 同一寄存器双机制读一致 + 经窗口枚举找到块/网设备），boot **70 suites / 251 cases 全绿**。
+- `MAX_BUSES=8`、`MAX_DEVICES=32`、多层级 PCIe 拓扑（bridge 后的二级总线在真实机器上如何跟随）**仍未做**——ECAM 地址编码本身支持到 bus 255，但枚举走仍是单根单层的跟随逻辑。
 - 设备识别表只有 virtio legacy/modern 几个 ID（pci.rs:90-96）。
 
 ### 5.2 virtio 块设备：全轮询、单请求在飞〔缺陷〕**Medium**
@@ -214,10 +215,12 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 ### 5.3 输入：PS/2 轮询，无 USB〔未实现〕**High**
 
 - `drivers/input.rs:1-20`：PS/2 控制器 `0x60/0x64`，在 tick handler 里被轮询。真实现代电脑几乎全部是 USB 键鼠（很多主板 BIOS 里 PS/2 仿真默认关闭）——**在现代硬件上这个内核大概率没有键盘**。需要 xHCI + HID 报告解析，工作量大但绕不开。
+- **评估（2026-11-08，未实现）**：q35 虚拟机里 PS/2 有效（QEMU 提供 i8042 仿真），所以内核测试拓扑不受影响；但真实硬件路线的前置依赖是 §5.1 的 PCI 基础设施（xHCI 是 PCIe 设备，BAR 映射/能力解析已就绪）加上 xHCI 调度器+环（ring）+ TRB 与 HID 报告描述符解析，是一整块独立工程，本轮不做。
 
 ### 5.4 存储：无 NVMe/AHCI/SATA/SD〔未实现〕**High**
 
 - 唯一存储后端是 virtio-blk。真实机器的磁盘 99% 是 NVMe（PCIe）或 AHCI SATA。没有这些，"运行在现代硬件"只剩 U 盘 FDD 模式这类边缘情形。
+- **评估（2026-11-08，未实现）**：NVMe 与 xHCI 同理——控制器发现/枚举的 PCI 部分（ECAM 配置读、BAR 探测、MSI-X 能力解析）Phase H 已铺好，剩余为 NVMe 队列模型（submission/completion pair + 64 字节命令）与 PRP 页表；AHCI 是另一条 MMIO+DMA 路径。均为独立大块，本轮仅评估不动工。
 
 ### 5.5 显示：仅 GOP framebuffer〔Low〕
 

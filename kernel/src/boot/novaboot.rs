@@ -381,6 +381,10 @@ pub unsafe fn capture() -> &'static BootInfo {
         // The wall clock's century register, from the boot manager's FADT
         // walk. Zero when no FADT was found — the reader infers instead.
         (&raw mut (*target).acpi_century).write(snapshot.acpi_century);
+        // The PCIe ECAM window, from the boot manager's MCFG walk. Zero when
+        // no MCFG was found — configuration keeps the port mechanism.
+        (&raw mut (*target).ecam_base).write(snapshot.ecam_base);
+        (&raw mut (*target).ecam_bus_end).write(snapshot.ecam_bus_end);
     }
 
     // SAFETY: `capture` owns the single write, and no concurrent writer exists this

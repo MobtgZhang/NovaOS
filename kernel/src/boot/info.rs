@@ -243,6 +243,12 @@ pub struct BootInfo {
     /// reader. `0` means "unknown": the boot manager found no FADT, and the
     /// reader infers the century from the year register instead.
     pub acpi_century: u8,
+    /// The physical base of the PCIe ECAM/MMCONFIG window, for PCI
+    /// configuration access. `0` means "none": the boot manager found no
+    /// MCFG, and configuration goes through mechanism #1's ports.
+    pub ecam_base: u64,
+    /// The last bus the ECAM window covers, when `ecam_base` is nonzero.
+    pub ecam_bus_end: u8,
 }
 
 impl BootInfo {
@@ -268,6 +274,8 @@ impl BootInfo {
             bsp_lapic_id: 0,
             boot_mode: 0,
             acpi_century: 0,
+            ecam_base: 0,
+            ecam_bus_end: 0,
         }
     }
 

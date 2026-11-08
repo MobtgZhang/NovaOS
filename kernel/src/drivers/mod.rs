@@ -65,6 +65,17 @@ const MOUNT_PARENT: &[u8] = b"/media";
 /// (the drivers allocate frames and map BARs) and after `services::init` (they
 /// mount into the file server). It is called from `main` between the two.
 pub unsafe fn init() {
+    // The ECAM window, if the boot protocol found one, is installed before
+    // any device is enumerated: every configuration read afterwards goes
+    // through it where it covers the bus, and through the ports where it
+    // does not.
+    //
+    // SAFETY: the boot path runs once; the boot info was captured already.
+    let boot_info = unsafe { crate::boot::read_boot_info() };
+    if boot_info.ecam_base != 0 {
+        pci::install_ecam(boot_info.ecam_base, boot_info.ecam_bus_end);
+    }
+
     // The PS/2 controller is a device the input service needs a source for.
     // Bringing it up before the block path means a headless machine without
     // disks still has a working input driver.

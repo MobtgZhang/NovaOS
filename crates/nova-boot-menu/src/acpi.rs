@@ -55,6 +55,12 @@ pub struct ProcessorTable {
     /// century for the wall clock. `0` means "unknown" — no FADT was found,
     /// and the reader falls back to its own inference.
     pub rtc_century: u8,
+    /// The physical base of the PCIe ECAM/MMCONFIG window, from the XSDT's
+    /// MCFG table. `0` means "none" — no MCFG was found, and the kernel keeps
+    /// the ports-based configuration mechanism.
+    pub ecam_base: u64,
+    /// The last bus the ECAM window covers, when `ecam_base` is nonzero.
+    pub ecam_bus_end: u8,
 }
 
 impl ProcessorTable {
@@ -72,6 +78,8 @@ impl ProcessorTable {
             },
             bsp_lapic_id: bsp_lapic_id(),
             rtc_century: 0,
+            ecam_base: 0,
+            ecam_bus_end: 0,
         }
     }
 }
@@ -201,15 +209,17 @@ unsafe fn collect_madt_processors(
     }
 
     // The entries are 8-byte physical addresses from offset 36 (after the
-    // common header) to `length`. The walk collects *two* tables: the MADT
-    // for the processor enumeration, and the FADT for the wall clock's
-    // century register. Stopping at the first MADT would leave the FADT
-    // unexamined when it precedes the MADT, so every entry is visited and
+    // common header) to `length`. The walk collects *three* tables: the MADT
+    // for the processor enumeration, the FADT for the wall clock's century
+    // register, and the MCFG for the ECAM window the kernel's PCI code reads
+    // configuration space through. Stopping at the first MADT would leave the
+    // others unexamined when they precede it, so every entry is visited and
     // each table is recorded at most once — a FADT whose century register
     // genuinely reads 0 ("none") must not be re-read forever.
     let entry_count = length.saturating_sub(36) / 8;
     let mut madt_found = false;
     let mut fadt_found = false;
+    let mut mcfg_found = false;
     for index in 0..entry_count {
         let entry = unsafe { read_u64_le(base.add(36 + index * 8)) };
         if entry == 0 {
@@ -223,7 +233,10 @@ unsafe fn collect_madt_processors(
         if !fadt_found && unsafe { try_fadt(entry, table) }.is_some() {
             fadt_found = true;
         }
-        if madt_found && fadt_found {
+        if !mcfg_found && unsafe { try_mcfg(entry, table) }.is_some() {
+            mcfg_found = true;
+        }
+        if madt_found && fadt_found && mcfg_found {
             return Ok(());
         }
     }
@@ -314,6 +327,57 @@ unsafe fn try_fadt(address: u64, table: &mut ProcessorTable) -> Option<()> {
         }
     }
     table.rtc_century = unsafe { *base.add(55) };
+    Some(())
+}
+
+/// Read one ACPI table and, when it is the MCFG, record the ECAM window.
+///
+/// The MCFG is the one table whose body does not start at offset 36: the
+/// PCI Firmware Spec puts eight reserved bytes between the common header and
+/// the first entry (§4.1.2), so entry `n` lives at `44 + 16*n` — base address
+/// (8 bytes), the PCI segment group it names (2), the first and last bus the
+/// window covers (1 + 1), four reserved — and a one-entry table is 60 bytes
+/// long. Only the first segment-0 entry is taken: this kernel names buses
+/// without a segment prefix, so a machine with several groups would be walked
+/// the same way a single-group machine is — bus 0 upward — and the extra
+/// windows could not be addressed consistently.
+///
+/// # Safety
+///
+/// `address` must be a readable ACPI table address.
+unsafe fn try_mcfg(address: u64, table: &mut ProcessorTable) -> Option<()> {
+    let base = (address as usize) as *const u8;
+    let signature = unsafe { read_bytes(base, 4) };
+    if &signature[..4] != b"MCFG" {
+        return None;
+    }
+    let length = unsafe { read_u32_le(base.add(4)) } as usize;
+    // One entry past the reserved gap is the minimum a real table carries:
+    // the 36-byte header, the eight reserved bytes the spec puts there, and
+    // 16 for the entry.
+    if length < 60 {
+        return None;
+    }
+    unsafe {
+        if checksum(base, length) != 0 {
+            return None;
+        }
+    }
+
+    // Entry 0, at offset 44: base address (8 bytes), segment group (2),
+    // start bus (1), end bus (1).
+    let segment = unsafe { read_u32_le(base.add(52)) } & 0xFFFF;
+    if segment != 0 {
+        return None;
+    }
+    let window = unsafe { read_u64_le(base.add(44)) };
+    // A zero base cannot be a window — and it is exactly what "none" reads as
+    // on the kernel side — so a corrupt entry is dropped rather than published.
+    if window == 0 {
+        return None;
+    }
+    table.ecam_base = window;
+    table.ecam_bus_end = unsafe { *base.add(55) };
     Some(())
 }
 

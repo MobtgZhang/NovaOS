@@ -45,10 +45,15 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 ///
 /// `1` added `acpi_century` at the end of the snapshot: the FADT's
 /// `RTC century` register index, which the kernel's CMOS reader needs to
-/// interpret the century byte correctly. A minor-0 producer never writes the
-/// field, and the snapshot page is zeroed, so an older snapshot reads as
-/// "unknown century" — exactly the value zero.
-pub const PROTOCOL_MINOR: u16 = 1;
+/// interpret the century byte correctly.
+///
+/// `2` added `ecam_base` and `ecam_bus_end`: the PCIe ECAM/MMCONFIG window
+/// from the firmware's MCFG table, which the kernel's PCI code uses for
+/// configuration access where the ports-only mechanism cannot reach. A
+/// minor-0 or minor-1 producer never writes the fields, and the snapshot
+/// page is zeroed, so an older snapshot reads as `ecam_base = 0` — "no
+/// window", and the kernel keeps the port mechanism.
+pub const PROTOCOL_MINOR: u16 = 2;
 
 /// Maximum memory-map rows a snapshot can carry.
 pub const MAX_MEMORY_REGIONS: usize = 64;
@@ -259,6 +264,13 @@ pub struct BootProtocol {
     /// kernel falls back to its own inference. The snapshot page is zeroed,
     /// so a producer that predates the field reads as zero here.
     pub acpi_century: u8,
+    /// The physical base of the PCIe ECAM/MMCONFIG window, from the
+    /// firmware's MCFG table. `0` means "none": the producer found no MCFG
+    /// (or predated the field), and the kernel keeps mechanism #1's ports.
+    pub ecam_base: u64,
+    /// The last bus the ECAM window covers, when `ecam_base` is nonzero.
+    /// Buses past this number are not addressable through the window.
+    pub ecam_bus_end: u8,
 }
 
 impl BootProtocol {
@@ -291,6 +303,8 @@ impl BootProtocol {
             boot_mode: 0,
             reserved: 0,
             acpi_century: 0,
+            ecam_base: 0,
+            ecam_bus_end: 0,
         }
     }
 
@@ -313,6 +327,12 @@ impl BootProtocol {
         // means "unknown" and is always acceptable.
         if self.acpi_century > 0x7F {
             return Err(BootProtocolError::BadAcpiCentury);
+        }
+        // The ECAM window is page-granular by construction: the spec sizes it
+        // 4 KiB per function, so a base that is not page-aligned cannot be a
+        // real window. `0` means "none" and is always acceptable.
+        if self.ecam_base != 0 && self.ecam_base & 0xFFF != 0 {
+            return Err(BootProtocolError::BadEcam);
         }
         if self.boot_mode != 0 && BootMode::from_code(self.boot_mode).is_none() {
             return Err(BootProtocolError::BadBootMode);
@@ -414,6 +434,7 @@ pub enum BootProtocolError {
     BadFramebuffer,
     BadBootMode,
     BadAcpiCentury,
+    BadEcam,
 }
 
 impl BootProtocolError {
@@ -436,6 +457,7 @@ impl BootProtocolError {
             Self::BadFramebuffer => "bad-framebuffer",
             Self::BadBootMode => "bad-boot-mode",
             Self::BadAcpiCentury => "bad-acpi-century",
+            Self::BadEcam => "bad-ecam",
         }
     }
 }
@@ -595,6 +617,22 @@ mod tests {
         protocol.minor = PROTOCOL_MINOR + 1;
         assert_eq!(protocol.validate(), Err(BootProtocolError::BadVersion));
         protocol.minor = 0;
+        assert_eq!(protocol.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_unaligned_ecam_base_is_refused_but_zero_is_accepted() {
+        let mut protocol = valid_protocol();
+        // Zero is "no window", the value an older producer's zeroed page
+        // yields, and is always acceptable.
+        protocol.ecam_base = 0;
+        protocol.ecam_bus_end = 0;
+        assert_eq!(protocol.validate(), Ok(()));
+        // A real window is page-granular: the spec sizes it 4 KiB per
+        // function, so an unaligned base cannot be one.
+        protocol.ecam_base = 0x3F00_0C00;
+        assert_eq!(protocol.validate(), Err(BootProtocolError::BadEcam));
+        protocol.ecam_base = 0x3F00_0000;
         assert_eq!(protocol.validate(), Ok(()));
     }
 
