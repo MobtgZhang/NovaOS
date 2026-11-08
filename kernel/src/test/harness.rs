@@ -232,6 +232,14 @@ static ALL_SUITES: &[TestSuite] = &[
                 kernel_image_within_usable,
             ),
             ("the_snapshot_revalidates", the_snapshot_revalidates),
+            (
+                "a_huge_leaf_translation_carries_the_full_offset",
+                a_huge_leaf_translation_carries_the_full_offset,
+            ),
+            (
+                "remapping_a_huge_leaf_page_is_idempotent",
+                remapping_a_huge_leaf_page_is_idempotent,
+            ),
         ],
     },
     TestSuite {
@@ -1218,6 +1226,92 @@ fn the_snapshot_revalidates() -> Result<(), &'static str> {
     // means the copy loop read the wrong array.
     if validation.out_of_order > info.regions().len() {
         return Err("more out-of-order entries than regions");
+    }
+
+    Ok(())
+}
+
+/// A translation through a huge HHDM leaf must carry the offset's *full*
+/// width, not just its low twelve bits.
+///
+/// The direct map is built from 2 MiB and 1 GiB leaves, so a RAM address
+/// whose offset within its leaf exceeds 4 KiB only translates back exactly
+/// when the walk names the leaf's real size. This is the kernel-side half of
+/// §1.2: every query path that meets a huge leaf gets the whole offset.
+fn a_huge_leaf_translation_carries_the_full_offset() -> Result<(), &'static str> {
+    use crate::mm::page_table::{self, PageTable};
+
+    // SAFETY: see `every_region_is_page_aligned`.
+    let info = unsafe { crate::boot::read_boot_info() };
+
+    // A usable region deep enough that an address past 2 MiB stays inside it,
+    // so the address lands in the *body* of a huge leaf rather than in a
+    // region's 4 KiB head or tail.
+    let region = info
+        .regions()
+        .iter()
+        .find(|region| region.is_usable() && region.length >= 16 * 1024 * 1024)
+        .ok_or("no usable region is large enough to hold a huge leaf body")?;
+
+    let body = (region.base + 0x1F_FFFF) & !0x1F_FFFF;
+    let phys = body + 5 * 1024 * 1024 + 0x1234;
+    if phys >= region.end() {
+        return Err("the chosen address left its region");
+    }
+
+    let alias = crate::mm::direct_map::phys_to_virt(phys) as u64;
+    let kernel = crate::mm::address_space::kernel_space().pml4_phys();
+    let translated = page_table::translate(&PageTable::at(kernel), alias);
+
+    if translated != Some(phys) {
+        return Err("a direct-map translation through a huge leaf lost the offset");
+    }
+
+    Ok(())
+}
+
+/// Re-mapping a page a huge leaf already maps must be a no-op, and the leaf
+/// must survive it: a walk that mistook the leaf for a 4 KiB entry would
+/// overwrite it with a 4 KiB entry and strand the rest of its 2 MiB.
+fn remapping_a_huge_leaf_page_is_idempotent() -> Result<(), &'static str> {
+    use crate::arch::x86_64::paging::PageFlags;
+    use crate::mm::page_table::{self, PageTable};
+
+    // SAFETY: see `every_region_is_page_aligned`.
+    let info = unsafe { crate::boot::read_boot_info() };
+
+    let region = info
+        .regions()
+        .iter()
+        .find(|region| region.is_usable() && region.length >= 16 * 1024 * 1024)
+        .ok_or("no usable region is large enough to hold a huge leaf body")?;
+
+    let body = (region.base + 0x1F_FFFF) & !0x1F_FFFF;
+    let phys = body + 6 * 1024 * 1024;
+    if phys >= region.end() {
+        return Err("the chosen address left its region");
+    }
+
+    let alias = crate::mm::direct_map::phys_to_virt(phys) as u64;
+    let root = PageTable::at(crate::mm::address_space::kernel_space().pml4_phys());
+
+    // The leaf already maps this exact physical address: the re-map is
+    // idempotent, not a refusal and not a silent overwrite.
+    page_table::map(
+        &root,
+        alias,
+        phys,
+        PageFlags::PRESENT.union(PageFlags::WRITABLE),
+        false,
+    )
+    .map_err(|_| "re-mapping an existing huge-leaf page failed")?;
+
+    // And the leaf still covers its neighbours: a page 4 KiB further on
+    // translates through the *same* leaf. A demoted leaf fails here, because
+    // the walk then reads the old base as if it were a page table.
+    let neighbour = page_table::translate(&root, alias + 0x1000);
+    if neighbour != Some(phys + 0x1000) {
+        return Err("the huge leaf was demoted by the re-map");
     }
 
     Ok(())

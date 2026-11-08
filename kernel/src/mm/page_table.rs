@@ -254,9 +254,16 @@ fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmE
     let mut table = *root;
 
     for (level, size) in [
+        // A `PS` bit at the PML4 level is architecturally reserved — no real
+        // leaf exists there — and the size paired with it is unreachable in
+        // practice. A 1 GiB name keeps the pairing monotonic if a corrupted
+        // entry ever sets the bit.
         (WalkLevel::Pml4, P3_PAGE_BYTES),
-        (WalkLevel::Pdpt, P2_PAGE_BYTES),
-        (WalkLevel::Pd, P1_PAGE_BYTES),
+        // A `PS` bit one level below the PML4 — in a directory-pointer
+        // entry — makes a 1 GiB leaf.
+        (WalkLevel::Pdpt, P3_PAGE_BYTES),
+        // A `PS` bit in a directory entry makes a 2 MiB leaf.
+        (WalkLevel::Pd, P2_PAGE_BYTES),
     ] {
         let index = level.index_of(address);
 
@@ -523,9 +530,16 @@ pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
     let mut table = *root;
 
     for (level, size) in [
+        // A `PS` bit at the PML4 level is architecturally reserved — no real
+        // leaf exists there — and the size paired with it is unreachable in
+        // practice. A 1 GiB name keeps the pairing monotonic if a corrupted
+        // entry ever sets the bit.
         (WalkLevel::Pml4, P3_PAGE_BYTES),
-        (WalkLevel::Pdpt, P2_PAGE_BYTES),
-        (WalkLevel::Pd, P1_PAGE_BYTES),
+        // A `PS` bit one level below the PML4 — in a directory-pointer
+        // entry — makes a 1 GiB leaf.
+        (WalkLevel::Pdpt, P3_PAGE_BYTES),
+        // A `PS` bit in a directory entry makes a 2 MiB leaf.
+        (WalkLevel::Pd, P2_PAGE_BYTES),
     ] {
         let index = level.index_of(virt);
         let entry = table.read(index);
@@ -549,11 +563,23 @@ pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
 pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
     let mut table = *root;
 
-    for level in [WalkLevel::Pml4, WalkLevel::Pdpt, WalkLevel::Pd] {
+    for (level, size) in [
+        (WalkLevel::Pml4, P3_PAGE_BYTES),
+        (WalkLevel::Pdpt, P3_PAGE_BYTES),
+        (WalkLevel::Pd, P2_PAGE_BYTES),
+    ] {
         let index = level.index_of(virt);
         let entry = table.read(index);
         if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
             return None;
+        }
+        // A huge leaf in a user space would make the descent below read the
+        // leaf's 2 MiB base as if it were a table. None of today's user
+        // mappings are huge, but a corrupted or future one gets the same
+        // offset arithmetic a kernel translation would give rather than
+        // garbage.
+        if entry_flags(entry).contains(PageFlags::HUGE) {
+            return Some(leaf_physical(entry, virt, size));
         }
         table = PageTable::at(decode_entry(entry));
     }
