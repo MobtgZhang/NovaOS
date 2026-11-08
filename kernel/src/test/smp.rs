@@ -70,7 +70,16 @@ fn created_threads_dispatch_across_online_cpus() -> Result<(), &'static str> {
     let mut ids = [0u32; CREATED];
     for (index, id_slot) in ids.iter_mut().enumerate() {
         let id = 0x2000 + index as u32;
-        let Some(thread) = crate::task::create_thread(id, 0, space, crate::task::Entry::Kernel(0))
+        // The entry must be a real park loop, not a placeholder address: a
+        // thread created here is runnable, so the next tick on its CPU can
+        // dispatch it before the cleanup below marks it exited — and a
+        // dispatched kernel thread that jumps to address zero faults in low
+        // memory, where the trampoline's 16-bit bytes decode as garbage in
+        // 64-bit mode. The AP idle entry parks instead, so a thread that
+        // slips into the window simply idles until it is reaped.
+        let entry = crate::boot::smp::ap_idle_entry as *const () as u64;
+        let Some(thread) =
+            crate::task::create_thread(id, 0, space, crate::task::Entry::Kernel(entry))
         else {
             return Err("the round-robin dispatcher could not create a thread");
         };
@@ -86,23 +95,54 @@ fn created_threads_dispatch_across_online_cpus() -> Result<(), &'static str> {
         return Err("every created thread landed on the same CPU");
     }
 
-    // Clean up: mark each created thread `Exited` on its own CPU's pool and
-    // reap, so neither the pool slots nor the kernel stacks leak.
-    for id in ids {
-        for cpu in 0..info.processor_count() {
-            let Some(slot) = crate::task::slot_of_for_cpu(cpu, id) else {
-                continue;
-            };
-            let Some(mut thread) = (unsafe { crate::task::thread_in_slot_for_cpu(cpu, slot) })
-            else {
-                continue;
-            };
-            thread.state = crate::task::ThreadState::Exited;
-            unsafe { crate::task::update_thread_for_cpu(cpu, slot, thread) };
+    // Clean up: mark each created thread `Exited`, then let every CPU reap
+    // its own pool — the bootstrap processor reaps directly here, and an AP
+    // reaps from its scheduler path on its own tick. The reap contract skips
+    // the CPU's current slot, so a thread that was dispatched before the mark
+    // is first switched out (it is parked in the idle entry) and reaped on a
+    // later tick. The mark is repeated because a tick that dispatched a
+    // thread after the first mark writes `Running` back into the record; the
+    // loop converges once every slot is empty, and the assertion below turns
+    // a stuck cleanup into a test failure rather than a hung machine.
+    let cpus = info.processor_count();
+    let mut attempts = 0;
+    while attempts < 8 {
+        attempts += 1;
+        for id in ids {
+            for cpu in 0..cpus {
+                if let Some(slot) = crate::task::slot_of_for_cpu(cpu, id)
+                    && let Some(mut thread) =
+                        (unsafe { crate::task::thread_in_slot_for_cpu(cpu, slot) })
+                {
+                    thread.state = crate::task::ThreadState::Exited;
+                    unsafe { crate::task::update_thread_for_cpu(cpu, slot, thread) };
+                }
+            }
         }
-    }
-    for cpu in 0..info.processor_count() {
-        unsafe { crate::sched::reap_exited_threads_for_cpu(cpu) };
+        unsafe { crate::sched::reap_exited_threads_for_cpu(0) };
+
+        let all_reaped = ids
+            .iter()
+            .all(|id| (0..cpus).all(|cpu| crate::task::slot_of_for_cpu(cpu, *id).is_none()));
+        if all_reaped {
+            break;
+        }
+        if attempts >= 8 {
+            break;
+        }
+
+        // Bounded spin: give the APs' periodic ticks time to switch the
+        // parked threads out and reap them. Same bound as the other cases
+        // that wait for an AP tick.
+        let mut spins = 0u64;
+        while spins < 10_000_000 {
+            spins += 1;
+            // SAFETY: `pause` changes no memory state and is valid while the
+            // interrupts this CPU masked are still masked.
+            unsafe {
+                core::arch::asm!("pause", options(nomem, nostack));
+            }
+        }
     }
     for id in ids {
         for cpu in 0..info.processor_count() {

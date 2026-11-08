@@ -313,107 +313,6 @@ pub enum Entry {
     },
 }
 
-/// A thread's kernel stack.
-///
-/// A fixed-size, 16-byte-aligned buffer. The `Sync` implementation documents
-/// the single-CPU discipline: the CPU writes the buffer through the stack
-/// pointer it was given, and only one thread is running at a time.
-#[repr(align(16))]
-struct StackBuffer(UnsafeCell<[u8; KERNEL_STACK_SIZE]>);
-
-// SAFETY: the buffer is written only by the CPU, through the stack pointer the
-// kernel hands it, and only while that thread is the running one. Two threads
-// never share a buffer: the pool hands each thread its own slot, and a slot is
-// not reused until the thread occupying it has been reaped.
-//
-// The buffer is not read through Rust at all — the kernel only ever computes
-// its top address — so there is no Rust-level aliasing to reason about.
-unsafe impl Sync for StackBuffer {}
-
-/// The pool of kernel stacks.
-///
-/// A static array rather than an allocator: the kernel has no general-purpose
-/// allocator for objects, and a stack must be a single contiguous region that
-/// never moves.
-struct StackPool {
-    /// The buffers.
-    ///
-    /// `UnsafeCell` because the CPU — not Rust — writes the bytes.
-    buffers: [StackBuffer; MAX_THREADS],
-    /// Which buffers are in use.
-    ///
-    /// A plain array rather than a bitmap: the pool is small, and the search
-    /// is a short scan on a path that runs once per thread creation.
-    used: [bool; MAX_THREADS],
-}
-
-impl StackPool {
-    const fn new() -> Self {
-        Self {
-            buffers: [const { StackBuffer(UnsafeCell::new([0; KERNEL_STACK_SIZE])) }; MAX_THREADS],
-            used: [false; MAX_THREADS],
-        }
-    }
-
-    /// Claim a stack, returning its slot.
-    ///
-    /// Returns `None` when the pool is exhausted.
-    fn acquire(&mut self) -> Option<usize> {
-        let slot = self.used.iter().position(|taken| !taken)?;
-        self.used[slot] = true;
-        Some(slot)
-    }
-
-    /// Release a stack.
-    fn release(&mut self, slot: usize) {
-        if slot < MAX_THREADS {
-            self.used[slot] = false;
-        }
-    }
-
-    /// The top address of a stack.
-    ///
-    /// The CPU pushes downwards from here. The alignment is asserted rather
-    /// than assumed: the buffer is 16-byte aligned and the size is a multiple
-    /// of 16, so the sum is aligned too — but a linker or attribute change
-    /// could break that, and a misaligned stack pointer faults in ring 0.
-    fn top_of(&self, slot: usize) -> u64 {
-        let base = self.buffers[slot].0.get() as *const u8 as u64;
-        let top = base + KERNEL_STACK_SIZE as u64;
-        debug_assert_eq!(top & 0xF, 0, "a kernel stack top must be 16-byte aligned");
-        top
-    }
-
-    /// The lowest address of a stack.
-    fn base_of(&self, slot: usize) -> u64 {
-        self.buffers[slot].0.get() as *const u8 as u64
-    }
-}
-
-/// The kernel's stack pool.
-///
-/// Behind an [`UnsafeCell`] because the pool is read and written in pieces:
-/// a thread is claimed by a writer, and the *running* thread's stack
-/// bounds are read by the fault path while the pool is otherwise quiescent.
-/// A `static mut` cannot lend either of those without the borrow checker
-/// (correctly) objecting that a shared reference to a mutable static is
-/// undefined behaviour.
-struct StackPoolCell(UnsafeCell<StackPool>);
-
-// SAFETY: the pool is only accessed with interrupts masked, which is the
-// kernel's discipline for every access to shared state. The CPU writes
-// through a stack pointer the kernel hands it, and only while that thread
-// is the running one.
-unsafe impl Sync for StackPoolCell {}
-
-/// Per-CPU stack pools.
-///
-/// Each processor owns its own pool. A thread's stack slot is therefore
-/// meaningful only together with its CPU index, and no two processors can claim
-/// the same slot.
-static STACKS: [StackPoolCell; MAX_CPUS] =
-    [const { StackPoolCell(UnsafeCell::new(StackPool::new())) }; MAX_CPUS];
-
 /// A thread.
 ///
 /// Every field is fixed-size and `Copy`, so a thread's metadata lives in a
@@ -428,8 +327,9 @@ pub struct Thread {
     pub space: AddressSpace,
     /// The CPU that owns this thread's pool and stack.
     pub cpu: usize,
-    /// The thread's kernel stack slot in the CPU's pool.
-    pub stack_slot: usize,
+    /// The low address of the thread's kernel stack, allocated from the
+    /// kernel heap. `kernel_stack_top` derives the top from it.
+    pub stack_base: u64,
     /// The thread's saved machine state.
     pub context: Context,
     /// What the thread is doing.
@@ -655,7 +555,8 @@ pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry)
 ///
 /// # Errors
 ///
-/// Returns `None` when that CPU's thread pool or stack pool is exhausted.
+/// Returns `None` when that CPU's thread table is full or the kernel heap
+/// cannot supply a stack.
 pub fn create_thread_for_cpu(
     cpu: usize,
     id: u32,
@@ -665,32 +566,48 @@ pub fn create_thread_for_cpu(
 ) -> Option<Thread> {
     assert!(cpu < MAX_CPUS, "CPU index exceeds the static thread table");
 
-    // SAFETY: creation runs with interrupts masked on the owning CPU, and it
-    // is the only writer of that CPU's pool and stack pool.
-    unsafe {
-        let slot = (unsafe { thread_pool(cpu) })
+    // Claim the table slot first: the stack is allocated from the kernel heap
+    // below, and a `None` after that point would have to give the stack back.
+    // Creation runs with interrupts masked on the owning CPU, and it is the
+    // only writer of that CPU's thread pool.
+    let slot = unsafe {
+        (unsafe { thread_pool(cpu) })
             .iter()
-            .position(|entry| entry.is_none())?;
-        let stack_slot = unsafe { (*STACKS[cpu].0.get()).acquire()? };
+            .position(|entry| entry.is_none())?
+    };
 
-        let thread = Thread {
-            id,
-            process,
-            space,
-            cpu,
-            stack_slot,
-            context: Context::default(),
-            state: ThreadState::Runnable,
-            entry,
-            exit_status: 0,
-            runs: 0,
-            preemptions: 0,
-            fault_address: 0,
-        };
-
-        (unsafe { thread_pool(cpu) })[slot] = Some(thread);
-        Some(thread)
+    // The stack comes from the kernel heap: the heap's own lock is irq-safe,
+    // so claiming one here cannot deadlock against an interrupt that also
+    // allocates. A failed claim is the heap being out of frames — the same
+    // `None` the caller already handles for a full thread table.
+    let stack_layout = alloc::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 16)
+        .expect("a kernel stack layout is representable");
+    // SAFETY: the heap hands out writable, 16-byte-aligned stacks; the
+    // returned pointer is live until this thread is reaped.
+    let base = unsafe { alloc::alloc::alloc(stack_layout) } as u64;
+    if base == 0 {
+        return None;
     }
+
+    let thread = Thread {
+        id,
+        process,
+        space,
+        cpu,
+        stack_base: base,
+        context: Context::default(),
+        state: ThreadState::Runnable,
+        entry,
+        exit_status: 0,
+        runs: 0,
+        preemptions: 0,
+        fault_address: 0,
+    };
+
+    // SAFETY: creation runs with interrupts masked on the owning CPU, and it
+    // is the only writer of that CPU's thread pool.
+    unsafe { (unsafe { thread_pool(cpu) })[slot] = Some(thread) };
+    Some(thread)
 }
 
 /// Look up a thread by identifier on the bootstrap processor.
@@ -814,7 +731,15 @@ pub unsafe fn reap_thread_for_cpu(cpu: usize, slot: usize) {
             .and_then(|entry| *entry)
             && thread.state == ThreadState::Exited
         {
-            unsafe { (*STACKS[cpu].0.get()).release(thread.stack_slot) };
+            // The stack was claimed from the kernel heap at creation; give it
+            // back with the same layout. The thread is exited and not
+            // running, so nothing can be executing on this memory.
+            let stack_layout = alloc::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 16)
+                .expect("a kernel stack layout is representable");
+            // SAFETY: the thread is not running and its record is about to
+            // leave the table, so this is the one dealloc for a stack that
+            // exactly one creation allocated.
+            unsafe { alloc::alloc::dealloc(thread.stack_base as *mut u8, stack_layout) };
             (unsafe { thread_pool(cpu) })[slot] = None;
         }
     }
@@ -826,14 +751,12 @@ pub unsafe fn reap_thread_for_cpu(cpu: usize, slot: usize) {
 /// from "an interrupt arrived on the scheduler's stack". The distinction
 /// matters: only the former is a preemption of the current thread.
 pub fn stack_bounds(thread: &Thread) -> (u64, u64) {
-    // SAFETY: the per-CPU pool hands each thread its own slot, and a slot is
-    // not released until the thread is reaped, so the slot is still the
-    // thread's. `thread.cpu` names the pool that owns it.
-    let pool = unsafe { &*STACKS[thread.cpu].0.get() };
-    (
-        pool.base_of(thread.stack_slot),
-        pool.top_of(thread.stack_slot),
-    )
+    // The stack is a heap allocation owned by this thread's record; the
+    // top is base plus the fixed size, 16-byte aligned by the layout the
+    // creation path requested.
+    let top = thread.stack_base + KERNEL_STACK_SIZE as u64;
+    debug_assert_eq!(top & 0xF, 0, "a kernel stack top must be 16-byte aligned");
+    (thread.stack_base, top)
 }
 
 /// Whether `address` lies within a thread's kernel stack.
@@ -848,11 +771,7 @@ pub fn stack_contains(thread: &Thread, address: u64) -> bool {
 /// the CPU uses it to land an interrupt, and the syscall entry path uses it
 /// to switch to the kernel stack.
 pub fn kernel_stack_top(thread: &Thread) -> u64 {
-    // SAFETY: the per-CPU stack pool's slots are claimed exclusively by one
-    // thread each. A thread's slot is not released until the thread is
-    // reaped, so the slot is still the thread's while the thread exists.
-    let pool = unsafe { &*STACKS[thread.cpu].0.get() };
-    pool.top_of(thread.stack_slot)
+    stack_bounds(thread).1
 }
 
 /// The pool slot of the thread with `id`, if it exists.
@@ -1057,25 +976,8 @@ unsafe extern "C" fn thread_exit_landing_stub() -> ! {
 pub fn describe_threads() {
     klog!(
         Level::Info,
-        "task: {} threads live, {} stack slots",
+        "task: {} threads live, table capacity {}",
         thread_count(),
         MAX_THREADS
     );
-}
-
-/// The number of stack slots still free on the bootstrap processor.
-pub fn free_stack_slots() -> usize {
-    free_stack_slots_for_cpu(0)
-}
-
-/// The number of stack slots still free on a specific CPU.
-pub fn free_stack_slots_for_cpu(cpu: usize) -> usize {
-    // SAFETY: reading the pool is safe with interrupts masked.
-    unsafe {
-        (*STACKS[cpu].0.get())
-            .used
-            .iter()
-            .filter(|used| !**used)
-            .count()
-    }
 }

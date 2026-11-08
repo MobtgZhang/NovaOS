@@ -167,9 +167,17 @@ fn freed_neighbours_coalesce() -> Result<(), &'static str> {
 
     let mut merged = Vec::with_capacity(width * 2);
     merged.resize(width * 2, 0);
+    let held = !merged.iter().any(|byte| *byte != 0);
+    // Measure with every allocation of this case released. Comparing while
+    // `merged` is still live would count its block against whatever free
+    // space served it — which, once thread stacks (16 KiB each) live in the
+    // heap, can be space that predates this case entirely — and report the
+    // consumption as shrinkage. Released, the comparison reads exactly what
+    // the message says: no byte the heap started with has been lost.
+    drop(merged);
     let after = crate::mm::heap::heap().stats();
 
-    if merged.iter().any(|byte| *byte != 0) {
+    if !held {
         return Err("the merged allocation did not hold a cleared pattern");
     }
     if after.frames != claimed {
