@@ -22,8 +22,10 @@
 | 附带发现 | **已修复** | 帧位图两处正确性 bug（计数 u32 回绕、`find_first_free_from` 用掩码当移位量）——宿主复现后修复；顺序分配 hint 改单调前进 |
 | §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
 | §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
+| 附带发现 | **已修复**（2026-11-08） | 中断屏蔽采样 bug：`Interrupts::mask` 先 `cli` 再读 RFLAGS，永远返回"先前未屏蔽"，每个 `MaskGuard` Drop 都无条件 `sti`——AP bring-up（全程应 IF=0）首次堆分配结束后中断被强行打开，武装好的 APIC timer 随即在调度器恢复序列中途触发 tick，把半途上下文毒化进线程记录，随后每次恢复都落到 noreturn 调用点的 int3 填充（#BP，ip 随构建漂移）。修复为先采样后 `cli`；§8.2 栈迁堆正是踩中此雷的催化剂 |
+| §8.2 线程栈迁堆（第一项） | **已修复**（2026-11-08） | `StackBuffer`/`StackPool`/`STACKS` 静态池整体删除；`Thread.stack_slot` → `stack_base: u64`，创建时 `alloc(Layout(16 KiB,16))`（先占表槽再分配，防泄漏），回收时 `dealloc`；`stack_bounds`/`kernel_stack_top` 由 base 推算，栈数量上限随线程表存在。smp 测试 `created_threads_dispatch_across_online_cpus` 同步加固：入口由占位地址 0 改为 `ap_idle_entry` 安全 park 循环（原入口被 tick 派发后会跳 0 执行低内存垃圾），清理改为"循环重标 Exited + 各 CPU 自行 reap"。boot 套件 65 suites / 228 cases 全绿 ×2 次，`scripts/gates.sh` 五道门禁全过 |
 
-**仍然未解**：§2.5 的静态池动态化（§8.2：StackPool/能力表/IPC 通道迁堆）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§2.5 堆本体、§4.1、§4.2（virtio-net 路径）、§1.2（引导侧 + 内核侧）、§4.4 均已修复并验证（2026-11-08）〕
+**仍然未解**：§8.2 剩余静态池（能力表/IPC 通道/socket/mount 等迁堆）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§2.5 堆本体、§2.5 范围注中的 StackPool、§4.1、§4.2（virtio-net 路径）、§1.2（引导侧 + 内核侧）、§4.4 均已修复并验证（2026-11-08）〕
 
 ---
 
@@ -103,7 +105,7 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 > **已修复**：新增 `kernel/src/mm/heap.rs`——首个 `GlobalAlloc` 实现。帧分配器供给整帧，堆按**地址序单向空闲链 + 首适配 + 相邻合并**做子分配：块头一个 word（size | USED 位，双 free 靠 USED 位拒绝，不信任调用方元数据）；free 块第二字存 next；`MIN_BLOCK=32`、块对齐 16；align>16 时过分配 + back-offset word 存于 payload 前 8 字节，`release` 读回。增长路径从帧分配器领帧直到某个连续 run 足够宽，**每个较短的 run 都入空闲链**（堆永不还帧，中途放弃的 run 就是泄漏；位图洞结束一个 run、开启下一个，`insert_free` 自带合并会把后来相邻的 run 接上）；碎片病态时以 `2×need` 帧为预算防止一次增长吃光帧图。中断纪律：堆操作先 `mask_preserving()` 再拿递归锁（递归 SpinLock 会把中断里同 CPU 加锁当合法重入）。配套 `kernel_heap` 套件 7 用例（roundtrip 模式保持、跨帧宽分配、2000 小对象、align=64、双 free 拒绝、相邻合并、stats 守恒）。**验证**：boot 65 suites / 228 cases 全绿，`scripts/gates.sh` 五道门禁全过（提交 `91081e1` + `cad264f`；期间发现并修复了 §4.4 中断恢复寄存器互换——堆自身簿记 trace 自洽，故障随布局漂移的根因在中断路径）。
 >
-> **范围与未竟**：`alloc` 已可用（测试 harness、`Box`/`Vec` 走堆）；但 §8.2 列的静态池**尚未动态化**——`StackPool`（16 KiB×8）、能力表、IPC 通道等仍是编译期定长数组，硬上限（§9.4）原样。下一步是把线程栈等逐项迁到堆上。
+> **范围与未竟**：`alloc` 已可用（测试 harness、`Box`/`Vec` 走堆）；§8.2 的第一项——线程栈——**已迁堆**（`StackPool` 删除，`Thread.stack_base` 指向堆块，随创建/回收进出；2026-11-08，见更新记录表）。能力表、IPC 通道等仍是编译期定长数组，硬上限（§9.4）对它们原样。下一步是逐项迁余下的静态池。
 
 - 内核没有任何通用 `alloc`：线程栈（`task/mod.rs:336-389` StackPool）、能力表、IPC 通道、socket、mount 表……全部是编译期定长静态数组。这导致：
   - 所有资源都有硬上限（§9.4 汇总），任何超限都是拒绝服务而不是退化降速；
@@ -281,7 +283,7 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 |---|---|---|
 | 任务（进程） | **8** | `services/mod.rs:100` |
 | 每 CPU 线程 | **8** | `task/mod.rs:94`（注意 `services/mod.rs:107` 另有一个 `MAX_THREADS=64`，**两处常量名冲突、语义不一致**〔缺陷〕） |
-| 内核栈 | 16 KiB × 8 | `task/mod.rs:88` |
+| 内核栈 | 16 KiB × 8 | `task/mod.rs:88`（**已动态化（2026-11-08）**：栈改内核堆分配，随线程表存在；表中其余静态池未动） |
 | IPC 通道 | 16 | `services/mod.rs:113` |
 | socket | 8 | `services/net.rs:62` |
 | mount | 2 | `services/fs.rs` |
