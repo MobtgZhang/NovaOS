@@ -23,7 +23,7 @@
 | §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
 | §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
 
-**仍然未解**：§4.2 中断驱动的设备路径（P0）；内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1 已修复并验证（2026-11-08）〕
+**仍然未解**：内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1 已修复并验证、§4.2 virtio-net 中断驱动路径已修复并验证（2026-11-08）〕
 
 ---
 
@@ -153,7 +153,17 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 后果：中断源是 APIC timer 时一切正常；但 PIT 的第一次 IRQ0 一旦经 PIC 送进同一个 vector，PIC 的 In-Service 寄存器永远不会被清——该 IRQ 及更低优先级线从此"卡住"，而代码没有任何地方意识到这一点。当前碰巧靠 APIC timer 供 tick 才没出事，**这是靠巧合而不是靠设计正确的双中断源共用一 vector**。正确做法：PIC 完全 mask 掉（或直接不 unmask IRQ0），APIC timer 换一个独立 vector（如 0x32+），并在 handler 里按中断源分发 EOI。
 
-### 4.2 除 tick 外没有任何中断处理能力〔未实现〕**High**
+### 4.2 除 tick 外没有任何中断处理能力〔未实现〕**High** → **已修复并验证（2026-11-08，virtio-net 路径）**
+
+> **已修复**：virtio-net 经 **MSI-X** 走上中断驱动路径（免 IOAPIC/MADT——MSI 消息直写本地 APIC）。实现要点：
+>
+> - **向量分配**：设备占用 vector 0x31（`intr::DEVICE_VECTOR_BASE`）。PIC 重映射范围已全 mask、APIC timer 独占 0x30，MSI 消息自带向量号，因此"门上的 handler 即中断源"，EOI 在构造上无歧义。IDT 装 `virtio_irq_stub`（完整寄存器文件入栈）→ handler：APIC EOI + `net::note_device_interrupt()`（共享原子计数）+ `task::resume_from_block` 原样续行——调度器完全不感知设备中断，设备自身的状态锁留在本已持有它的代码路径里。
+> - **MSI-X 启用**（`pci::msix_capability` + `Transport::enable_msix`）：从 config space 读能力头 → 探测表所在 BAR → **逐页 `map_kernel_mmio`**（表在 MMIO BAR，直接映射不覆盖——virtio-net 表在 bar1 @ 0x81081000，PCI hole）→ 写全部表项（addr=`0xFEE00000|dest<<12`、data=向量号、ctrl=0）→ 最后才置 enable 位，设备不可能经陈旧表项投递。
+> - **两个寄存器级事实**（QEMU 源码核实）：modern virtio-pci 每队列初始 vector 为 `NO_VECTOR`，**必须**在队列选中期间经 common config 的 `queue_msix_vector`（offset 0x1A）分配向量，否则队列永不中断；notify 步长与 MSI-X 无关（恒为 4），现有 multiplier 逻辑不变。
+> - **等待路径**：`await_completion` 改为等待计数——`POLL_BUDGET` 只剩"设备停止中断"的兜底上限；计数变化后收缩为 `IRQ_DRAIN_BUDGET=1_000_000` 的短排水窗，覆盖 used-ring 与标志的一次读竞争。无 MSI-X 能力的设备降级为原轮询等待（记 Warn，不吞错）。
+> - **顺带修真 bug**：`gate_target()` 重组 handler 地址时高 dword 位移用了 48 而非 32（内核地址高 32 位全 1，必然截断）——新测试用例抓住。
+>
+> 新增 `interrupt_vectors` 第 4 用例：设备向量门已装、与 timer 门及 PIC 范围共享 handler 均不重合。门禁全绿，boot 套件 64 suites / 219 cases 全过，net_tcp_handshake 等网络套件全过。**范围说明**：本项的"修复"覆盖 virtio-net 一台设备的中断驱动路径（第一台 claimant）；virtio-blk 仍走轮询、tick 里的 PS/2 轮询仍在，I/O APIC/IRQ 路由表/下半部基础设施仍未建——这些留给后续接 NVMe/USB 时一并做。
 
 - `idt.rs:652-658`：vector > 31 且无专用 handler 的中断一律 panic（"hardware interrupt with no handler"）。
 - 没有 I/O APIC、没有 MSI/MSI-X、没有 IRQ 路由表；所有设备（virtio-blk、virtio-net、PS/2）都靠**在时钟 tick 里轮询**（idt.rs:1332-1343 甚至在 tick handler 里直接轮询 PS/2 控制器）。
