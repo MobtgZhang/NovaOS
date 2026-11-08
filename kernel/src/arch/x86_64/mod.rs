@@ -91,10 +91,15 @@ impl Interrupts {
 
 impl InterruptControl for Interrupts {
     fn mask(&self) -> bool {
-        // `cli`/`sti` are safe wrappers: they encode the architectural fact that
-        // neither instruction can fault at any privilege level.
+        // The previous state must be sampled *before* the `cli`: a flag read
+        // afterwards would always observe the freshly-masked state, every
+        // guard would restore to "unmasked", and any context that entered
+        // with interrupts disabled — the AP bring-up path, for one — would
+        // leave its critical section force-enabled. This is exactly the
+        // read-`RFLAGS`-first protocol the module docs describe above.
+        let was_masked = !Self::read_flag();
         port_io::cli();
-        Self::read_flag()
+        was_masked
     }
 
     fn restore(&self, was_masked: bool) {
