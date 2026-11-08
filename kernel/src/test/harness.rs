@@ -179,6 +179,7 @@ static SUITE_GROUPS: &[&[TestSuite]] = &[
     crate::test::m6::M6_SUITES,
     crate::test::m7::M7_SUITES,
     crate::test::smp::SMP_SUITES,
+    crate::test::heap::HEAP_SUITES,
 ];
 
 /// The M1 suites: the boot, memory, fault, and console gates.

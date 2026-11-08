@@ -31,6 +31,7 @@
 //! dropped.
 
 pub mod harness;
+pub mod heap;
 pub mod m2;
 pub mod m34;
 pub mod m5;
@@ -46,6 +47,7 @@ pub mod smp;
 pub const SUITE_NAMES: &[&str] = &[
     "boot_smoke",
     "memory_map_sanity",
+    "kernel_heap",
     "divide_by_zero_fault",
     "invalid_opcode_fault",
     "serial_log_format",

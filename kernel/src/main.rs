@@ -35,6 +35,11 @@
 // could opt out of.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// The kernel heap (`mm::heap`) backs `alloc` from the frame allocator; the
+// boot path stays allocation-free by design, so the allocator only comes to
+// life once `mm::init` has run.
+extern crate alloc;
+
 mod arch;
 mod boot;
 mod drivers;

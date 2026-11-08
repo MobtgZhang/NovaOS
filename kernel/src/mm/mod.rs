@@ -16,6 +16,7 @@
 pub mod address_space;
 pub mod direct_map;
 pub mod frame;
+pub mod heap;
 pub mod page_table;
 
 use core::cell::UnsafeCell;
