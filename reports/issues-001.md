@@ -23,7 +23,7 @@
 | §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
 | §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
 
-**仍然未解**：内核堆（§2.5）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1、§4.2（virtio-net 路径）、§1.2（引导侧 + 内核侧）均已修复并验证（2026-11-08）〕
+**仍然未解**：§2.5 的静态池动态化（§8.2：StackPool/能力表/IPC 通道迁堆）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§2.5 堆本体、§4.1、§4.2（virtio-net 路径）、§1.2（引导侧 + 内核侧）、§4.4 均已修复并验证（2026-11-08）〕
 
 ---
 
@@ -99,7 +99,11 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 - `mm/address_space.rs`：每进程 PML4 只复制上半区（内核区）条目，中间表共享——省内存，但意味着**内核映射的修改必须立即在所有 CPU/所有进程生效**（单 CPU 下天然成立；SMP + 多进程下，改内核页表需要 IPI 或约定只在启动期修改）。文档已意识到，但 SMP 落地时这是隐蔽正确性雷区。
 
-### 2.5 没有内核堆分配器〔未实现〕**High**（下一步）
+### 2.5 没有内核堆分配器〔未实现〕**High** → **已修复并验证（2026-11-08）**
+
+> **已修复**：新增 `kernel/src/mm/heap.rs`——首个 `GlobalAlloc` 实现。帧分配器供给整帧，堆按**地址序单向空闲链 + 首适配 + 相邻合并**做子分配：块头一个 word（size | USED 位，双 free 靠 USED 位拒绝，不信任调用方元数据）；free 块第二字存 next；`MIN_BLOCK=32`、块对齐 16；align>16 时过分配 + back-offset word 存于 payload 前 8 字节，`release` 读回。增长路径从帧分配器领帧直到某个连续 run 足够宽，**每个较短的 run 都入空闲链**（堆永不还帧，中途放弃的 run 就是泄漏；位图洞结束一个 run、开启下一个，`insert_free` 自带合并会把后来相邻的 run 接上）；碎片病态时以 `2×need` 帧为预算防止一次增长吃光帧图。中断纪律：堆操作先 `mask_preserving()` 再拿递归锁（递归 SpinLock 会把中断里同 CPU 加锁当合法重入）。配套 `kernel_heap` 套件 7 用例（roundtrip 模式保持、跨帧宽分配、2000 小对象、align=64、双 free 拒绝、相邻合并、stats 守恒）。**验证**：boot 65 suites / 228 cases 全绿，`scripts/gates.sh` 五道门禁全过（提交 `91081e1` + `cad264f`；期间发现并修复了 §4.4 中断恢复寄存器互换——堆自身簿记 trace 自洽，故障随布局漂移的根因在中断路径）。
+>
+> **范围与未竟**：`alloc` 已可用（测试 harness、`Box`/`Vec` 走堆）；但 §8.2 列的静态池**尚未动态化**——`StackPool`（16 KiB×8）、能力表、IPC 通道等仍是编译期定长数组，硬上限（§9.4）原样。下一步是把线程栈等逐项迁到堆上。
 
 - 内核没有任何通用 `alloc`：线程栈（`task/mod.rs:336-389` StackPool）、能力表、IPC 通道、socket、mount 表……全部是编译期定长静态数组。这导致：
   - 所有资源都有硬上限（§9.4 汇总），任何超限都是拒绝服务而不是退化降速；
@@ -174,6 +178,13 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 ### 4.3 时间子系统单薄〔未实现〕**Medium**
 
 - 只有 PIT（`arch/x86_64/pit.rs`）+ 被意外依赖的 APIC timer；无 HPET、无 TSC 校准（`msr.rs` 存在但没用它做时间源）、无 RTC/墙上时钟。系统没有任何"绝对时间"概念，这直接导致文件系统无法实现时间戳（§6.3）。
+
+### 4.4 中断恢复路径 RSI/RDI 互换〔缺陷〕**High** → **已修复并验证（2026-11-08，随 §2.5 调试发现）**
+
+> **已修复**：`task::resume_from_block` 的 pop 序把 RSI/RDI 弹反（`write_block` 也配套写反）。这对自洽，所以调度器切换路径无恙；但 timer/PIC/virtio 三个中断 stub 把 **stub 自己保存的寄存器区**（`UserRegisters` 布局，RDI 在低位，编译期断言钉死）直接交给 `resume_from_block` 恢复——**每次中断恢复都悄悄互换被打断代码的 RSI 和 RDI**。异常路径（`resume_from_frame`）序是对的，所以只有中断路径坏。修复：两侧统一到 `UserRegisters` 约定（`resume_from_block` 先弹 RDI、`write_block` 把 RDI 写在低位槽），中断 stub 不动。验证：内核堆调试中 verify 循环的 `#GP`（timer tick 落在两条指令之间，恢复后指针寄存器变成立即数 → 非规范地址）随修复消失，boot 228 cases 全绿（提交 `91081e1`）。
+
+- 症状极具迷惑性：故障落在"不可能 fault"的指令上（合法 HHDM 地址上的 `cmp` 报 #GP、ip 落进 ASCII 字符串、dealloc 收到 ptr=8/align=-128 的垃圾参数），且随每次重建漂移；插桩改变时序会让故障"消失"。根因不在故障点，而在几百个周期前的一次中断恢复。
+- 教训与既有文档呼应：`idt.rs` 对"pop 序差一个 word → 寄存器文件整体错位"的静默失败模式已有大段注释（`resume_from_frame` 的 120 vs 128），这次是同一类错误的另一变种——**成对寄存器的相对顺序**，两个消费者（字段访问 vs 弹栈恢复）对同一保存区各持一套约定，必须有一方统一到另一方的钉死布局。
 
 ---
 
