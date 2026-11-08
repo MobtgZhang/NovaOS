@@ -239,6 +239,10 @@ pub struct BootInfo {
     /// typed form is [`Self::boot_mode`]; the raw code is stored so this struct
     /// stays a plain data record the host tests can construct.
     pub boot_mode: u16,
+    /// The FADT's `RTC century` register index, for the wall clock's CMOS
+    /// reader. `0` means "unknown": the boot manager found no FADT, and the
+    /// reader infers the century from the year register instead.
+    pub acpi_century: u8,
 }
 
 impl BootInfo {
@@ -263,6 +267,7 @@ impl BootInfo {
             cpu_ids: [0; MAX_CPUS],
             bsp_lapic_id: 0,
             boot_mode: 0,
+            acpi_century: 0,
         }
     }
 

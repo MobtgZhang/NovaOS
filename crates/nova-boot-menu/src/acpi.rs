@@ -51,6 +51,10 @@ pub struct ProcessorTable {
     /// The local APIC identifier of *this* processor — the boot manager only
     /// ever runs on the bootstrap processor, so CPUID's answer is authoritative.
     pub bsp_lapic_id: u32,
+    /// The FADT's `RTC century` register index: which CMOS register holds the
+    /// century for the wall clock. `0` means "unknown" — no FADT was found,
+    /// and the reader falls back to its own inference.
+    pub rtc_century: u8,
 }
 
 impl ProcessorTable {
@@ -67,6 +71,7 @@ impl ProcessorTable {
                 ids
             },
             bsp_lapic_id: bsp_lapic_id(),
+            rtc_century: 0,
         }
     }
 }
@@ -196,18 +201,34 @@ unsafe fn collect_madt_processors(
     }
 
     // The entries are 8-byte physical addresses from offset 36 (after the
-    // common header) to `length`.
+    // common header) to `length`. The walk collects *two* tables: the MADT
+    // for the processor enumeration, and the FADT for the wall clock's
+    // century register. Stopping at the first MADT would leave the FADT
+    // unexamined when it precedes the MADT, so every entry is visited and
+    // each table is recorded at most once — a FADT whose century register
+    // genuinely reads 0 ("none") must not be re-read forever.
     let entry_count = length.saturating_sub(36) / 8;
+    let mut madt_found = false;
+    let mut fadt_found = false;
     for index in 0..entry_count {
         let entry = unsafe { read_u64_le(base.add(36 + index * 8)) };
         if entry == 0 {
             continue;
         }
         // A failure inside one table is not a reason to stop: the walk keeps
-        // looking for the MADT among the remaining entries.
-        if unsafe { try_madt(entry, table) }.is_some() && table.count != 0 {
+        // looking for the remaining tables among the other entries.
+        if !madt_found && unsafe { try_madt(entry, table) }.is_some() && table.count != 0 {
+            madt_found = true;
+        }
+        if !fadt_found && unsafe { try_fadt(entry, table) }.is_some() {
+            fadt_found = true;
+        }
+        if madt_found && fadt_found {
             return Ok(());
         }
+    }
+    if madt_found {
+        return Ok(());
     }
     Err(DiscoveryError::NoMadt)
 }
@@ -259,6 +280,40 @@ unsafe fn try_madt(address: u64, table: &mut ProcessorTable) -> Option<()> {
         }
         cursor += entry_length;
     }
+    Some(())
+}
+
+/// Read one ACPI table and, when it is the FADT, record the wall clock's
+/// century register index.
+///
+/// The FADT's `CENTURY` field sits at byte offset 55 — after `MONTH_ALRM`
+/// and `DAY_ALRM`, per the ACPI spec's fixed-layout table. It names the
+/// CMOS register that holds the century; the kernel's CMOS reader needs it
+/// to turn the wall clock into a real year. `0` there is firmware saying
+/// "no century register", which the kernel infers around instead.
+///
+/// # Safety
+///
+/// `address` must be a readable ACPI table address.
+unsafe fn try_fadt(address: u64, table: &mut ProcessorTable) -> Option<()> {
+    let base = (address as usize) as *const u8;
+    let signature = unsafe { read_bytes(base, 4) };
+    if &signature[..4] != b"FACP" {
+        return None;
+    }
+    let length = unsafe { read_u32_le(base.add(4)) } as usize;
+    // ACPI 1.0 fixed the FADT at 128 bytes, so a table shorter than the
+    // century field's offset plus one is either a truncated record or a
+    // pre-ACPI fragment; neither is safe to read past the header.
+    if length < 56 {
+        return None;
+    }
+    unsafe {
+        if checksum(base, length) != 0 {
+            return None;
+        }
+    }
+    table.rtc_century = unsafe { *base.add(55) };
     Some(())
 }
 

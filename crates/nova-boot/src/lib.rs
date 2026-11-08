@@ -42,7 +42,13 @@ pub const MAGIC: [u8; 4] = *b"NVBP";
 pub const PROTOCOL_MAJOR: u16 = 1;
 
 /// Minor protocol version. A kernel may accept an older minor.
-pub const PROTOCOL_MINOR: u16 = 0;
+///
+/// `1` added `acpi_century` at the end of the snapshot: the FADT's
+/// `RTC century` register index, which the kernel's CMOS reader needs to
+/// interpret the century byte correctly. A minor-0 producer never writes the
+/// field, and the snapshot page is zeroed, so an older snapshot reads as
+/// "unknown century" — exactly the value zero.
+pub const PROTOCOL_MINOR: u16 = 1;
 
 /// Maximum memory-map rows a snapshot can carry.
 pub const MAX_MEMORY_REGIONS: usize = 64;
@@ -247,6 +253,12 @@ pub struct BootProtocol {
     pub selected_entry: u16,
     pub boot_mode: u16,
     pub reserved: u16,
+    /// The FADT's `RTC century` register index — which CMOS register holds
+    /// the century for the wall clock. `0` means "unknown": the producer
+    /// found no FADT (or a minor-0 producer predated the field), and the
+    /// kernel falls back to its own inference. The snapshot page is zeroed,
+    /// so a producer that predates the field reads as zero here.
+    pub acpi_century: u8,
 }
 
 impl BootProtocol {
@@ -278,6 +290,7 @@ impl BootProtocol {
             selected_entry: 0,
             boot_mode: 0,
             reserved: 0,
+            acpi_century: 0,
         }
     }
 
@@ -294,6 +307,12 @@ impl BootProtocol {
         }
         if self.reserved != 0 {
             return Err(BootProtocolError::ReservedField);
+        }
+        // The century field is a CMOS register index: port 0x70's high bit is
+        // the NMI control, so a register index past 0x7F cannot be read. `0`
+        // means "unknown" and is always acceptable.
+        if self.acpi_century > 0x7F {
+            return Err(BootProtocolError::BadAcpiCentury);
         }
         if self.boot_mode != 0 && BootMode::from_code(self.boot_mode).is_none() {
             return Err(BootProtocolError::BadBootMode);
@@ -394,6 +413,7 @@ pub enum BootProtocolError {
     InitramfsOutsideMemory,
     BadFramebuffer,
     BadBootMode,
+    BadAcpiCentury,
 }
 
 impl BootProtocolError {
@@ -415,6 +435,7 @@ impl BootProtocolError {
             Self::InitramfsOutsideMemory => "initramfs-outside-memory",
             Self::BadFramebuffer => "bad-framebuffer",
             Self::BadBootMode => "bad-boot-mode",
+            Self::BadAcpiCentury => "bad-acpi-century",
         }
     }
 }

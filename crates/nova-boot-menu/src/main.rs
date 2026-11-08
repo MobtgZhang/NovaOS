@@ -734,6 +734,9 @@ fn boot_kernel(
         addr_of_mut!((*snapshot).selected_entry).write(selected_entry);
         addr_of_mut!((*snapshot).boot_mode).write(boot_mode);
         addr_of_mut!((*snapshot).reserved).write(0);
+        // The FADT's wall-clock century register, for the kernel's CMOS
+        // reader. Zero when no FADT was found — the kernel infers instead.
+        addr_of_mut!((*snapshot).acpi_century).write(processors.rtc_century);
     }
 
     // Validate the snapshot before committing.

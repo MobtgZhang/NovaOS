@@ -38,6 +38,7 @@ pub mod m5;
 pub mod m6;
 pub mod m7;
 pub mod smp;
+pub mod wallclock;
 
 /// Every suite name the kernel runs, in order.
 ///
@@ -103,6 +104,8 @@ pub const SUITE_NAMES: &[&str] = &[
     "net_icmp_echo",
     "net_dhcp_lease",
     "net_socket_api",
+    // The wall clock: the CMOS RTC behind the filesystem's timestamps.
+    "wall_clock",
     // M8: SMP bring-up.
     "smp_cpu_state",
 ];

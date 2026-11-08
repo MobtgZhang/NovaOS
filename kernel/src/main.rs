@@ -53,6 +53,7 @@ mod sync;
 mod syscall;
 mod task;
 mod test;
+mod time;
 
 use crate::arch::capabilities::Console as _;
 use crate::boot::BootInfo;

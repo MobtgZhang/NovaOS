@@ -29,6 +29,7 @@ pub mod paging;
 pub mod percpu;
 pub mod pit;
 pub mod port_io;
+pub mod rtc;
 pub mod smp;
 
 pub mod console;

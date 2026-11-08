@@ -177,9 +177,18 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - 没有 I/O APIC、没有 MSI/MSI-X、没有 IRQ 路由表；所有设备（virtio-blk、virtio-net、PS/2）都靠**在时钟 tick 里轮询**（idt.rs:1332-1343 甚至在 tick handler 里直接轮询 PS/2 控制器）。
 - 影响：a) I/O 吞吐被 100 Hz tick 限死（virtio-net 的 `POLL_BUDGET=100_000_000` 次自旋，`drivers/virtio/net.rs:118`，一次收包可能自旋数秒）；b) 中断驱动的全部基础设施（下半部、软中断、tasklet、wakeup）为零，将来接 NVMe/USB 必须从零建。
 
-### 4.3 时间子系统单薄〔未实现〕**Medium**
+### 4.3 时间子系统单薄〔部分实现：墙上时钟已就绪（2026-11-08）；HPET/TSC 仍未做〕**Medium**
 
-- 只有 PIT（`arch/x86_64/pit.rs`）+ 被意外依赖的 APIC timer；无 HPET、无 TSC 校准（`msr.rs` 存在但没用它做时间源）、无 RTC/墙上时钟。系统没有任何"绝对时间"概念，这直接导致文件系统无法实现时间戳（§6.3）。
+- 只有 PIT（`arch/x86_64/pit.rs`）+ 被意外依赖的 APIC timer；无 HPET、无 TSC 校准（`msr.rs` 存在但没用它做时间源）。~~系统没有任何"绝对时间"概念~~ → **CMOS RTC 墙上时钟已实现**（提交本节所述 Phase E），文件系统时间戳（§6.2）的地基已具备。
+
+> **已实现（墙上时钟，2026-11-08）**：`kernel/src/arch/x86_64/rtc.rs`（CMOS RTC 驱动）+ `kernel/src/time.rs`（`wall_clock_seconds() -> Option<u64>` 门面）+ 新 boot 套件 `wall_clock`（8 用例，boot **66 suites / 236 cases 全绿**）。要点：
+> - **每次调用实读，不缓存快照**：读一次只做两打端口 I/O 周期，比带时间戳的文件操作便宜两个数量级；缓存的"开机时刻"会随 uptime 越来越陈旧，故不采用。`None`（读不稳/日期不合理）时调用方省略时间戳而非记录垃圾值。
+> - **硬件细节全覆盖**：BCD/二进制（StatusB bit2）、12h/24h（StatusB bit1，PM 位在小时寄存器 raw bit7，12AM→0、12PM→12）、UIP 更新周期（StatusA bit7 等待 + 连续两次读一致才算成功，`UIP_BUDGET`/`READ_BUDGET` 有界，病态时钟返回 `None` 而非挂死）。
+> - **世纪寄存器经 boot 协议传入**：FADT（"FACP"）offset 55 的 `RTC century` 由 nova-boot-menu 的 XSDT 遍历读出（与 MADT 双表并行扫描、签名+长度≥56+校验和三重验证），随 `BootProtocol` 末尾追加的 `acpi_century: u8` 字段携带；`PROTOCOL_MINOR` 0→1（字段逐字段读写 + 快照页清零，旧 menu 读到 0 = "未知世纪"，安全；版本门使旧内核干净拒绝新 menu）。无 FADT 时内核按 2000+year 推断。协议侧新增 `BadAcpiCentury` 校验（寄存器索引 > 0x7F 拒绝——port 0x70 的 bit7 是 NMI 控制位，不是地址位）。
+> - **并发**：CMOS 端口对是全机状态，`sync::SpinLock` 串行化（irq-safe、按 CPU 槽位重入）；NMI 位在会话内保存、逐次索引写恢复。
+> - **日历算术**：`days_from_civil` 用 March-based 的 Hinnant 公式（`153*m+2)/5`，闰日落在二月末不前移），已知值锚定 1970-01-01=0、2000-01-01=946684800、2024-02-29/03-01、2026-11-08=1794096000。
+> - 仍未做：HPET、TSC 校准（高精度时间源）——tick 仍是 100 Hz PIT，I/O 吞吐瓶颈（§4.2）不变。
+
 
 ### 4.4 中断恢复路径 RSI/RDI 互换〔缺陷〕**High** → **已修复并验证（2026-11-08，随 §2.5 调试发现）**
 

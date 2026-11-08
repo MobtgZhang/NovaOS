@@ -378,6 +378,9 @@ pub unsafe fn capture() -> &'static BootInfo {
 
         // The mode the menu selected, carried through to `init` by syscall.
         (&raw mut (*target).boot_mode).write(snapshot.boot_mode);
+        // The wall clock's century register, from the boot manager's FADT
+        // walk. Zero when no FADT was found — the reader infers instead.
+        (&raw mut (*target).acpi_century).write(snapshot.acpi_century);
     }
 
     // SAFETY: `capture` owns the single write, and no concurrent writer exists this
