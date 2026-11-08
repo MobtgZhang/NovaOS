@@ -40,10 +40,10 @@ use nova_fs::scope::{FileScope, ScopeSet};
 use nova_ipc::Message;
 use nova_protocols::ProtocolVersion;
 use nova_protocols::file::{
-    FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_LIST,
-    FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE, FILE_READ_REPLY_SIZE,
-    FILE_VERSION, FileCloseReply, FileDirEntry, FileKind, FileListReply, FileOpenReply,
-    FileReadReply, FileStatReply, FileWriteReply,
+    FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_DELETE,
+    FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT,
+    FILE_OP_WRITE, FILE_READ_REPLY_SIZE, FILE_VERSION, FileCloseReply, FileDirEntry, FileKind,
+    FileListReply, FileOpenReply, FileReadReply, FileStatReply, FileWriteReply,
 };
 use nova_protocols::negotiate;
 
@@ -92,6 +92,12 @@ pub const MAX_MOUNTS: usize = 2;
 /// other — the two are checked by construction rather than by remembering to
 /// keep the counters apart.
 const DISK_WIRE_BIT: u64 = 1 << 63;
+
+/// The owner value for an open the server made on its own behalf.
+///
+/// Real task slots are bounded by [`crate::services::MAX_TASKS`], so this can
+/// never match a task's slot and a `kill_task` can never close it.
+const SERVER_OWNED: usize = usize::MAX;
 
 /// A disk mounted into the file namespace.
 pub struct DiskMount {
@@ -302,6 +308,12 @@ struct ServerFile {
     /// The path it was opened at, so the scope can be re-checked on every
     /// later operation.
     path: CanonicalPath,
+    /// The task slot that opened the file, so its death can close it.
+    ///
+    /// [`SERVER_OWNED`] for an open the server made on its own behalf and
+    /// closed within the same request — bookkeeping that outliving the
+    /// request would be a leak.
+    owner: usize,
 }
 
 /// The file server.
@@ -312,6 +324,13 @@ struct ServerFile {
 pub struct FileServer {
     fs: RamFs,
     open_files: [Option<ServerFile>; MAX_SERVER_FILES],
+    /// How many times each open-file slot has been reused.
+    ///
+    /// A disk file's wire handle carries its slot's generation, so a handle
+    /// that outlives its close cannot address the file that later claims the
+    /// slot — the handle's generation no longer matches the slot's, and the
+    /// lookup refuses it instead of silently redirecting it.
+    generations: [u16; MAX_SERVER_FILES],
     mounts: [Option<DiskMount>; MAX_MOUNTS],
 }
 
@@ -336,6 +355,7 @@ impl FileServer {
         Self {
             fs: RamFs::new(),
             open_files: [None; MAX_SERVER_FILES],
+            generations: [0; MAX_SERVER_FILES],
             mounts: [None, None],
         }
     }
@@ -397,6 +417,7 @@ impl FileServer {
         // overflow the stack.
         self.fs.clear();
         self.open_files = [None; MAX_SERVER_FILES];
+        self.generations = [0; MAX_SERVER_FILES];
         self.mounts = [None, None];
     }
 
@@ -488,6 +509,7 @@ impl FileServer {
         &mut self,
         index: usize,
         canonical: &CanonicalPath,
+        owner: usize,
     ) -> Result<(u64, u32), FsError> {
         let mount = self.mounts[index].as_mut().ok_or(FsError::NotFound)?;
         let Some(relative) = Self::mounted_relative(mount.path.as_bytes(), canonical.as_bytes())
@@ -507,6 +529,7 @@ impl FileServer {
                 position: 0,
             },
             path,
+            owner,
         )?;
         let _ = read_only;
 
@@ -517,10 +540,12 @@ impl FileServer {
     ///
     /// The scope check happens before the path is resolved — before the mount
     /// table is even consulted — so a caller without a grant learns nothing
-    /// about which disks are mounted, let alone what is on them.
-    pub fn open_scoped(
+    /// about which disks are mounted, let alone what is on it. The open is
+    /// recorded against `owner`'s task slot, so the owner's death closes it.
+    pub fn open_for_task(
         &mut self,
         scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        owner: usize,
         path: &[u8],
         required: Rights,
     ) -> Result<(u64, u32), FsError> {
@@ -530,7 +555,7 @@ impl FileServer {
         }
 
         if let Some(index) = self.mount_covering(&canonical) {
-            return self.open_mounted(index, &canonical);
+            return self.open_mounted(index, &canonical, owner);
         }
 
         let handle = self.fs.open_scoped(scopes, path, required)?;
@@ -539,8 +564,24 @@ impl FileServer {
             .metadata(canonical.as_bytes())
             .map(|metadata| metadata.size)
             .unwrap_or(0);
-        let wire = self.remember(Origin::Ram(handle), canonical)?;
+        let wire = self.remember(Origin::Ram(handle), canonical, owner)?;
         Ok((wire, size))
+    }
+
+    /// Open a file for a client whose identity the server does not track.
+    ///
+    /// The protocol path goes through [`FileServer::open_for_task`], which
+    /// records the caller so its death can reclaim the file. This entry point
+    /// is for the server's own opens — a truncation an `open` with the
+    /// truncate flag just performed — which are closed within the same
+    /// request and never outlive it.
+    pub fn open_scoped(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        path: &[u8],
+        required: Rights,
+    ) -> Result<(u64, u32), FsError> {
+        self.open_for_task(scopes, SERVER_OWNED, path, required)
     }
 
     /// Read from a file the client has open.
@@ -642,14 +683,60 @@ impl FileServer {
                 }
             }
         }
-        for slot in self.open_files.iter_mut() {
+        for (index, slot) in self.open_files.iter_mut().enumerate() {
             if let Some(entry) = slot
                 && entry.wire == wire
             {
                 *slot = None;
+                // The slot's next tenant must not be addressable by this
+                // handle: bump the generation the next disk wire for this
+                // slot will carry.
+                self.generations[index] = self.generations[index].wrapping_add(1);
             }
         }
         Ok(())
+    }
+
+    /// Close every file a task has open, and say how many.
+    ///
+    /// Called from `kill_task`: a dead client's authority is withdrawn, and
+    /// with it the open files that authority was exercising. Without this,
+    /// the thirty-two `MAX_SERVER_FILES` slots could be drained by clients
+    /// that are never coming back, and every later open in the system would
+    /// fail as a quota — a denial of service paid for by nobody in particular.
+    ///
+    /// The slot is reclaimed *before* the underlying file is released, so a
+    /// failed flush cannot strand a dead client's file in the table; the
+    /// flush is best-effort, because the client it would be acknowledged to
+    /// no longer exists. A file the server opened on its own behalf is never
+    /// a match: its owner is [`SERVER_OWNED`], which no task slot can equal.
+    pub fn close_owner(&mut self, owner: usize) -> usize {
+        let mut closed = 0usize;
+        for index in 0..MAX_SERVER_FILES {
+            let Some(entry) = self.open_files[index] else {
+                continue;
+            };
+            if entry.owner != owner {
+                continue;
+            }
+            self.open_files[index] = None;
+            self.generations[index] = self.generations[index].wrapping_add(1);
+
+            match entry.origin {
+                Origin::Ram(handle) => {
+                    let _ = self.fs.close(handle);
+                }
+                Origin::Disk { mount, .. } => {
+                    if let Some(mount) = self.mounts.get_mut(mount).and_then(|m| m.as_mut())
+                        && !mount.read_only
+                    {
+                        let _ = mount.disk.flush();
+                    }
+                }
+            }
+            closed = closed.saturating_add(1);
+        }
+        closed
     }
 
     /// Empty an open file, under the caller's scopes.
@@ -672,47 +759,128 @@ impl FileServer {
         }
     }
 
+    /// Delete a file by path, under the caller's scopes.
+    ///
+    /// Removing a name is a write to the directory it lives in, so the check
+    /// is `WRITE` on the path itself — the same right creating it needed.
+    /// Only the disk format has a delete: the RAM filesystem holds its files
+    /// for the whole session, and reports the operation as unsupported
+    /// rather than half-honouring it.
+    pub fn delete_scoped(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        path: &[u8],
+    ) -> Result<(), FsError> {
+        let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
+        if scopes.denies(&canonical, Rights::WRITE) {
+            return Err(FsError::Denied);
+        }
+
+        let Some(index) = self.mount_covering(&canonical) else {
+            return Err(FsError::Unsupported);
+        };
+        let Some(relative) = ({
+            let mount = self.mounts[index].as_ref().ok_or(FsError::NotFound)?;
+            Self::mounted_relative(mount.path.as_bytes(), canonical.as_bytes())
+        }) else {
+            // The request *is* the mount point: a directory, and directories
+            // are not files this format can delete.
+            return Err(FsError::IsADirectory);
+        };
+
+        let mount = self.mounts[index].as_mut().ok_or(FsError::NotFound)?;
+        mount.disk.delete(relative)
+    }
+
+    /// Rename a file, under the caller's scopes.
+    ///
+    /// Both names need a write grant: the old name is removed and the new
+    /// one appears, and each of those is a change to a directory the client
+    /// may not own. The rename happens inside one filesystem, so the two
+    /// names must be covered by the same mount — or both by none, for the
+    /// RAM filesystem, which has no rename and refuses rather than guessing.
+    pub fn rename_scoped(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        from: &[u8],
+        to: &[u8],
+    ) -> Result<(), FsError> {
+        let old = canonicalize(from).map_err(FsError::InvalidPath)?;
+        let new = canonicalize(to).map_err(FsError::InvalidPath)?;
+        if scopes.denies(&old, Rights::WRITE) || scopes.denies(&new, Rights::WRITE) {
+            return Err(FsError::Denied);
+        }
+
+        let old_mount = self.mount_covering(&old);
+        let new_mount = self.mount_covering(&new);
+        match (old_mount, new_mount) {
+            (Some(index), Some(same)) if index == same => {
+                let relative_from = {
+                    let mount = self.mounts[index].as_ref().ok_or(FsError::NotFound)?;
+                    Self::mounted_relative(mount.path.as_bytes(), old.as_bytes())
+                        .ok_or(FsError::IsADirectory)?
+                };
+                let relative_to = {
+                    let mount = self.mounts[index].as_ref().ok_or(FsError::NotFound)?;
+                    Self::mounted_relative(mount.path.as_bytes(), new.as_bytes())
+                        .ok_or(FsError::IsADirectory)?
+                };
+                let mount = self.mounts[index].as_mut().ok_or(FsError::NotFound)?;
+                mount.disk.rename(relative_from, relative_to)
+            }
+            // Cross-mount renames do not exist here, and neither does a RAM
+            // rename: both are refused as unsupported rather than silently
+            // turned into a copy.
+            _ => Err(FsError::Unsupported),
+        }
+    }
+
     /// One open file's record.
     fn entry(&self, wire: u64) -> Result<ServerFile, FsError> {
         self.open_files
             .iter()
             .flatten()
             .find(|entry| entry.wire == wire)
-            .map(|entry| ServerFile {
-                wire: entry.wire,
-                origin: entry.origin,
-                path: entry.path,
-            })
+            .copied()
             .ok_or(FsError::BadHandle)
     }
 
     /// Handle one file-protocol request, returning the reply message.
     ///
     /// This is the server side of the protocol. The caller supplies the scopes
-    /// of the *requesting* task: the server executes on the client's behalf,
-    /// so the client's grants, not the server's, decide what is allowed.
+    /// and the task slot *of the requesting task*: the server executes on the
+    /// client's behalf, so the client's grants decide what is allowed, and the
+    /// client's slot is recorded so its death reclaims what it opened.
     pub fn handle_message(
         &mut self,
         scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        task_slot: usize,
         request: &Message,
     ) -> Message {
         let opcode = request.opcode();
         let payload = request.payload();
 
         match opcode {
-            FILE_OP_OPEN => self.handle_open(scopes, payload),
+            FILE_OP_OPEN => self.handle_open(scopes, task_slot, payload),
             FILE_OP_READ => self.handle_read(scopes, payload),
             FILE_OP_WRITE => self.handle_write(scopes, payload),
             FILE_OP_CLOSE => self.handle_close(scopes, payload),
             FILE_OP_LIST => self.handle_list(scopes, payload),
             FILE_OP_LIST_AT => self.handle_list_at(scopes, payload),
             FILE_OP_STAT => self.handle_stat(scopes, payload),
+            FILE_OP_DELETE => self.handle_delete(scopes, payload),
+            FILE_OP_RENAME => self.handle_rename(scopes, payload),
             _ => reply_error(ErrorCode::Unsupported),
         }
     }
 
     /// The `open` operation.
-    fn handle_open(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+    fn handle_open(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        task_slot: usize,
+        payload: &[u8],
+    ) -> Message {
         // The header is the fixed layout `nova-protocols` defines; the path
         // follows it in the same payload.
         let Some((version, flags, path_len)) = read_open_header(payload) else {
@@ -729,7 +897,7 @@ impl FileServer {
         // Both flags are writes: one puts bytes where there were none, the
         // other takes them away. `required` therefore names the right the
         // *open* needs, which is what both the pre-check below and the
-        // resolution inside `open_scoped` consult.
+        // resolution inside `open_for_task` consult.
         let truncating = flags & FILE_FLAG_TRUNCATE != 0;
         let required = if creating || truncating {
             Rights::WRITE
@@ -751,7 +919,7 @@ impl FileServer {
             let _ = self.fs.create_file(path);
         }
 
-        match self.open_scoped(scopes, path, required) {
+        match self.open_for_task(scopes, task_slot, path, required) {
             Ok((wire, size)) => {
                 if truncating && let Err(error) = self.truncate_scoped(scopes, wire) {
                     // The file is open and must not stay open. A client that
@@ -848,6 +1016,53 @@ impl FileServer {
     /// The `list` operation.
     fn handle_list(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         self.list_from(scopes, payload, 0)
+    }
+
+    /// The `delete` operation: remove a file by name.
+    ///
+    /// Deleting is a write to the directory the name lives in, so the check
+    /// is `WRITE` on the path itself — the same right creating it needed.
+    /// Deleting is defined for the disk format, which is where names can be
+    /// removed; the RAM filesystem keeps its files for the whole session and
+    /// reports the operation as unsupported rather than half-honouring it.
+    fn handle_delete(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        let Some((version, path_len)) = read_path_header(payload) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if negotiate(FILE_VERSION, version).is_err() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let Some(path) = slice_at(payload, 16, path_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        match self.delete_scoped(scopes, path) {
+            Ok(()) => reply_status(),
+            Err(error) => reply_error(error.code()),
+        }
+    }
+
+    /// The `rename` operation: move a file's name.
+    ///
+    /// Both paths must resolve inside the same filesystem — the operation
+    /// never crosses a mount boundary, so a rename that would move a file
+    /// from RAM to disk is refused rather than silently copied.
+    fn handle_rename(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        let Some((version, old_len, new_len)) = read_rename_header(payload) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if negotiate(FILE_VERSION, version).is_err() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let Some(old) = slice_at(payload, 16, old_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        let Some(new) = slice_at(payload, 16 + old_len as usize, new_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        match self.rename_scoped(scopes, old, new) {
+            Ok(()) => reply_status(),
+            Err(error) => reply_error(error.code()),
+        }
     }
 
     /// The `list_at` operation: the same listing, starting at one child index.
@@ -1083,24 +1298,44 @@ impl FileServer {
         self.mounts.iter().flatten()
     }
 
+    /// How many files are open right now.
+    ///
+    /// The observer the reclaim tests read: a dead client's files must be
+    /// gone from this count, not merely unusable.
+    pub fn open_count(&self) -> usize {
+        self.open_files.iter().flatten().count()
+    }
+
     /// Remember an open file, returning the wire handle the client holds.
     ///
     /// The wire handle for a RAM file carries the slot and the generation, so
     /// a client that keeps a stale handle after a close cannot address a
-    /// reused slot. A disk file's wire handle carries its slot in *this*
-    /// table plus the bit that marks it as a disk handle; the disk's own
-    /// handle travels inside [`Origin::Disk`], where a stale one is caught by
-    /// the filesystem rather than by the wire.
-    fn remember(&mut self, origin: Origin, path: CanonicalPath) -> Result<u64, FsError> {
+    /// reused slot. A disk file's wire handle carries *this* table's slot,
+    /// that slot's generation, and the bit that marks it as a disk handle;
+    /// the generation is what makes a handle that outlived its close refuse
+    /// rather than address whatever later claimed the slot.
+    fn remember(
+        &mut self,
+        origin: Origin,
+        path: CanonicalPath,
+        owner: usize,
+    ) -> Result<u64, FsError> {
         for (index, slot) in self.open_files.iter_mut().enumerate() {
             if slot.is_none() {
                 let wire = match &origin {
                     Origin::Ram(handle) => {
                         ((handle.generation() as u64) << 32) | (handle.slot() as u64)
                     }
-                    Origin::Disk { .. } => DISK_WIRE_BIT | index as u64,
+                    Origin::Disk { .. } => {
+                        DISK_WIRE_BIT | ((self.generations[index] as u64) << 32) | index as u64
+                    }
                 };
-                *slot = Some(ServerFile { wire, origin, path });
+                *slot = Some(ServerFile {
+                    wire,
+                    origin,
+                    path,
+                    owner,
+                });
                 return Ok(wire);
             }
         }
@@ -1217,6 +1452,23 @@ fn read_path_header(payload: &[u8]) -> Option<(ProtocolVersion, u32)> {
     let minor = read_u16(payload, 2)?;
     let path_len = read_u32(payload, 8)?;
     Some((ProtocolVersion::new(major, minor), path_len))
+}
+
+/// The header of a `rename` request: two length-prefixed paths follow it.
+fn read_rename_header(payload: &[u8]) -> Option<(ProtocolVersion, u32, u32)> {
+    let major = read_u16(payload, 0)?;
+    let minor = read_u16(payload, 2)?;
+    let old_len = read_u32(payload, 8)?;
+    let new_len = read_u32(payload, 12)?;
+    Some((ProtocolVersion::new(major, minor), old_len, new_len))
+}
+
+/// A reply that says only "it worked".
+fn reply_status() -> Message {
+    let mut bytes = [0u8; 16];
+    write_protocol_version(&mut bytes, FILE_VERSION);
+    bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+    reply_bytes(&bytes)
 }
 
 /// A reply that carries only a status.

@@ -35,10 +35,11 @@
 
 use nova_abi::error::ErrorCode;
 use nova_protocols::file::{
-    FILE_CLOSE_REQUEST_SIZE, FILE_DIR_ENTRY_SIZE, FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE,
-    FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT,
-    FILE_OP_WRITE, FILE_OPEN_REPLY_SIZE, FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE,
-    FILE_VERSION, FILE_WRITE_REQUEST_SIZE, FileKind,
+    FILE_CLOSE_REQUEST_SIZE, FILE_DELETE_REQUEST_SIZE, FILE_DIR_ENTRY_SIZE, FILE_FLAG_CREATE,
+    FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST_AT,
+    FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_OPEN_REPLY_SIZE,
+    FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE, FILE_RENAME_REQUEST_SIZE, FILE_VERSION,
+    FILE_WRITE_REQUEST_SIZE, FileKind,
 };
 
 use crate::graphics::{MAX_PAYLOAD, read_u32, read_u64, reply_ok, service_request};
@@ -229,6 +230,60 @@ pub fn close(handle: u64) -> Result<(), ErrorCode> {
 
     let mut reply = [0u8; MAX_PAYLOAD];
     let length = service_request(SERVICE_FILE, FILE_OP_CLOSE, &request, &mut reply)?;
+    reply_ok(&reply[..length])
+}
+
+/// Delete the file at `path`.
+///
+/// Only a mounted disk's files can be deleted — the RAM filesystem holds its
+/// files for the whole session — so a path outside a mount is refused as
+/// [`ErrorCode::Unsupported`]. Deleting needs a write grant on the path, the
+/// same right creating it needed.
+pub fn delete(path: &[u8]) -> Result<(), ErrorCode> {
+    if path.is_empty() || path.len() > MAX_PATH {
+        return Err(ErrorCode::Invalid);
+    }
+
+    let mut request = [0u8; MAX_PAYLOAD];
+    write_version(&mut request);
+    request[8..12].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    request[16..16 + path.len()].copy_from_slice(path);
+
+    let mut reply = [0u8; MAX_PAYLOAD];
+    let length = service_request(
+        SERVICE_FILE,
+        FILE_OP_DELETE,
+        &request[..16 + path.len()],
+        &mut reply,
+    )?;
+    reply_ok(&reply[..length])
+}
+
+/// Rename the file at `from` to `to`.
+///
+/// Both names must live in the same filesystem — the operation never crosses
+/// a mount boundary — and both need a write grant. A handle to the file
+/// stays valid across the rename, exactly as a UNIX rename leaves an open
+/// descriptor alone.
+pub fn rename(from: &[u8], to: &[u8]) -> Result<(), ErrorCode> {
+    if from.is_empty() || to.is_empty() || from.len() > MAX_PATH || to.len() > MAX_PATH {
+        return Err(ErrorCode::Invalid);
+    }
+
+    let mut request = [0u8; MAX_PAYLOAD];
+    write_version(&mut request);
+    request[8..12].copy_from_slice(&(from.len() as u32).to_le_bytes());
+    request[12..16].copy_from_slice(&(to.len() as u32).to_le_bytes());
+    request[16..16 + from.len()].copy_from_slice(from);
+    request[16 + from.len()..16 + from.len() + to.len()].copy_from_slice(to);
+
+    let mut reply = [0u8; MAX_PAYLOAD];
+    let length = service_request(
+        SERVICE_FILE,
+        FILE_OP_RENAME,
+        &request[..16 + from.len() + to.len()],
+        &mut reply,
+    )?;
     reply_ok(&reply[..length])
 }
 

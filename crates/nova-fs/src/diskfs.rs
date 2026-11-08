@@ -736,9 +736,116 @@ impl<D: BlockDevice> DiskFs<D> {
         self.device.flush().map_err(map_device_error)
     }
 
+    /// Delete the file at `path`.
+    ///
+    /// The slot is freed by zeroing its name and length — the two fields a
+    /// free slot must carry — and the directory sector is rewritten once, so
+    /// the on-medium image never names a file the memory has forgotten or
+    /// the other way around. A crash before the rewrite leaves the file
+    /// exactly as it was: the old directory is still consistent with the
+    /// old data, so deletion is a step the medium either took whole or not
+    /// at all.
+    ///
+    /// The file's data blocks are not erased: the slot's extent stays owned
+    /// by the slot, and the next `create` that claims the slot overwrites
+    /// them. What the delete must guarantee is only that no *name* reaches
+    /// the stale bytes.
+    ///
+    /// A handle a caller still holds becomes [`FsError::BadHandle`] on its
+    /// next use — the slot it names is no longer claimed. The identity is
+    /// checked against the directory rather than remembered, so there is no
+    /// window in which a deleted file is still writable.
+    pub fn delete(&mut self, path: &[u8]) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+
+        let name = match split_rooted(path)? {
+            Rooted::Root => return Err(FsError::IsADirectory),
+            Rooted::Leaf(name) => name,
+            Rooted::Nested(first) => {
+                return Err(match self.find_name(first) {
+                    Some(_) => FsError::NotADirectory,
+                    None => FsError::NotFound,
+                });
+            }
+        };
+
+        let slot = self.find_name(name).ok_or(FsError::NotFound)?;
+        self.entries[slot] = Entry::free();
+        self.write_back_directory()?;
+        Ok(())
+    }
+
+    /// Rename the file at `from` to `to`.
+    ///
+    /// A rename changes one field of one directory entry — the name — and
+    /// the slot, and therefore the data extent behind the file, does not
+    /// move. The target name is validated and checked for a collision
+    /// *before* the entry is touched, so a refused rename leaves the
+    /// directory exactly as it was; and the rewrite that publishes the new
+    /// name is a single sector write, so a crash between the two leaves the
+    /// file under its old name rather than under a half-written one.
+    ///
+    /// Handles a caller already holds stay valid and now name the file's
+    /// new path: the handle's identity is the slot, not the name — the same
+    /// semantics a UNIX rename gives an open descriptor.
+    pub fn rename(&mut self, from: &[u8], to: &[u8]) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
+
+        let old = match split_rooted(from)? {
+            Rooted::Root => return Err(FsError::IsADirectory),
+            Rooted::Leaf(name) => name,
+            Rooted::Nested(first) => {
+                return Err(match self.find_name(first) {
+                    Some(_) => FsError::NotADirectory,
+                    None => FsError::NotFound,
+                });
+            }
+        };
+        let new = match split_rooted(to)? {
+            Rooted::Root => return Err(FsError::IsADirectory),
+            Rooted::Leaf(name) => name,
+            Rooted::Nested(first) => {
+                return Err(match self.find_name(first) {
+                    Some(_) => FsError::NotADirectory,
+                    None => FsError::NotFound,
+                });
+            }
+        };
+        validate_name(new)?;
+
+        let slot = self.find_name(old).ok_or(FsError::NotFound)?;
+        // `find_name` matches any live entry with the target name — including
+        // the source itself, so a rename onto its own name is refused rather
+        // than silently rewritten.
+        if self.find_name(new).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
+
+        let mut entry = self.entries[slot];
+        entry.name = [0u8; NAME_FIELD_BYTES];
+        entry.name[..new.len()].copy_from_slice(new);
+        entry.name_len = new.len();
+        self.entries[slot] = entry;
+        self.write_back_directory()?;
+        Ok(())
+    }
+
     /// Borrow the device, for callers that need the raw disk beside the files.
     pub fn device(&mut self) -> &mut D {
         &mut self.device
+    }
+
+    /// Take the device back, ending the filesystem.
+    ///
+    /// For callers that mounted a device they still own — the round-trip
+    /// tests, which remount the same image to check that a change reached
+    /// the medium rather than only the cache.
+    pub fn into_device(self) -> D {
+        self.device
     }
 
     /// The reserved test area as a sector range, if the image has one.
@@ -1299,5 +1406,113 @@ mod tests {
             size: 0,
         }; 2];
         assert_eq!(fs.list(&mut entries), 2);
+    }
+
+    #[test]
+    fn a_delete_frees_the_slot_for_a_new_file() {
+        let mut fs = mount(image_device(), false);
+        fs.create(b"/gone.txt").expect("create");
+        fs.delete(b"/gone.txt").expect("delete");
+
+        assert_eq!(fs.file_count(), 0);
+        assert_eq!(fs.lookup(b"/gone.txt"), Err(FsError::NotFound));
+        // The freed slot takes a new file, and the new file's bytes are not
+        // the old file's: the name is what decides, and it is gone.
+        let id = fs.create(b"/fresh.txt").expect("create on the freed slot");
+        fs.write(id, 0, b"new").expect("write");
+        let mut out = [0u8; 8];
+        assert_eq!(fs.read_path(b"/fresh.txt", &mut out).expect("read"), 3);
+        assert_eq!(&out[..3], b"new");
+    }
+
+    #[test]
+    fn a_deleted_file_is_unwritable_through_its_old_handle() {
+        let mut fs = mount(image_device(), false);
+        let id = fs.create(b"/doomed.txt").expect("create");
+        fs.delete(b"/doomed.txt").expect("delete");
+        // The identity is checked against the directory, so a handle that
+        // outlived its file cannot keep writing it.
+        assert_eq!(fs.write(id, 0, b"zombie"), Err(FsError::BadHandle));
+    }
+
+    #[test]
+    fn a_delete_of_a_missing_file_is_a_not_found() {
+        let mut fs = mount(image_device(), false);
+        assert_eq!(fs.delete(b"/absent.txt"), Err(FsError::NotFound));
+        // Nested paths are not files this format can name.
+        assert_eq!(fs.delete(b"/dir/absent.txt"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn a_read_only_mount_refuses_delete_and_rename() {
+        let mut fs = mount(image_device(), true);
+        assert_eq!(fs.delete(b"/whatever.txt"), Err(FsError::ReadOnly));
+        assert_eq!(
+            fs.rename(b"/whatever.txt", b"/elsewhere.txt"),
+            Err(FsError::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn a_rename_moves_the_name_and_keeps_the_bytes() {
+        let mut fs = mount(image_device(), false);
+        let id = fs.create(b"/before.txt").expect("create");
+        fs.write(id, 0, b"payload").expect("write");
+
+        fs.rename(b"/before.txt", b"/after.txt").expect("rename");
+        assert_eq!(fs.lookup(b"/before.txt"), Err(FsError::NotFound));
+        assert_eq!(fs.file_count(), 1);
+
+        // The handle taken before the rename still reads the file: identity
+        // is the slot, not the name.
+        let mut out = [0u8; 8];
+        assert_eq!(fs.read(id, 0, &mut out).expect("read"), 7);
+        assert_eq!(&out[..7], b"payload");
+        assert_eq!(fs.read_path(b"/after.txt", &mut out).expect("read"), 7);
+    }
+
+    #[test]
+    fn a_rename_refuses_a_colliding_target_without_touching_anything() {
+        let mut fs = mount(image_device(), false);
+        let id = fs.create(b"/first.txt").expect("create first");
+        fs.create(b"/second.txt").expect("create second");
+
+        assert_eq!(
+            fs.rename(b"/first.txt", b"/second.txt"),
+            Err(FsError::AlreadyExists)
+        );
+        // Both files are exactly where they were.
+        assert!(fs.lookup(b"/first.txt").is_ok());
+        assert!(fs.lookup(b"/second.txt").is_ok());
+        let stat = fs.stat(id).expect("stat");
+        assert_eq!(stat.size, 0);
+    }
+
+    #[test]
+    fn a_rename_onto_its_own_name_is_refused() {
+        let mut fs = mount(image_device(), false);
+        fs.create(b"/same.txt").expect("create");
+        assert_eq!(
+            fs.rename(b"/same.txt", b"/same.txt"),
+            Err(FsError::AlreadyExists)
+        );
+    }
+
+    #[test]
+    fn a_deleted_slot_round_trips_through_the_medium() {
+        // The delete reaches the device, not just the memory: a fresh mount
+        // of the same image must agree that the file is gone.
+        let mut device = image_device();
+        {
+            let mut fs = mount(device, false);
+            let id = fs.create(b"/temp.txt").expect("create");
+            fs.write(id, 0, b"data").expect("write");
+            fs.delete(b"/temp.txt").expect("delete");
+            fs.flush().expect("flush");
+            device = fs.into_device();
+        }
+        let fs = mount(device, false);
+        assert_eq!(fs.file_count(), 0);
+        assert_eq!(fs.lookup(b"/temp.txt"), Err(FsError::NotFound));
     }
 }

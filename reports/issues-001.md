@@ -233,15 +233,19 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 - `kernel/src/services/fs.rs`：FileServer 内部是**硬编码 mount 表**，`MAX_MOUNTS = 2`；路径→文件系统的分派不是可插拔接口。加第二个真实文件系统（FAT、ext2）必须改 FileServer 本体。
 
-### 6.2 磁盘格式 NOVADSK 的结构性缺陷〔缺陷〕**High**
+### 6.2 磁盘格式 NOVADSK 的结构性缺陷〔部分修复（2026-11-08）：句柄 generation + delete/rename 已实现；两步写不一致仍开放〕**High**
 
-- `crates/nova_fs/src/diskfs.rs:92`：`MAX_SLOTS = 8` ——整个磁盘最多 8 个文件；固定 4 KiB 块；**没有 delete / rename / truncate / 目录层次 / 时间戳 / 权限 / 链接**。
-- 写路径（diskfs.rs:640-686）：**先写数据块、后改目录项长度**，两步之间掉电即产生"目录声称有长度、数据却是垃圾"的不一致；无日志、无校验和、无原子 rename。
-- wire handle 无 generation（`services/fs.rs:94,1101`）：客户端持有的句柄在服务端槽复用后（ABA）会**静默指向另一个文件**——能力系统"句柄即权限"的承诺在文件句柄上被打破。
+- ~~`crates/nova_fs/src/diskfs.rs:92`：`MAX_SLOTS = 8`~~ 槽位数仍为 8，固定 4 KiB 块不变；**delete / rename 已实现**（见下），目录层次 / 时间戳 / 权限 / 链接仍未做。
+- 写路径（diskfs.rs:640-686）**两步不一致仍未修**：先写数据块、后改目录项长度，两步之间掉电仍可产生不一致；无日志、无校验和（delete/rename 的单扇区目录重写是其上唯一的原子性来源，见下）。
+- ~~wire handle 无 generation~~ → **已修复并验证（2026-11-08）**：`FileServer` 现为每个打开文件表槽位维护 `generations: [u16; MAX_SERVER_FILES]`，磁盘文件的 wire handle 改为 `DISK_WIRE_BIT | (generation << 32) | slot`（RAM 句柄本就携带 RamFs 自己的 generation，无需改）。close/回收时槽位 generation 递增，陈旧句柄经 wire 等值查找失配 → `BadHandle`，而不是静默指向槽位的新租户（ABA）。测试：`disk_delete_rename.a_stale_disk_handle_cannot_address_a_reused_slot`。
 
-### 6.3 客户端死亡不回收打开文件〔缺陷〕**High**
+> **已实现（delete / rename，2026-11-08）**：`DiskFs::delete`/`DiskFs::rename`（nova-fs 层，8 个宿主测试）+ 内核 `FileServer::delete_scoped`/`rename_scoped`（scope 检查：两个名字都要 WRITE 授权）+ 协议新操作码 `FILE_OP_DELETE=8`/`FILE_OP_RENAME=9`（`FILE_VERSION` 1.0→1.1，negotiate 接受旧 minor，旧客户端不受影响；新增 `FileDeleteRequest`/`FileRenameRequest` wire 布局）+ 客户端 `fsclient::delete`/`fsclient::rename`。原子性设计：delete 置零槽位（名字+长度）后**单扇区**目录重写——崩溃前旧目录仍自洽，删除要么整体发生要么不发生；rename 只改一个目录项的名字字段，目标名校验与冲突检查先于任何改动，槽位（因此数据区）不动——打开句柄跨 rename 依然有效（UNIX 语义），被删除文件句柄下一次使用即 `BadHandle`。内核测试 `disk_delete_rename`（3 用例，boot **68 suites / 241 cases 全绿**）注册在 M5 组**之后**运行：磁盘映像整个 boot 共享，delete/rename 是真实破坏，不能触及仍依赖种子文件的 M5 测试。局限：RAM 文件系统仍无 delete/rename（返回 `Unsupported` 而非半支持）；跨挂载点 rename 拒绝。
 
-- `services/fs.rs:296-305`：`ServerFile` 没有 owner/task 字段，内核 kill 一个任务时（`kill_task → revoke_all` 能力级联是完备的）**无法回收它打开的文件**；32 个文件槽（`MAX_OPEN_FILES`）可被恶意/失败客户端耗尽，构成拒绝服务。这是"能力撤销即资源回收"这条招牌特色的直接违背，建议优先修。
+### 6.3 客户端死亡不回收打开文件〔缺陷〕**High** → **已修复并验证（2026-11-08）**
+
+> **已修复**：`ServerFile` 增加 `owner: usize`（打开者的任务槽位）；`FileServer::handle_message` 增加 `task_slot` 参数（dispatch 与 net 服务同款模式传入 `context.task_slot`），协议 open 路径经新的 `open_for_task` 记录 owner；服务器自用的 open（truncate 回退路径）记为哨兵 `SERVER_OWNED`，任何真实槽位都不会匹配。`kill_task → files.close_owner(slot)` 在能力撤销级联之后执行：**先回收槽位、后释放底层文件**（flush 失败不会把死客户端的文件困在表里，因为客户端已不存在、无从被告知）。测试：`file_server_reclaims_dead_clients`（2 用例）——死亡即 `open_count()→0`；先灌满 32 个槽再 kill，继承任务能重新打开满额文件，证明回收的是槽位本身而非仅句柄不可用。
+
+- 原缺陷：`services/fs.rs:296-305` 的 `ServerFile` 没有 owner/task 字段，内核 kill 一个任务时（`kill_task → revoke_all` 能力级联是完备的）无法回收它打开的文件；32 个文件槽（`MAX_OPEN_FILES`）可被恶意/失败客户端耗尽，构成拒绝服务——"能力撤销即资源回收"这条招牌特色的直接违背。现与 compositor 的 `remove_owner` 同构：能力撤销、文件回收、通道唤醒在同一个 `kill_task` 里完成。
 
 ### 6.4 RamFS 尺寸过小〔Low〕
 

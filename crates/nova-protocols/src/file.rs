@@ -27,7 +27,12 @@
 use crate::ProtocolVersion;
 
 /// The file protocol version this implementation speaks.
-pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+///
+/// Minor `1` added the `FILE_OP_DELETE` and `FILE_OP_RENAME` operations. The
+/// negotiation accepts an older minor, so a client that predates the two
+/// operations still talks to a server that has them: the version is a floor
+/// on what a peer may offer, not a requirement that it offer everything.
+pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 /// Opcode for opening a file.
 pub const FILE_OP_OPEN: u64 = 1;
@@ -56,6 +61,21 @@ pub const FILE_OP_STAT: u64 = 6;
 /// is that same listing *with a starting index*, so a client can page through
 /// a directory instead of being told only that it is incomplete.
 pub const FILE_OP_LIST_AT: u64 = 7;
+
+/// Opcode for deleting a file.
+///
+/// Added at protocol minor `1`. The path follows the header in the payload,
+/// exactly as [`FILE_OP_LIST`]'s does. A server whose protocol predates the
+/// operation refuses it as `Unsupported`, which a client can treat as "this
+/// filesystem has no delete" rather than as a transport failure.
+pub const FILE_OP_DELETE: u64 = 8;
+
+/// Opcode for renaming a file.
+///
+/// Added at protocol minor `1`. Two paths follow the header in the payload:
+/// the old name first, then the new one. Renaming is only ever defined within
+/// one filesystem — a server never crosses a mount boundary to satisfy one.
+pub const FILE_OP_RENAME: u64 = 9;
 
 /// Flag: open without failing if the file does not exist.
 pub const FILE_FLAG_CREATE: u32 = 1 << 0;
@@ -359,6 +379,48 @@ pub struct FileStatReply {
 /// Size of a file stat reply, in bytes.
 pub const FILE_STAT_REPLY_SIZE: usize = 24;
 
+/// A request to delete a file.
+///
+/// The path follows the header in the message's inline payload; `path_len`
+/// says how many bytes. The reply is a close-shaped status header.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct FileDeleteRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// Reserved flags. Must be zero.
+    pub flags: u32,
+    /// How many payload bytes carry the path.
+    pub path_len: u32,
+    /// Reserved. Must be zero.
+    pub reserved: u32,
+}
+
+/// Size of a file delete request, in bytes.
+pub const FILE_DELETE_REQUEST_SIZE: usize = 16;
+
+/// A request to rename a file.
+///
+/// Two paths follow the header in the payload: the old name's bytes first,
+/// then the new name's bytes, in that order with no padding between. Both
+/// must resolve inside the *same* filesystem — the operation never crosses a
+/// mount boundary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct FileRenameRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// Reserved flags. Must be zero.
+    pub flags: u32,
+    /// How many payload bytes carry the old path.
+    pub old_len: u32,
+    /// How many payload bytes carry the new path.
+    pub new_len: u32,
+}
+
+/// Size of a file rename request, in bytes.
+pub const FILE_RENAME_REQUEST_SIZE: usize = 16;
+
 const _: () = assert!(size_of::<FileOpenRequest>() == FILE_OPEN_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileOpenReply>() == FILE_OPEN_REPLY_SIZE);
 const _: () = assert!(size_of::<FileReadRequest>() == FILE_READ_REQUEST_SIZE);
@@ -373,6 +435,8 @@ const _: () = assert!(size_of::<FileDirEntry>() == FILE_DIR_ENTRY_SIZE);
 const _: () = assert!(size_of::<FileListReply>() == FILE_LIST_REPLY_SIZE);
 const _: () = assert!(size_of::<FileStatRequest>() == FILE_STAT_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileStatReply>() == FILE_STAT_REPLY_SIZE);
+const _: () = assert!(size_of::<FileDeleteRequest>() == FILE_DELETE_REQUEST_SIZE);
+const _: () = assert!(size_of::<FileRenameRequest>() == FILE_RENAME_REQUEST_SIZE);
 
 const _: () = assert!(core::mem::offset_of!(FileOpenRequest, version) == 0);
 const _: () = assert!(core::mem::offset_of!(FileOpenRequest, flags) == 4);
@@ -464,11 +528,12 @@ impl WireHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_OP_CLOSE, FILE_OP_LIST, FILE_OP_LIST_AT,
-        FILE_OP_OPEN, FILE_OP_READ, FILE_OP_STAT, FILE_OP_WRITE, FILE_VERSION, FileCloseReply,
-        FileCloseRequest, FileDirEntry, FileKind, FileListAtRequest, FileListReply,
-        FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply, FileReadRequest,
-        FileStatReply, FileStatRequest, FileWriteReply, FileWriteRequest, WireHandle,
+        FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST,
+        FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE,
+        FILE_VERSION, FileCloseReply, FileCloseRequest, FileDirEntry, FileKind, FileListAtRequest,
+        FileListReply, FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply,
+        FileReadRequest, FileStatReply, FileStatRequest, FileWriteReply, FileWriteRequest,
+        WireHandle,
     };
     use crate::ProtocolVersion;
     use nova_abi::ipc::MAX_INLINE_PAYLOAD;
@@ -568,8 +633,11 @@ mod tests {
 
     #[test]
     fn the_version_is_checked_before_anything_else() {
-        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 0));
+        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 1));
         assert!(crate::negotiate(FILE_VERSION, FILE_VERSION).is_ok());
+        // A minor-0 client still negotiates with a minor-1 server: the two
+        // new operations are refused individually, not by version gate.
+        assert!(crate::negotiate(FILE_VERSION, ProtocolVersion::new(1, 0)).is_ok());
         assert!(
             crate::negotiate(FILE_VERSION, ProtocolVersion::new(2, 0)).is_err(),
             "a different major version is a different protocol"
@@ -586,6 +654,8 @@ mod tests {
             FILE_OP_LIST,
             FILE_OP_STAT,
             FILE_OP_LIST_AT,
+            FILE_OP_DELETE,
+            FILE_OP_RENAME,
         ];
         for (index, opcode) in opcodes.iter().enumerate() {
             for other in &opcodes[index + 1..] {
@@ -612,7 +682,7 @@ mod tests {
             reserved: 0,
         };
         assert_eq!(request.version.major, 1);
-        assert_eq!(request.version.minor, 0);
+        assert_eq!(request.version.minor, 1);
         assert_eq!(request.flags, FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE);
         assert_eq!(request.path_len, 11);
         assert_eq!(request.reserved, 0);

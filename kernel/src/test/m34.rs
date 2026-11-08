@@ -38,7 +38,7 @@ use nova_cap::ObjectRef;
 use nova_fs::ramfs::FsError;
 use nova_ipc::endpoint::Side;
 use nova_ipc::message::Message;
-use nova_protocols::file::{FILE_OP_OPEN, FILE_VERSION};
+use nova_protocols::file::{FILE_OP_DELETE, FILE_OP_OPEN, FILE_OP_RENAME, FILE_VERSION};
 use nova_protocols::manifest::{Dependency, RestartDecision, ServiceManifest, ServiceState};
 use nova_protocols::shell::{ShellCommand, parse};
 
@@ -203,6 +203,19 @@ pub static M3_SUITES: &[TestSuite] = &[
 
 /// The M4 suites, in registration order.
 pub static M4_SUITES: &[TestSuite] = &[
+    TestSuite {
+        name: "file_server_reclaims_dead_clients",
+        cases: &[
+            (
+                "a_dead_clients_open_files_are_reclaimed",
+                a_dead_clients_open_files_are_reclaimed,
+            ),
+            (
+                "a_dead_client_does_not_drain_the_table",
+                a_dead_client_does_not_drain_the_table,
+            ),
+        ],
+    },
     TestSuite {
         name: "shell_ls",
         cases: &[
@@ -369,6 +382,29 @@ pub static M4_SUITES: &[TestSuite] = &[
         ],
     },
 ];
+
+/// The disk-format suites: delete, rename, and stale-handle refusal.
+///
+/// Registered *after* the M5 group rather than with the other M4 suites,
+/// because the disk image is one live medium for the whole boot: a delete
+/// here is real, and the M5 tests open the seeded `hello.txt` expecting it
+/// to exist. The three cases also chain: the rename produces the file the
+/// delete destroys, so a format with no create-through-protocol path — the
+/// gap §6.2 records — still leaves every case with a file to work on.
+pub static DISK_SUITES: &[TestSuite] = &[TestSuite {
+    name: "disk_delete_rename",
+    cases: &[
+        (
+            "a_stale_disk_handle_cannot_address_a_reused_slot",
+            a_stale_disk_handle_cannot_address_a_reused_slot,
+        ),
+        ("a_disk_file_can_be_renamed", a_disk_file_can_be_renamed),
+        (
+            "a_disk_file_can_be_deleted_by_name",
+            a_disk_file_can_be_deleted_by_name,
+        ),
+    ],
+}];
 
 // --- helpers ----------------------------------------------------------------
 
@@ -2461,7 +2497,7 @@ fn protocol_round_trips_a_file() -> Result<(), &'static str> {
 
     // An `open` request with the right version.
     let request = open_request(FILE_VERSION.major, FILE_VERSION.minor, b"/docs/notes.txt");
-    let reply = state.files.handle_message(&scopes, &request);
+    let reply = state.files.handle_message(&scopes, 0, &request);
     let status = reply_status(&reply);
     if status != 0 {
         return Err("the open request was refused");
@@ -2477,6 +2513,7 @@ fn protocol_round_trips_a_file() -> Result<(), &'static str> {
     request[24..28].copy_from_slice(&32u32.to_le_bytes());
     let reply = state.files.handle_message(
         &scopes,
+        0,
         &Message::with_payload(2, &request).map_err(|_| "the request was refused")?,
     );
     if reply_status(&reply) != 0 {
@@ -2519,7 +2556,7 @@ fn unknown_major_version_is_refused() -> Result<(), &'static str> {
         FILE_VERSION.minor,
         b"/docs/notes.txt",
     );
-    let reply = state.files.handle_message(&scopes, &request);
+    let reply = state.files.handle_message(&scopes, 0, &request);
     if reply_status(&reply) != ErrorCode::Unsupported.code() {
         return Err("an unknown major version was not refused");
     }
@@ -2553,7 +2590,7 @@ fn matching_version_is_accepted() -> Result<(), &'static str> {
     let scopes = state.scope_set_for(slot);
 
     let request = open_request(FILE_VERSION.major, FILE_VERSION.minor, b"/docs/notes.txt");
-    let reply = state.files.handle_message(&scopes, &request);
+    let reply = state.files.handle_message(&scopes, 0, &request);
     if reply_status(&reply) != 0 {
         return Err("the matching version was refused");
     }
@@ -2592,7 +2629,7 @@ fn newer_minor_version_is_refused() -> Result<(), &'static str> {
         FILE_VERSION.minor + 1,
         b"/docs/notes.txt",
     );
-    let reply = state.files.handle_message(&scopes, &request);
+    let reply = state.files.handle_message(&scopes, 0, &request);
     if reply_status(&reply) != ErrorCode::Unsupported.code() {
         return Err("a newer minor version was not refused");
     }
@@ -2803,6 +2840,297 @@ fn service_waits_for_dependencies() -> Result<(), &'static str> {
 }
 
 /// A manifest with a restart budget and a window.
+/// ---- §6.3: a dead client's open files are reclaimed -----------------------
+
+/// Open two files for a task through the owner-tracking path.
+fn open_two_for(
+    state: &mut KernelState,
+    slot: usize,
+    first: &[u8],
+    second: &[u8],
+) -> Result<(u64, u64), &'static str> {
+    let scopes = state.scope_set_for(slot);
+    let a = state
+        .files
+        .open_for_task(&scopes, slot, first, Rights::READ)
+        .map_err(|_| "an open was refused")?
+        .0;
+    let b = state
+        .files
+        .open_for_task(&scopes, slot, second, Rights::READ)
+        .map_err(|_| "an open was refused")?
+        .0;
+    Ok((a, b))
+}
+
+fn a_dead_clients_open_files_are_reclaimed() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
+    state
+        .grant_file_scope(slot, b"/", Rights::READ | Rights::WRITE)
+        .map_err(|_| "the grant was refused")?;
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/reclaimed-a.txt")
+        .map_err(|_| "cannot create /reclaimed-a.txt")?;
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/reclaimed-b.txt")
+        .map_err(|_| "cannot create /reclaimed-b.txt")?;
+
+    let _handles = open_two_for(&mut *state, slot, b"/reclaimed-a.txt", b"/reclaimed-b.txt")?;
+    if state.files.open_count() != 2 {
+        return Err("the opens did not land in the table");
+    }
+
+    // The kill is the reclaim point: the slots must be free again, not
+    // merely unusable.
+    if !state.kill_task(task) {
+        return Err("the kill was refused");
+    }
+    if state.files.open_count() != 0 {
+        return Err("a dead client's open files were not reclaimed");
+    }
+    Ok(())
+}
+
+fn a_dead_client_does_not_drain_the_table() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let victim = state.create_task().ok_or("task pool is empty")?;
+    let victim_slot = slot_of(&state, victim).ok_or("the new task has no slot")?;
+    let heir = state.create_task().ok_or("task pool is empty")?;
+    let heir_slot = slot_of(&state, heir).ok_or("the new task has no slot")?;
+    for slot in [victim_slot, heir_slot] {
+        state
+            .grant_file_scope(slot, b"/", Rights::READ | Rights::WRITE)
+            .map_err(|_| "the grant was refused")?;
+    }
+
+    // Drain the table with the victim's opens: the same file opened
+    // thirty-two times, once per slot. The RAM filesystem has its own
+    // open-file table with exactly this bound, so the two fill together.
+    let scopes = state.scope_set_for(victim_slot);
+    state
+        .files
+        .fs_mut()
+        .create_file(b"/drain.txt")
+        .map_err(|_| "cannot create /drain.txt")?;
+    for _ in 0..crate::services::fs::MAX_SERVER_FILES {
+        state
+            .files
+            .open_for_task(&scopes, victim_slot, b"/drain.txt", Rights::READ)
+            .map_err(|_| "the open was refused")?;
+    }
+    if state.files.open_count() != crate::services::fs::MAX_SERVER_FILES {
+        return Err("the table did not fill to its bound");
+    }
+
+    if !state.kill_task(victim) {
+        return Err("the kill was refused");
+    }
+
+    // The heir can open as many files as the table holds: every slot the
+    // dead client held is available again.
+    let scopes = state.scope_set_for(heir_slot);
+    for _ in 0..crate::services::fs::MAX_SERVER_FILES {
+        state
+            .files
+            .open_for_task(&scopes, heir_slot, b"/drain.txt", Rights::READ)
+            .map_err(|_| "the reclaimed slot was not usable")?;
+    }
+    Ok(())
+}
+
+/// ---- §6.2: disk handles carry a generation, delete and rename -------------
+
+/// Mount the writable test disk at its usual place and grant `slot` both
+/// rights on it.
+fn mount_writable_disk(state: &mut KernelState, slot: usize) -> Result<(), &'static str> {
+    state
+        .files
+        .mount_disk(0, crate::drivers::MOUNT_TEST, false)
+        .map_err(|error| error.name())?;
+    state
+        .grant_file_scope(
+            slot,
+            crate::drivers::MOUNT_TEST,
+            Rights::READ | Rights::WRITE,
+        )
+        .map_err(|_| "the grant was refused")?;
+    Ok(())
+}
+
+fn a_stale_disk_handle_cannot_address_a_reused_slot() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
+    mount_writable_disk(&mut *state, slot)?;
+    let scopes = state.scope_set_for(slot);
+
+    // First open: the wire carries the slot's current generation.
+    let (wire, _) = state
+        .files
+        .open_for_task(&scopes, slot, b"/media/test/hello.txt", Rights::READ)
+        .map_err(|_| "the first open was refused")?;
+    state
+        .files
+        .close(&scopes, wire)
+        .map_err(|_| "the close was refused")?;
+
+    // Second open lands on the same table slot — the first free one — and
+    // must carry a *different* wire, so a client that kept the first handle
+    // cannot silently address the second file.
+    let (wire_two, _) = state
+        .files
+        .open_for_task(&scopes, slot, b"/media/test/hello.txt", Rights::READ)
+        .map_err(|_| "the second open was refused")?;
+    if wire_two == wire {
+        return Err("a reused disk slot re-issued the same wire handle");
+    }
+
+    // The stale handle is refused rather than redirected.
+    let mut buffer = [0u8; 8];
+    match state.files.read(&scopes, wire, &mut buffer) {
+        Err(FsError::BadHandle) => {}
+        Ok(_) => return Err("a stale disk handle read the slot's new tenant"),
+        Err(other) => return Err(other.name()),
+    }
+    Ok(())
+}
+
+/// Build a file-protocol `delete` request.
+fn delete_request(path: &[u8]) -> Message {
+    let mut bytes = [0u8; 64];
+    bytes[0..2].copy_from_slice(&FILE_VERSION.major.to_le_bytes());
+    bytes[2..4].copy_from_slice(&FILE_VERSION.minor.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    bytes[16..16 + path.len()].copy_from_slice(path);
+    Message::with_payload(FILE_OP_DELETE, &bytes[..16 + path.len()])
+        .unwrap_or_else(|_| Message::new(0))
+}
+
+/// Build a file-protocol `rename` request.
+fn rename_request(from: &[u8], to: &[u8]) -> Message {
+    let mut bytes = [0u8; 96];
+    bytes[0..2].copy_from_slice(&FILE_VERSION.major.to_le_bytes());
+    bytes[2..4].copy_from_slice(&FILE_VERSION.minor.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(from.len() as u32).to_le_bytes());
+    bytes[12..16].copy_from_slice(&(to.len() as u32).to_le_bytes());
+    bytes[16..16 + from.len()].copy_from_slice(from);
+    bytes[16 + from.len()..16 + from.len() + to.len()].copy_from_slice(to);
+    Message::with_payload(FILE_OP_RENAME, &bytes[..16 + from.len() + to.len()])
+        .unwrap_or_else(|_| Message::new(0))
+}
+
+fn a_disk_file_can_be_deleted_by_name() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
+    mount_writable_disk(&mut *state, slot)?;
+    let scopes = state.scope_set_for(slot);
+
+    // The rename case produced this file; this case destroys it.
+    let path = b"/media/test/after.txt";
+    let (wire, _) = state
+        .files
+        .open_for_task(&scopes, slot, path, Rights::WRITE)
+        .map_err(|_| "the open was refused")?;
+    state
+        .files
+        .write(&scopes, wire, b"gone soon")
+        .map_err(|_| "the write was refused")?;
+
+    let reply = state
+        .files
+        .handle_message(&scopes, slot, &delete_request(path));
+    if reply_status(&reply) != 0 {
+        return Err("the delete was refused");
+    }
+
+    // The name is gone, and the handle that outlived the delete reads
+    // nothing: the identity is checked against the directory.
+    match state.files.open_for_task(&scopes, slot, path, Rights::READ) {
+        Err(FsError::NotFound) => {}
+        Ok(_) => return Err("a deleted file was still openable by name"),
+        Err(other) => return Err(other.name()),
+    }
+    let mut buffer = [0u8; 16];
+    match state.files.read(&scopes, wire, &mut buffer) {
+        Err(FsError::BadHandle) => {}
+        Ok(_) => return Err("a deleted file's handle still read"),
+        Err(other) => return Err(other.name()),
+    }
+    Ok(())
+}
+
+fn a_disk_file_can_be_renamed() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let task = state.create_task().ok_or("task pool is empty")?;
+    let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
+    mount_writable_disk(&mut *state, slot)?;
+    let scopes = state.scope_set_for(slot);
+
+    // The seeded file is the one thing this format can name without a
+    // create-through-protocol path; rename it, and the delete case destroys
+    // the rename's product.
+    let from = b"/media/test/hello.txt";
+    let to = b"/media/test/after.txt";
+    let (wire, _) = state
+        .files
+        .open_for_task(&scopes, slot, from, Rights::WRITE)
+        .map_err(|error| error.name())?;
+    state
+        .files
+        .write(&scopes, wire, b"renamed data")
+        .map_err(|_| "the write was refused")?;
+
+    let reply = state
+        .files
+        .handle_message(&scopes, slot, &rename_request(from, to));
+    if reply_status(&reply) != 0 {
+        return Err("the rename was refused");
+    }
+
+    // The old name is gone; the handle taken before the rename still works,
+    // because the identity is the slot rather than the name. Whatever its
+    // position says about the bytes, the handle must not be refused.
+    match state.files.open_for_task(&scopes, slot, from, Rights::READ) {
+        Err(FsError::NotFound) => {}
+        Ok(_) => return Err("the old name still resolved"),
+        Err(other) => return Err(other.name()),
+    }
+    let mut buffer = [0u8; 16];
+    match state.files.read(&scopes, wire, &mut buffer) {
+        Ok(_) => {}
+        Err(FsError::BadHandle) => return Err("the pre-rename handle was refused"),
+        Err(other) => return Err(other.name()),
+    }
+
+    // A fresh handle at the new name reads the bytes, which never moved.
+    let (fresh, _) = state
+        .files
+        .open_for_task(&scopes, slot, to, Rights::READ)
+        .map_err(|error| error.name())?;
+    let count = state
+        .files
+        .read(&scopes, fresh, &mut buffer)
+        .map_err(|error| error.name())?;
+    // The write that made these bytes was shorter than the file it overwrote,
+    // so the tail is whatever the seed left there; the head is what matters.
+    if count < 12 || &buffer[..12] != b"renamed data" {
+        return Err("the renamed file's bytes did not follow the name");
+    }
+    Ok(())
+}
+
 fn manifest_with_budget(attempts: u32, window_ms: u32) -> ServiceManifest {
     let mut manifest = ServiceManifest::new("file-server").expect("a valid service name");
     manifest.set_restart_max_attempts(attempts);

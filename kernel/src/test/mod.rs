@@ -75,6 +75,8 @@ pub const SUITE_NAMES: &[&str] = &[
     "file_cap_scope_allows_descendant",
     "file_cap_scope_denies_sibling",
     "ramfs_write_read",
+    // The file server's reclamation of dead clients' open files.
+    "file_server_reclaims_dead_clients",
     "protocol_version_mismatch",
     "service_restart_after_crash",
     "initramfs_boot",
@@ -85,6 +87,10 @@ pub const SUITE_NAMES: &[&str] = &[
     "block_timeout",
     "driver_crash_mid_io",
     "read_only_mount",
+    // The disk format's delete and rename, and the generation that makes a
+    // stale disk handle refuse. Runs after the M5 suites, which share the
+    // disk image with it.
+    "disk_delete_rename",
     // M6: display, compositor surfaces, focus, input, and GUI lifecycle.
     "display_two_windows",
     "move_window",

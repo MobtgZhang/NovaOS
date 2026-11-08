@@ -634,6 +634,11 @@ impl KernelState {
         let revoked = crate::services::cap::revoke_all(&mut self.caps[slot], &self.objects);
         let _ = revoked;
 
+        // A dead client's open files are reclaimed with its authority: the
+        // slots it held must be available to tasks that are still running,
+        // or a few crashed clients could drain the table for everyone.
+        self.files.close_owner(slot);
+
         // A crashed GUI process must not leave its surfaces, focus, or buffer
         // frames behind. The compositor owns the placement and the buffer
         // objects; the task owns only the capabilities it attached.

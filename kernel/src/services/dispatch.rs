@@ -916,7 +916,7 @@ pub fn service_request(
         // Ring 3 reads the input queue and may not inject into it: the
         // trusted `handle_message` path is the driver's, not a client's.
         SERVICE_INPUT => input.handle_client_message(&request, compositor, context.task_slot),
-        SERVICE_FILE => files.handle_message(&scopes, &request),
+        SERVICE_FILE => files.handle_message(&scopes, context.task_slot, &request),
         SERVICE_NET => net.handle_message(&request, context.task_slot),
         _ => return Err(ErrorCode::Unsupported),
     };

@@ -176,6 +176,9 @@ static SUITE_GROUPS: &[&[TestSuite]] = &[
     crate::test::m34::M3_SUITES,
     crate::test::m34::M4_SUITES,
     crate::test::m5::M5_SUITES,
+    // The disk-format suites run after M5's: they delete and rename the
+    // seeded file, which the M5 tests open expecting it to exist.
+    crate::test::m34::DISK_SUITES,
     crate::test::m6::M6_SUITES,
     crate::test::m7::M7_SUITES,
     crate::test::smp::SMP_SUITES,
