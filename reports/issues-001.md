@@ -23,7 +23,7 @@
 | §3.2 per-CPU 抽象 | **已修复**（2026-11-08） | 新增 `arch::x86_64::percpu`（GS base，IA32_GS_BASE，offset 0x00 用户栈指针 / 0x08 内核栈顶 / 0x10 CPU 槽位）；syscall stub 与 `return_to_user` 全部 GS 寻址，删除单全局 `NOVA_KERNEL_USER_STACK_POINTER` 与"BSP-only TSS"假设；`sched`/`task` 所有 cpu-0 包装改 `arch::current_cpu()`；`PENDING_EFFECT`/`PENDING_EXIT_STATUS` 改 per-CPU 数组（§3.4 随之关闭）；服务层、帧分配器、virtio net/block 单例全部套上新的递归 irq-safe `SpinLock`（`kernel/src/sync.rs`，按 CPU 槽位判重入）；`task::create_thread` 轮转分发到在线 CPU，新测试 `created_threads_dispatch_across_online_cpus` 断言线程落在多个 CPU。门禁全绿，boot 套件 63 suites / 215 cases 全过，`-smp 4`（xtask 硬编码）3 AP 在线 |
 | §3.4 全局单槽 syscall 副作用 | **已修复**（2026-11-08） | 随 §3.2：改 per-CPU 数组，槽位经 GS 读取当前 CPU |
 
-**仍然未解**：内核堆（§2.5）；`walk_to_leaf` 巨叶（§1.2 内核侧）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1 已修复并验证、§4.2 virtio-net 中断驱动路径已修复并验证（2026-11-08）〕
+**仍然未解**：内核堆（§2.5）；§4.3 时间源；§5.1 ECAM；§6/§7 FS 与 TCP 项；驱动现代化（§5.3/§5.4）。〔§4.1、§4.2（virtio-net 路径）、§1.2（引导侧 + 内核侧）均已修复并验证（2026-11-08）〕
 
 ---
 
@@ -58,9 +58,11 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - 没有 RTC/`FADT` 世纪寄存器，内核**没有任何墙上时钟**——这也解释了文件系统为什么没有时间戳（§6）。
 - NovaBoot 的 `BootProtocol` 快照结构已为 `cpu_ids: [u32; MAX_CPUS]`（`kernel/src/boot/info.rs:233`）留好了位置，但填充端写死 `cpu_count=1, bsp_lapic_id=0`（`kernel/src/boot/novaboot.rs:236-243`）。
 
-### 1.2 早期页表只支持 4K 页〔未实现〕**Medium** → **引导侧已修（2026-11-08）**
+### 1.2 早期页表只支持 4K 页〔未实现〕**Medium** → **已修复并验证（2026-11-08，引导侧 + 内核侧）**
 
-> **更新**：NovaBoot 的恒等映射已改为 PML4[0]→PDPT→512 个 PD、每 PD 2 MiB 叶子，盖满低 4 GiB（此前只盖 1 GiB，引导镜像在 ~2 GiB 时首次取指即三重故障）。内核侧 `walk_to_leaf` 仍不识别大页位——任何内核查询/修改路径遇到 2 MiB 叶子仍会走错，需与 §2.3 的收尾联动。
+> **更新**：NovaBoot 的恒等映射已改为 PML4[0]→PDPT→512 个 PD、每 PD 2 MiB 叶子，盖满低 4 GiB（此前只盖 1 GiB，引导镜像在 ~2 GiB 时首次取指即三重故障）。
+>
+> **内核侧也已修复（2026-11-08）**：`walk_to_leaf`/`translate` 的层级-尺寸配对原本错位一级——PDPT 级 `PS` 位（1 GiB 巨叶）被当 2 MiB、PD 级 `PS` 位（2 MiB 巨叶）被当 4 KiB，与 `Leaf` 自身的文档矛盾。后果（潜在，因现有 MMIO 地址都恰好在 RAM 巨叶体之外）：`map()` 会把巨叶当 4K 条目**静默覆写**，废掉同叶其余 511（或 5 亿）页；`translate()` 对叶内偏移 ≥4K 的地址丢失高位偏移位。直接映射恰由这些巨叶构成，第一次对 RAM 覆盖范围内的别名调 `map_kernel_mmio` 就会损坏映射。顺带修了 `translate_user`（用户映射现全为 4K，但损坏/未来的巨叶不应被当页表走进去）。新增 `memory_map_sanity` 两用例（巨叶翻译带全偏移、重映射巨叶页幂等且叶仍盖邻页），**曾以旧配对运行确认失败**（测试真能咬住 bug）。门禁全绿，boot 套件 64 suites / 221 cases 全过。
 
 - `crates/nova-boot` 的引导期页表（PML4[0]/[256]/[511] 三条链）全部是 4K 叶子；内核侧 `mm/page_table.rs` 的 `walk_to_leaf` 同样不支持 2MiB/1GiB 叶子（§3）。
 - 在 4K-only 下映射 256 MiB HHDM 需要 65536 个 PTE；真实机器 32 GiB 内存需要 800 万+ 个 PTE（约 16 GiB 的表空间都不够），**这是"现代硬件不可运行"的第一数学障碍**。
