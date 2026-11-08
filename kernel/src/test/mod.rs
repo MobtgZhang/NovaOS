@@ -110,6 +110,9 @@ pub const SUITE_NAMES: &[&str] = &[
     "net_icmp_echo",
     "net_dhcp_lease",
     "net_socket_api",
+    // The TCP server side: listen marks a socket, accept completes one
+    // inbound handshake, and ISNs are drawn fresh per connection.
+    "net_listen_accept",
     // The wall clock: the CMOS RTC behind the filesystem's timestamps.
     "wall_clock",
     // M8: SMP bring-up.

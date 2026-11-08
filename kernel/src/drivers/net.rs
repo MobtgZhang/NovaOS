@@ -208,6 +208,21 @@ pub fn connect_tcp_from(
     result
 }
 
+/// Complete one inbound TCP handshake on `port`, returning the connection.
+pub fn accept_tcp(port: u16) -> Result<TcpConnection, NetError> {
+    let result = with_net(|device| device.accept_tcp(port))?;
+    result
+}
+
+/// A fresh TCP initial sequence number, from the live device.
+///
+/// The tests read this through the driver so the ISN path is exercised the
+/// way a connection exercises it: against the live device's MAC, with the
+/// counter and clock mixed in.
+pub fn initial_sequence() -> u32 {
+    with_net(|device| device.initial_sequence()).expect("the network device is live")
+}
+
 /// Send bytes on a TCP connection.
 pub fn send_tcp(connection: &mut TcpConnection, payload: &[u8]) -> Result<(), NetError> {
     let result = with_net(|device| device.send_tcp(connection, payload))?;

@@ -37,11 +37,12 @@ use super::{FEATURE_VERSION_1, VirtioError};
 use crate::arch::ADDRESS_SPACE;
 use crate::drivers::mmio;
 use crate::drivers::pci;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::klog;
 use crate::logger::Level;
 use crate::mm::{direct_map, frame_allocator};
+use crate::time::wall_clock_seconds;
 use nova_net::{
     BROADCAST_MAC, DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpReply, ETHERTYPE_IPV4, IP_PROTOCOL_ICMP,
     IP_PROTOCOL_TCP, IP_PROTOCOL_UDP, Ipv4Addr, MacAddr, TCP_ACK, TCP_FIN, TCP_PSH, TCP_SYN,
@@ -93,7 +94,43 @@ pub const TCP_SOURCE_PORT: u16 = 49153;
 ///
 /// A nonzero sequence avoids the degenerate `seq=0` state some emulated TCP
 /// stacks treat specially; the handshake still checks `ack = sequence + 1`.
+///
+/// **Retired as a constant (2026-11-08, §7.2):** a fixed ISN is both a
+/// security hole on a real network — predictable sequence numbers make a
+/// session hijack trivial — and a guaranteed collision between two NovaOS
+/// machines. [`VirtioNet::initial_sequence`] now mixes hardware and clock
+/// entropy per connection; this value survives only as the mix's nonzero
+/// fallback.
 pub const TCP_INITIAL_SEQUENCE: u32 = 0x1234_5678;
+
+/// The ISN mixer's call counter, so two connections opened in the same
+/// second never share a sequence number.
+static ISN_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Whether the processor offers RDRAND.
+///
+/// Leaf 1's ECX bit 30 carries the feature flag. The check runs once; a
+/// result that cannot change is not worth re-deriving per connection.
+fn has_rdrand() -> bool {
+    // SAFETY: `cpuid` is unprivileged and writes only its four documented
+    // result registers, the same discipline paging.rs and apic.rs apply.
+    let features = unsafe { core::arch::x86_64::__cpuid(0x0000_0001) };
+    features.ecx & (1 << 30) != 0
+}
+
+/// Mix 64 bits of state into a well-distributed word.
+///
+/// SplitMix64's finalizer: a few multiplies and xors turn correlated inputs
+/// (a MAC address changes only per machine, a clock changes only per second)
+/// into bits that do not share low-order structure. The ISN does not need to
+/// be cryptographically strong — it needs to not be a *constant* — and this
+/// is what the fallback's budget buys.
+fn mix64(mut state: u64) -> u64 {
+    state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    state = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_25CE_4F75);
+    state = (state ^ (state >> 27)).wrapping_mul(0x94D0_4A90_BB1C_8C5B);
+    state ^ (state >> 31)
+}
 
 /// A live TCP connection's sequence state.
 #[derive(Clone, Copy, Debug)]
@@ -677,6 +714,136 @@ impl VirtioNet {
         self.send_frame(&frame[..frame_length])
     }
 
+    /// A fresh initial sequence number for one connection.
+    ///
+    /// RDRAND when the processor offers it; otherwise a mix of the three
+    /// entropy sources a machine has without a hardware RNG: its own MAC
+    /// address, the wall clock (§4.3's CMOS read), and a per-call counter
+    /// that keeps two connections opened in the same second apart. The mix
+    /// is SplitMix64's finalizer, which spreads the correlated low bits.
+    ///
+    /// The result is never zero: a `seq = 0` initial sequence is the
+    /// degenerate state some emulated stacks treat specially, and an ISN
+    /// that lands there by accident is a bug the handshake cannot report.
+    pub fn initial_sequence(&self) -> u32 {
+        if has_rdrand() {
+            // SAFETY: `rdrand` writes only its output register and reports
+            // whether the value is valid; the CPUID check above established
+            // the instruction exists.
+            let mut random = 0u32;
+            let ok = unsafe { core::arch::x86_64::_rdrand32_step(&mut random) };
+            if ok != 0 {
+                return random | 1;
+            }
+            // A retry budget of one would be arbitrary; falling through to
+            // the mix below is not, and costs nothing the caller can see.
+        }
+
+        let counter = ISN_COUNTER.fetch_add(1, Ordering::Relaxed) as u64;
+        let mut state: u64 =
+            u64::from(self.mac.0[0]) | (u64::from(self.mac.0[5]) << 8) | (counter << 16);
+        if let Some(seconds) = wall_clock_seconds() {
+            state ^= (seconds as u64).wrapping_mul(0x1_0000_0001);
+        }
+        let isn = mix64(state) as u32;
+        if isn == 0 {
+            // Distinguishable from every other "zero" only by being
+            // deliberately so: the mixer's own constant.
+            TCP_INITIAL_SEQUENCE
+        } else {
+            isn
+        }
+    }
+
+    /// Complete one inbound handshake on `port`, returning the connection.
+    ///
+    /// The server side of the three-way handshake the client side in
+    /// [`Self::connect_tcp_from`] drives. A SYN arrives naming `port`; the
+    /// reply is a SYN-ACK carrying this side's own random ISN; the client's
+    /// ACK completes the connection. The client's MAC and IP come from the
+    /// frame itself, so no ARP resolution is needed in the listening path.
+    ///
+    /// Like `connect_tcp`, this is a chapter-one stack: one connection per
+    /// accept, exact-sequence data exchange after it, and a bounded budget
+    /// rather than a wall-clock deadline throughout.
+    pub fn accept_tcp(&mut self, port: u16) -> Result<TcpConnection, NetError> {
+        // Phase one: wait for the SYN. The pieces the handshake needs are
+        // all Copy — addresses, ports, sequence numbers — so nothing borrows
+        // the frame buffer across the phases.
+        let mut buffer = [0u8; MAX_FRAME_BYTES];
+        let mut syn: Option<(Ipv4Addr, MacAddr, u16, u32)> = None;
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let frame_length = self.poll_receive(&mut buffer)?;
+            match self.parse_inbound_tcp(&buffer[..frame_length], port) {
+                Some((source, source_mac, segment))
+                    if segment.has(TCP_SYN) && !segment.has(TCP_ACK) =>
+                {
+                    syn = Some((source, source_mac, segment.source_port, segment.sequence));
+                    break;
+                }
+                _ => {
+                    if attempt + 1 < LOOKUP_ATTEMPTS {
+                        self.prime_receive()?;
+                    }
+                }
+            }
+        }
+        let Some((remote, remote_mac, remote_port, client_seq)) = syn else {
+            return Err(NetError::TcpFailed);
+        };
+
+        let mut connection = TcpConnection {
+            remote,
+            remote_mac,
+            local_port: port,
+            remote_port,
+            local_seq: self.initial_sequence(),
+            remote_seq: client_seq.wrapping_add(1),
+        };
+
+        // SYN-ACK: this side's ISN, acknowledging the client's ISN + 1.
+        let mut tcp = [0u8; MAX_FRAME_BYTES];
+        let tcp_length = build_tcp(
+            LINK_ADDRESS,
+            remote,
+            port,
+            remote_port,
+            connection.local_seq,
+            connection.remote_seq,
+            TCP_SYN | TCP_ACK,
+            &[],
+            &mut tcp,
+        )
+        .ok_or(NetError::FrameTooLong)?;
+        self.prime_receive()?;
+        self.send_tcp_payload(remote, remote_mac, &tcp[..tcp_length])?;
+
+        // Phase two: the client's ACK of this side's ISN + 1 completes the
+        // handshake.
+        for attempt in 0..LOOKUP_ATTEMPTS {
+            let frame_length = self.poll_receive(&mut buffer)?;
+            let Some((_, _, segment)) = self.parse_inbound_tcp(&buffer[..frame_length], port)
+            else {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            };
+            if !segment.has(TCP_ACK)
+                || segment.has(TCP_SYN)
+                || segment.acknowledgement != connection.local_seq.wrapping_add(1)
+            {
+                if attempt + 1 < LOOKUP_ATTEMPTS {
+                    self.prime_receive()?;
+                }
+                continue;
+            }
+            connection.local_seq = connection.local_seq.wrapping_add(1);
+            return Ok(connection);
+        }
+        Err(NetError::TcpFailed)
+    }
+
     /// Open a TCP connection with a SYN / SYN-ACK / ACK handshake.
     pub fn connect_tcp(
         &mut self,
@@ -699,7 +866,7 @@ impl VirtioNet {
             remote_mac,
             local_port,
             remote_port: port,
-            local_seq: TCP_INITIAL_SEQUENCE,
+            local_seq: self.initial_sequence(),
             remote_seq: 0,
         };
 
@@ -1067,6 +1234,32 @@ impl VirtioNet {
             }
         }
         Err(NetError::DhcpFailed)
+    }
+
+    /// Parse one inbound TCP frame for the listening path.
+    ///
+    /// Unlike [`Self::parse_tcp_frame`], the source port is *any* port — an
+    /// acceptor cannot know it in advance — and the sender's addresses come
+    /// back with the segment, because the handshake reply needs them and the
+    /// listening path never resolves ARP.
+    fn parse_inbound_tcp<'a>(
+        &self,
+        frame: &'a [u8],
+        destination_port: u16,
+    ) -> Option<(Ipv4Addr, MacAddr, TcpSegment<'a>)> {
+        let ethernet = parse_ethernet(frame)?;
+        if ethernet.ethertype != ETHERTYPE_IPV4 {
+            return None;
+        }
+        let packet = parse_ipv4(ethernet.payload)?;
+        if packet.protocol != IP_PROTOCOL_TCP {
+            return None;
+        }
+        let segment = parse_tcp(packet.payload, packet.source, packet.destination)?;
+        if segment.destination_port != destination_port {
+            return None;
+        }
+        Some((packet.source, ethernet.source, segment))
     }
 
     /// Parse one TCP segment from an Ethernet + IPv4 frame.

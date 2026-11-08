@@ -35,7 +35,12 @@
 use crate::ProtocolVersion;
 
 /// The network protocol version this implementation speaks.
-pub const NET_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+///
+/// Minor `1` added the socket listen and accept operations, which turn a
+/// socket from a client into a server endpoint. The negotiation accepts an
+/// older minor, so a client that predates the two operations still talks to
+/// a server that has them.
+pub const NET_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 /// Ask for the current link state.
 pub const NET_OP_LINK_QUERY: u64 = 1;
@@ -69,6 +74,19 @@ pub const NET_OP_ICMP_ECHO: u64 = 10;
 
 /// Acquire an address from DHCP.
 pub const NET_OP_DHCP: u64 = 11;
+
+/// Mark a socket as listening on its local port.
+///
+/// Added at protocol minor `1`. A listening TCP socket is a server endpoint:
+/// the next [`NET_OP_SOCKET_ACCEPT`] on it completes one inbound handshake
+/// and turns the socket into a connection. Only TCP sockets can listen.
+pub const NET_OP_SOCKET_LISTEN: u64 = 12;
+
+/// Accept one inbound connection on a listening socket.
+///
+/// Added at protocol minor `1`. The accept drives the server side of the
+/// three-way handshake and names the peer in its reply.
+pub const NET_OP_SOCKET_ACCEPT: u64 = 13;
 
 /// Socket kinds.
 pub const NET_SOCKET_TCP: u32 = 1;
@@ -258,6 +276,84 @@ pub struct NetSocketCloseReply {
 
 /// Size of a socket-close reply, in bytes.
 pub const NET_SOCKET_CLOSE_REPLY_SIZE: usize = 12;
+
+/// A request to mark a socket as listening.
+///
+/// The port is the socket's own: the open assigned it, and the reply to the
+/// open named it. A caller that wants a specific port gets one by opening
+/// enough sockets to reach it — the bounded port space is the quota, not a
+/// parameter to race for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct NetSocketListenRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// Reserved flags. Must be zero in v1.
+    pub flags: u32,
+    /// The socket to mark as listening.
+    pub socket: u16,
+    /// Reserved. Must be zero.
+    pub reserved: u16,
+}
+
+/// Size of a socket-listen request, in bytes.
+pub const NET_SOCKET_LISTEN_REQUEST_SIZE: usize = 12;
+
+/// A reply to a socket listen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct NetSocketListenReply {
+    /// The protocol version the service speaks.
+    pub version: ProtocolVersion,
+    /// Status code: zero for success, or a service error code.
+    pub status: i32,
+    /// The socket that is now listening.
+    pub socket: u16,
+    /// The port the socket listens on.
+    pub port: u16,
+}
+
+/// Size of a socket-listen reply, in bytes.
+pub const NET_SOCKET_LISTEN_REPLY_SIZE: usize = 12;
+
+/// A request to accept one inbound connection on a listening socket.
+///
+/// The accept is synchronous: the reply arrives when a handshake has
+/// completed, failed, or timed out — not when the request was queued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct NetSocketAcceptRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// Reserved flags. Must be zero in v1.
+    pub flags: u32,
+    /// The listening socket to accept on.
+    pub socket: u16,
+    /// Reserved. Must be zero.
+    pub reserved: u16,
+}
+
+/// Size of a socket-accept request, in bytes.
+pub const NET_SOCKET_ACCEPT_REQUEST_SIZE: usize = 12;
+
+/// A reply to a socket accept, naming the peer the connection is with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct NetSocketAcceptReply {
+    /// The protocol version the service speaks.
+    pub version: ProtocolVersion,
+    /// Status code: zero for success, or a service error code.
+    pub status: i32,
+    /// The socket, now connected to the peer.
+    pub socket: u16,
+    /// The peer's port.
+    pub remote_port: u16,
+    /// The peer's IPv4 address.
+    pub destination: [u8; 4],
+}
+
+/// Size of a socket-accept reply, in bytes.
+pub const NET_SOCKET_ACCEPT_REPLY_SIZE: usize = 16;
 
 /// A request to send an ICMP echo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -498,6 +594,15 @@ const _: () = assert!(core::mem::size_of::<NetSendRequest>() == NET_SEND_REQUEST
 const _: () = assert!(core::mem::size_of::<NetSendReply>() == NET_SEND_REPLY_SIZE);
 const _: () = assert!(core::mem::size_of::<NetRecvRequest>() == NET_RECV_REQUEST_SIZE);
 const _: () = assert!(core::mem::size_of::<NetRecvReply>() == NET_RECV_REPLY_SIZE);
+const _: () =
+    assert!(core::mem::size_of::<NetSocketListenRequest>() == NET_SOCKET_LISTEN_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketListenReply>() == NET_SOCKET_LISTEN_REPLY_SIZE);
+const _: () =
+    assert!(core::mem::size_of::<NetSocketAcceptRequest>() == NET_SOCKET_ACCEPT_REQUEST_SIZE);
+const _: () = assert!(core::mem::size_of::<NetSocketAcceptReply>() == NET_SOCKET_ACCEPT_REPLY_SIZE);
+
+const _: () = assert!(core::mem::offset_of!(NetSocketAcceptReply, remote_port) == 10);
+const _: () = assert!(core::mem::offset_of!(NetSocketAcceptReply, destination) == 12);
 
 const _: () = assert!(core::mem::offset_of!(NetLinkReply, address) == 8);
 const _: () = assert!(core::mem::offset_of!(NetLinkReply, gateway) == 12);
@@ -621,7 +726,10 @@ mod tests {
 
     #[test]
     fn v1_is_the_only_version_this_protocol_defines() {
-        assert_eq!(NET_VERSION, ProtocolVersion::new(1, 0));
+        assert_eq!(NET_VERSION, ProtocolVersion::new(1, 1));
+        // A minor-0 client still negotiates with a minor-1 server: the two
+        // new operations are refused individually, not by version gate.
+        assert!(crate::negotiate(NET_VERSION, ProtocolVersion::new(1, 0)).is_ok());
     }
 
     #[test]

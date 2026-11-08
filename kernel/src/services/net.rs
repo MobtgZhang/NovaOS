@@ -41,13 +41,15 @@ use nova_protocols::net::{
     NET_LINK_REPLY_SIZE, NET_LINK_REQUEST_SIZE, NET_MAX_DATAGRAM, NET_MAX_ICMP_PAYLOAD,
     NET_MAX_ICMP_REPLY, NET_MAX_NAME, NET_MAX_RECV, NET_MAX_SOCKET_PAYLOAD, NET_MAX_SOCKET_RECV,
     NET_OP_DHCP, NET_OP_ICMP_ECHO, NET_OP_LINK_QUERY, NET_OP_RECV, NET_OP_RESOLVE, NET_OP_SEND,
-    NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT, NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV,
-    NET_OP_SOCKET_SEND, NET_RECV_REPLY_SIZE, NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE,
-    NET_RESOLVE_REQUEST_SIZE, NET_SEND_REPLY_SIZE, NET_SEND_REQUEST_SIZE,
+    NET_OP_SOCKET_ACCEPT, NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT, NET_OP_SOCKET_LISTEN,
+    NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV, NET_OP_SOCKET_SEND, NET_RECV_REPLY_SIZE,
+    NET_RECV_REQUEST_SIZE, NET_RESOLVE_REPLY_SIZE, NET_RESOLVE_REQUEST_SIZE, NET_SEND_REPLY_SIZE,
+    NET_SEND_REQUEST_SIZE, NET_SOCKET_ACCEPT_REPLY_SIZE, NET_SOCKET_ACCEPT_REQUEST_SIZE,
     NET_SOCKET_CLOSE_REPLY_SIZE, NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE,
-    NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE, NET_SOCKET_OPEN_REQUEST_SIZE,
-    NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE, NET_SOCKET_SEND_REPLY_SIZE,
-    NET_SOCKET_SEND_REQUEST_SIZE, NET_SOCKET_TCP, NET_SOCKET_UDP, NET_VERSION,
+    NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_LISTEN_REPLY_SIZE, NET_SOCKET_LISTEN_REQUEST_SIZE,
+    NET_SOCKET_OPEN_REPLY_SIZE, NET_SOCKET_OPEN_REQUEST_SIZE, NET_SOCKET_RECV_REPLY_SIZE,
+    NET_SOCKET_RECV_REQUEST_SIZE, NET_SOCKET_SEND_REPLY_SIZE, NET_SOCKET_SEND_REQUEST_SIZE,
+    NET_SOCKET_TCP, NET_SOCKET_UDP, NET_VERSION,
 };
 
 use crate::drivers::net as driver;
@@ -76,6 +78,8 @@ struct SocketSlot {
     kind: u32,
     /// The local port assigned to this socket.
     local_port: u16,
+    /// Whether a TCP socket is a server endpoint waiting to accept.
+    listening: bool,
     /// The live TCP connection state, when connected.
     tcp: Option<TcpConnection>,
     /// The UDP destination, when connected.
@@ -118,6 +122,8 @@ impl NetService {
             NET_OP_SOCKET_SEND => self.handle_socket_send(request.payload(), task_slot),
             NET_OP_SOCKET_RECV => self.handle_socket_recv(request.payload(), task_slot),
             NET_OP_SOCKET_CLOSE => self.handle_socket_close(request.payload(), task_slot),
+            NET_OP_SOCKET_LISTEN => self.handle_socket_listen(request.payload(), task_slot),
+            NET_OP_SOCKET_ACCEPT => self.handle_socket_accept(request.payload(), task_slot),
             NET_OP_ICMP_ECHO => self.handle_icmp(request.payload()),
             NET_OP_DHCP => self.handle_dhcp(request.payload()),
             _ => Message::with_payload(0, &[]).unwrap_or_else(|_| Message::new(0)),
@@ -323,6 +329,7 @@ impl NetService {
             task_slot,
             kind,
             local_port,
+            listening: false,
             tcp: None,
             udp_destination: None,
             udp_remote_port: 0,
@@ -569,6 +576,134 @@ impl NetService {
         }
         self.sockets[slot] = None;
         socket_reply(NET_SOCKET_CLOSE_REPLY_SIZE, socket_id)
+    }
+
+    /// The socket listen: mark a TCP socket as a server endpoint.
+    ///
+    /// The port is the socket's own — the open assigned it — so a listening
+    /// socket is bounded by the same quota every other socket is, and two
+    /// tasks cannot race for a privileged port number.
+    fn handle_socket_listen(&mut self, payload: &[u8], task_slot: usize) -> Message {
+        if payload.len() != NET_SOCKET_LISTEN_REQUEST_SIZE {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        }
+        let Some(version) = read_version(payload, 0) else {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        if negotiate(NET_VERSION, version).is_err() {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Unsupported);
+        }
+        let Some(flags) = read_u32(payload, 4) else {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        let Some(socket_id) = read_u16(payload, 8) else {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        let Some(reserved) = read_u16(payload, 10) else {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        if flags != 0 || reserved != 0 {
+            return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Invalid);
+        }
+
+        let Some(slot) = self.socket_slot(socket_id, task_slot) else {
+            return reply_error(
+                NET_SOCKET_LISTEN_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
+        };
+
+        match self.sockets[slot].as_mut() {
+            Some(socket) if socket.kind == NET_SOCKET_TCP => {
+                if socket.tcp.is_some() {
+                    // A connected socket cannot also be a listener: it is
+                    // already a conversation with one peer.
+                    return reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Busy);
+                }
+                socket.listening = true;
+                let mut bytes = [0u8; NET_SOCKET_LISTEN_REPLY_SIZE];
+                write_version(&mut bytes, NET_VERSION);
+                bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+                bytes[8..10].copy_from_slice(&socket_id.to_le_bytes());
+                bytes[10..12].copy_from_slice(&socket.local_port.to_le_bytes());
+                Message::with_payload(0, &bytes).unwrap_or_else(|_| Message::new(0))
+            }
+            Some(_) => reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::Unsupported),
+            None => reply_error(NET_SOCKET_LISTEN_REPLY_SIZE, ErrorCode::BadHandle),
+        }
+    }
+
+    /// The socket accept: complete one inbound handshake on a listener.
+    ///
+    /// The accept is synchronous — the reply names the peer only after the
+    /// three-way handshake has finished or failed — which is the same
+    /// shape every other socket operation has. On success the socket stops
+    /// listening and becomes the connection: one accept, one connection,
+    /// the chapter-one budget the driver's stack runs on.
+    fn handle_socket_accept(&mut self, payload: &[u8], task_slot: usize) -> Message {
+        if payload.len() != NET_SOCKET_ACCEPT_REQUEST_SIZE {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        }
+        let Some(version) = read_version(payload, 0) else {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        if negotiate(NET_VERSION, version).is_err() {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Unsupported);
+        }
+        let Some(flags) = read_u32(payload, 4) else {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        let Some(socket_id) = read_u16(payload, 8) else {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        let Some(reserved) = read_u16(payload, 10) else {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        };
+        if flags != 0 || reserved != 0 {
+            return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Invalid);
+        }
+
+        let Some(slot) = self.socket_slot(socket_id, task_slot) else {
+            return reply_error(
+                NET_SOCKET_ACCEPT_REPLY_SIZE,
+                socket_error(socket_id, task_slot),
+            );
+        };
+
+        let local_port = match self.sockets[slot].as_ref() {
+            Some(socket) if socket.kind == NET_SOCKET_TCP => {
+                if socket.tcp.is_some() {
+                    return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Busy);
+                }
+                if !socket.listening {
+                    return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Denied);
+                }
+                socket.local_port
+            }
+            Some(_) => {
+                return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::Unsupported);
+            }
+            None => return reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, ErrorCode::BadHandle),
+        };
+
+        match driver::accept_tcp(local_port) {
+            Ok(connection) => {
+                let destination = connection.remote;
+                let remote_port = connection.remote_port;
+                if let Some(socket) = self.sockets[slot].as_mut() {
+                    socket.tcp = Some(connection);
+                    socket.listening = false;
+                }
+                let mut bytes = [0u8; NET_SOCKET_ACCEPT_REPLY_SIZE];
+                write_version(&mut bytes, NET_VERSION);
+                bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
+                bytes[8..10].copy_from_slice(&socket_id.to_le_bytes());
+                bytes[10..12].copy_from_slice(&remote_port.to_le_bytes());
+                bytes[12..16].copy_from_slice(&destination.octets());
+                Message::with_payload(0, &bytes).unwrap_or_else(|_| Message::new(0))
+            }
+            Err(error) => reply_error(NET_SOCKET_ACCEPT_REPLY_SIZE, error_code(error)),
+        }
     }
 
     /// An ICMP echo.

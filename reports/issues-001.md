@@ -264,11 +264,11 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - `crates/nova-net`（1280 行）是纯函数式包构造/解析库：Ethernet/ARP/IPv4/UDP/TCP/DNS/ICMP/DHCP，全部可宿主测试——这是整个网络栈最有价值的部分。
 - `kernel/src/services/net.rs`（795 行）是服务层：`MAX_SOCKETS = 8`（net.rs:62）、同步 request/replay 语义、socket 按 `task_slot` 归属。
 
-### 7.2 TCP 实现是"教科书第 1 章"〔未实现〕**High**
+### 7.2 TCP 实现是"教科书第 1 章"〔部分修复（2026-11-08）：随机 ISN + listen/accept 已实现；重传/乱序/窗口仍开放〕**High**
 
-- `drivers/virtio/net.rs:94`：`TCP_INITIAL_SEQUENCE = 0x1234_5678` **常量 ISN**——固定 ISN 在真实网络上既是安全问题（可预测序列号 → 会话劫持），也保证了两台 NovaOS 互连时的必然冲突。
-- `connect_tcp`（net.rs:608-700）：内联轮询式三次握手；`send_tcp`/收包路径要求 `segment.sequence == remote_seq` **精确相等**（net.rs:752）——不支持乱序、丢包重传、重复 ACK、窗口缩放、拥塞控制、Nagle、keepalive。丢一个包 = 连接卡死到 `POLL_BUDGET` 耗尽。
-- 只有主动 `connect`，没有 `listen`/`accept`——**无法作为服务器**。
+- ~~`TCP_INITIAL_SEQUENCE = 0x1234_5678` 常量 ISN~~ → **已修复并验证（2026-11-08）**：`VirtioNet::initial_sequence()` 每连接现抽 ISN——CPUID leaf1 ECX bit30 支持 RDRAND 时直接取硬件随机数；否则 SplitMix64 finalizer 混合三个无硬件 RNG 机器也有的熵源（本机 MAC 两字节 + §4.3 墙钟秒数 + `ISN_COUNTER` AtomicU32 调用计数，保证同一秒内两次连接不撞号），结果恒非零（0 → 退回常量，常量保留为 fallback 并在文档中标注"已退役"）。测试 `net_listen_accept.initial_sequences_differ_and_are_never_zero` 对活设备验证非零 + 相邻两次不同。
+- ~~只有主动 `connect`，没有 `listen`/`accept`~~ → **已实现（2026-11-08）**：端到端三层——驱动层 `VirtioNet::accept_tcp(port)` 被动握手（SYN→SYN-ACK→ACK 两阶段轮询，客户端 MAC/IP 直接取自入帧、不走 ARP），`drivers/net.rs` 包装；协议层 `NET_OP_SOCKET_LISTEN=12`/`NET_OP_SOCKET_ACCEPT=13`（`NET_VERSION` 1.0→1.1，negotiate 接受旧 minor；`NetSocketListenRequest/Reply`、`NetSocketAcceptRequest/Reply` wire 布局 + offset 断言）；服务层 `SocketSlot.listening` 标记 + `handle_socket_listen`/`handle_socket_accept`（UDP listen→`Unsupported`；未 listen 就 accept→`Denied`；connected socket 再 listen/accept→`Busy`；跨 task→`BadHandle`；accept 成功后 socket 停止 listening 变为连接——一 accept 一连接，与驱动栈的"第 1 章"预算一致）。内核测试新套件 `net_listen_accept`（7 用例，boot **69 suites / 248 cases 全绿**）。
+- **局限（仍未做）**：accept 的完整三次握手无法在 QEMU 测试拓扑里端到端验证——测试网络只有 `guestfwd` 转发的出站对端（`TCP_TEST_SERVER`），没有向 guest 注入入站 SYN 的手段；测试覆盖为服务层校验路径 + ISN 属性，被动握手的真实往返留待有 hostfwd/hook 的拓扑。重传、乱序、重复 ACK、窗口缩放、拥塞控制、Nagle、keepalive 全部仍未做：丢一个包 = 连接卡死到 `POLL_BUDGET` 耗尽，这一条没有变。
 
 ### 7.3 绑死 QEMU slirp〔缺陷〕**Medium**
 

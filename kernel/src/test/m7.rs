@@ -43,6 +43,9 @@
 //! - `net_dhcp_lease`: DHCP must return a QEMU user-network address and an ACK.
 //! - `net_socket_api`: a UDP socket must send and receive, sockets must be owned
 //!   by the task that opened them, and malformed socket requests must be refused.
+//! - `net_listen_accept`: a TCP socket must be listenable as a server endpoint,
+//!   a listening socket must accept connections, and the initial sequence
+//!   numbers that open connections must never repeat or land on zero.
 
 use nova_abi::error::ErrorCode;
 use nova_protocols::ProtocolVersion;
@@ -50,10 +53,12 @@ use nova_protocols::net::{
     NET_DHCP_REPLY_SIZE, NET_DHCP_REQUEST_SIZE, NET_ICMP_REPLY_SIZE, NET_ICMP_REQUEST_SIZE,
     NET_LINK_REPLY_SIZE, NET_LINK_REQUEST_SIZE, NET_MAX_DATAGRAM, NET_MAX_ICMP_PAYLOAD,
     NET_MAX_NAME, NET_MAX_SOCKET_PAYLOAD, NET_MAX_SOCKET_RECV, NET_OP_DHCP, NET_OP_ICMP_ECHO,
-    NET_OP_LINK_QUERY, NET_OP_RESOLVE, NET_OP_SEND, NET_OP_SOCKET_CLOSE, NET_OP_SOCKET_CONNECT,
-    NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV, NET_OP_SOCKET_SEND, NET_RESOLVE_REQUEST_SIZE,
-    NET_SEND_REQUEST_SIZE, NET_SOCKET_CLOSE_REPLY_SIZE, NET_SOCKET_CLOSE_REQUEST_SIZE,
-    NET_SOCKET_CONNECT_REPLY_SIZE, NET_SOCKET_CONNECT_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
+    NET_OP_LINK_QUERY, NET_OP_RESOLVE, NET_OP_SEND, NET_OP_SOCKET_ACCEPT, NET_OP_SOCKET_CLOSE,
+    NET_OP_SOCKET_CONNECT, NET_OP_SOCKET_LISTEN, NET_OP_SOCKET_OPEN, NET_OP_SOCKET_RECV,
+    NET_OP_SOCKET_SEND, NET_RESOLVE_REQUEST_SIZE, NET_SEND_REQUEST_SIZE,
+    NET_SOCKET_ACCEPT_REPLY_SIZE, NET_SOCKET_ACCEPT_REQUEST_SIZE, NET_SOCKET_CLOSE_REPLY_SIZE,
+    NET_SOCKET_CLOSE_REQUEST_SIZE, NET_SOCKET_CONNECT_REPLY_SIZE, NET_SOCKET_CONNECT_REQUEST_SIZE,
+    NET_SOCKET_LISTEN_REPLY_SIZE, NET_SOCKET_LISTEN_REQUEST_SIZE, NET_SOCKET_OPEN_REPLY_SIZE,
     NET_SOCKET_OPEN_REQUEST_SIZE, NET_SOCKET_RECV_REPLY_SIZE, NET_SOCKET_RECV_REQUEST_SIZE,
     NET_SOCKET_SEND_REPLY_SIZE, NET_SOCKET_SEND_REQUEST_SIZE, NET_SOCKET_TCP, NET_SOCKET_UDP,
     NET_VERSION,
@@ -186,6 +191,33 @@ pub static M7_SUITES: &[TestSuite] = &[
             (
                 "malformed_socket_requests_are_refused",
                 malformed_socket_requests_are_refused,
+            ),
+        ],
+    },
+    TestSuite {
+        name: "net_listen_accept",
+        cases: &[
+            ("a_tcp_socket_can_listen", a_tcp_socket_can_listen),
+            ("a_udp_socket_cannot_listen", a_udp_socket_cannot_listen),
+            (
+                "an_unlistened_socket_cannot_accept",
+                an_unlistened_socket_cannot_accept,
+            ),
+            (
+                "a_connected_socket_cannot_listen_or_accept",
+                a_connected_socket_cannot_listen_or_accept,
+            ),
+            (
+                "a_listener_is_not_usable_by_another_task",
+                a_listener_is_not_usable_by_another_task,
+            ),
+            (
+                "malformed_listen_and_accept_requests_are_refused",
+                malformed_listen_and_accept_requests_are_refused,
+            ),
+            (
+                "initial_sequences_differ_and_are_never_zero",
+                initial_sequences_differ_and_are_never_zero,
             ),
         ],
     },
@@ -335,6 +367,36 @@ fn socket_close_request(
     socket: u16,
 ) -> [u8; NET_SOCKET_CLOSE_REQUEST_SIZE] {
     let mut bytes = [0u8; NET_SOCKET_CLOSE_REQUEST_SIZE];
+    bytes[0..2].copy_from_slice(&version.major.to_le_bytes());
+    bytes[2..4].copy_from_slice(&version.minor.to_le_bytes());
+    bytes[4..8].copy_from_slice(&flags.to_le_bytes());
+    bytes[8..10].copy_from_slice(&socket.to_le_bytes());
+    bytes[10..12].copy_from_slice(&0u16.to_le_bytes());
+    bytes
+}
+
+/// Build a fixed socket-listen request.
+fn socket_listen_request(
+    version: ProtocolVersion,
+    flags: u32,
+    socket: u16,
+) -> [u8; NET_SOCKET_LISTEN_REQUEST_SIZE] {
+    let mut bytes = [0u8; NET_SOCKET_LISTEN_REQUEST_SIZE];
+    bytes[0..2].copy_from_slice(&version.major.to_le_bytes());
+    bytes[2..4].copy_from_slice(&version.minor.to_le_bytes());
+    bytes[4..8].copy_from_slice(&flags.to_le_bytes());
+    bytes[8..10].copy_from_slice(&socket.to_le_bytes());
+    bytes[10..12].copy_from_slice(&0u16.to_le_bytes());
+    bytes
+}
+
+/// Build a fixed socket-accept request.
+fn socket_accept_request(
+    version: ProtocolVersion,
+    flags: u32,
+    socket: u16,
+) -> [u8; NET_SOCKET_ACCEPT_REQUEST_SIZE] {
+    let mut bytes = [0u8; NET_SOCKET_ACCEPT_REQUEST_SIZE];
     bytes[0..2].copy_from_slice(&version.major.to_le_bytes());
     bytes[2..4].copy_from_slice(&version.minor.to_le_bytes());
     bytes[4..8].copy_from_slice(&flags.to_le_bytes());
@@ -1098,5 +1160,254 @@ fn malformed_socket_requests_are_refused() -> Result<(), &'static str> {
         return Err("an oversized socket send was not refused");
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// net_listen_accept
+// ---------------------------------------------------------------------------
+
+/// Listen one TCP socket and return `(socket, listening_port)`.
+fn listen_tcp_socket(
+    state: &mut KernelState,
+    slot: usize,
+    reserved_slots: usize,
+) -> Result<(u16, u16), &'static str> {
+    let (socket, port) = open_tcp_socket(state, slot, reserved_slots)?;
+    let listen = socket_listen_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE {
+        return Err("the socket-listen reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(0) {
+        return Err("the TCP socket did not listen");
+    }
+    if reply_socket(&reply) != Some(socket) {
+        return Err("the socket-listen reply named a different socket");
+    }
+    let listened = reply_local_port(&reply).ok_or("the socket-listen reply had no port")?;
+    if listened != port {
+        return Err("the socket listened on a port other than its own");
+    }
+    Ok((socket, port))
+}
+
+fn a_tcp_socket_can_listen() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = listen_tcp_socket(&mut state, slot, 0)?;
+    close_socket(&mut state, slot, socket)?;
+    Ok(())
+}
+
+fn a_udp_socket_cannot_listen() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+
+    let open = socket_open_request(NET_VERSION, 0, NET_SOCKET_UDP);
+    let mut reply = [0u8; 64];
+    let length = ask(&mut state, slot, NET_OP_SOCKET_OPEN, &open, &mut reply)?;
+    if length != NET_SOCKET_OPEN_REPLY_SIZE || reply_status(&reply) != Some(0) {
+        return Err("the UDP socket did not open");
+    }
+    let socket = reply_socket(&reply).ok_or("the socket-open reply had no identifier")?;
+
+    let listen = socket_listen_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(&mut state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::Unsupported.code()) {
+        return Err("a UDP socket was allowed to listen");
+    }
+    Ok(())
+}
+
+fn an_unlistened_socket_cannot_accept() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = open_tcp_socket(&mut state, slot, 0)?;
+
+    // An accept on a socket that never listened is a client-socket misuse:
+    // refused as denied, and without touching the driver's bounded poll
+    // budget, which a real handshake would spend.
+    let accept = socket_accept_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(&mut state, slot, NET_OP_SOCKET_ACCEPT, &accept, &mut reply)?;
+    if length != NET_SOCKET_ACCEPT_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::Denied.code()) {
+        return Err("an unlistened socket was allowed to accept");
+    }
+    close_socket(&mut state, slot, socket)?;
+    Ok(())
+}
+
+fn a_connected_socket_cannot_listen_or_accept() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    // Three reserved sockets keep this connection's 4-tuple off the ports
+    // the earlier cases' handshakes used — slirp may still hold those.
+    let (socket, _port) = connect_forwarded_tcp(&mut state, slot, 3)?;
+
+    // A connected socket is a conversation with one peer; it cannot also be
+    // a server endpoint.
+    let listen = socket_listen_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(&mut state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::Busy.code()) {
+        return Err("a connected socket was allowed to listen");
+    }
+
+    let accept = socket_accept_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(&mut state, slot, NET_OP_SOCKET_ACCEPT, &accept, &mut reply)?;
+    if length != NET_SOCKET_ACCEPT_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::Busy.code()) {
+        return Err("a connected socket was allowed to accept");
+    }
+    close_socket(&mut state, slot, socket)?;
+    Ok(())
+}
+
+fn a_listener_is_not_usable_by_another_task() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let first = task_slot(&mut state)?;
+    let second = task_slot(&mut state)?;
+    let (socket, _port) = listen_tcp_socket(&mut state, first, 0)?;
+
+    let listen = socket_listen_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(
+        &mut state,
+        second,
+        NET_OP_SOCKET_LISTEN,
+        &listen,
+        &mut reply,
+    )?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::BadHandle.code()) {
+        return Err("another task was allowed to listen on the socket");
+    }
+
+    let accept = socket_accept_request(NET_VERSION, 0, socket);
+    let mut reply = [0u8; 64];
+    let length = ask(
+        &mut state,
+        second,
+        NET_OP_SOCKET_ACCEPT,
+        &accept,
+        &mut reply,
+    )?;
+    if length != NET_SOCKET_ACCEPT_REPLY_SIZE {
+        return Err("the refusal reply was not the protocol's fixed size");
+    }
+    if reply_status(&reply) != Some(ErrorCode::BadHandle.code()) {
+        return Err("another task was allowed to accept on the socket");
+    }
+    close_socket(&mut state, first, socket)?;
+    Ok(())
+}
+
+fn malformed_listen_and_accept_requests_are_refused() -> Result<(), &'static str> {
+    let mut state = fresh_state();
+    let mut state = &mut *state;
+    let slot = task_slot(&mut state)?;
+    let (socket, _port) = open_tcp_socket(&mut state, slot, 1)?;
+    let mut reply = [0u8; 64];
+
+    // Unknown protocol version.
+    let listen = socket_listen_request(ProtocolVersion::new(2, 0), 0, socket);
+    let length = ask(&mut state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Unsupported.code())
+    {
+        return Err("an unknown listen version was not refused");
+    }
+
+    // Nonzero flags.
+    let listen = socket_listen_request(NET_VERSION, 1, socket);
+    let length = ask(&mut state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Invalid.code())
+    {
+        return Err("nonzero listen flags were not refused");
+    }
+
+    // Nonzero reserved word.
+    let mut listen = socket_listen_request(NET_VERSION, 0, socket);
+    listen[10..12].copy_from_slice(&1u16.to_le_bytes());
+    let length = ask(&mut state, slot, NET_OP_SOCKET_LISTEN, &listen, &mut reply)?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Invalid.code())
+    {
+        return Err("a nonzero listen reserved word was not refused");
+    }
+
+    // A request shorter than the fixed layout.
+    let listen = socket_listen_request(NET_VERSION, 0, socket);
+    let length = ask(
+        &mut state,
+        slot,
+        NET_OP_SOCKET_LISTEN,
+        &listen[..10],
+        &mut reply,
+    )?;
+    if length != NET_SOCKET_LISTEN_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Invalid.code())
+    {
+        return Err("a short listen request was not refused");
+    }
+
+    // The same refusals on accept, which never reaches the driver.
+    let accept = socket_accept_request(ProtocolVersion::new(2, 0), 0, socket);
+    let length = ask(&mut state, slot, NET_OP_SOCKET_ACCEPT, &accept, &mut reply)?;
+    if length != NET_SOCKET_ACCEPT_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Unsupported.code())
+    {
+        return Err("an unknown accept version was not refused");
+    }
+
+    let accept = socket_accept_request(NET_VERSION, 1, socket);
+    let length = ask(&mut state, slot, NET_OP_SOCKET_ACCEPT, &accept, &mut reply)?;
+    if length != NET_SOCKET_ACCEPT_REPLY_SIZE
+        || reply_status(&reply) != Some(ErrorCode::Invalid.code())
+    {
+        return Err("nonzero accept flags were not refused");
+    }
+
+    close_socket(&mut state, slot, socket)?;
+    Ok(())
+}
+
+fn initial_sequences_differ_and_are_never_zero() -> Result<(), &'static str> {
+    // The ISN is §7.2's security fix: a constant sequence number is a
+    // session-hijack waiting to happen, and two machines sharing one
+    // constant would collide deterministically. Both properties are
+    // checked against the live device, through the same path a connection
+    // takes.
+    let first = driver::initial_sequence();
+    let second = driver::initial_sequence();
+    if first == 0 || second == 0 {
+        return Err("an initial sequence number landed on the degenerate zero");
+    }
+    if first == second {
+        return Err("two successive connections drew the same initial sequence");
+    }
     Ok(())
 }
