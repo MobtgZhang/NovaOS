@@ -262,8 +262,9 @@ impl Context {
         // 160-byte region on the target thread's kernel stack, and every
         // write below stays inside it.
         unsafe {
-            // The registers, in the order the trampoline pops them: `r15`
-            // first (lowest address) and `rax` last.
+            // The registers, in `UserRegisters` order — the order every
+            // interrupt stub pushes and this file's trampoline pops: `r15`
+            // first (lowest address), `rax` last, and `rdi` below `rsi`.
             block.add(0).write(self.r15);
             block.add(1).write(self.r14);
             block.add(2).write(self.r13);
@@ -273,8 +274,8 @@ impl Context {
             block.add(6).write(self.r9);
             block.add(7).write(self.r8);
             block.add(8).write(self.rbp);
-            block.add(9).write(self.rsi);
-            block.add(10).write(self.rdi);
+            block.add(9).write(self.rdi);
+            block.add(10).write(self.rsi);
             block.add(11).write(self.rdx);
             block.add(12).write(self.rcx);
             block.add(13).write(self.rbx);
@@ -930,9 +931,14 @@ pub unsafe fn build_resume_block(thread: &Thread) -> u64 {
 pub unsafe extern "C" fn resume_from_block(block: u64) -> ! {
     core::arch::naked_asm!(
         // SAFETY: by contract, `block` addresses a resume block whose fifteen
-        // leading words are the general-purpose registers, `r15` at the
-        // lowest address. The pops below therefore restore the registers
-        // correctly, and leave the stack pointer at the block's frame.
+        // leading words are the general-purpose registers, laid out exactly as
+        // `UserRegisters` — `r15` at the lowest address and, critically, `rdi`
+        // below `rsi`, the same order every interrupt stub pushes. The pops
+        // below therefore restore the registers correctly, and leave the stack
+        // pointer at the block's frame. The two swaps here (`rdi`/`rsi` and
+        // nothing else) are not interchangeable with the push order: getting
+        // this pair wrong swaps the two registers of every resumed context,
+        // which shows up as impossible faults in unrelated code.
         "mov rsp, rdi",
         "pop r15",
         "pop r14",
@@ -943,8 +949,8 @@ pub unsafe extern "C" fn resume_from_block(block: u64) -> ! {
         "pop r9",
         "pop r8",
         "pop rbp",
-        "pop rsi",
         "pop rdi",
+        "pop rsi",
         "pop rdx",
         "pop rcx",
         "pop rbx",
