@@ -1352,6 +1352,76 @@ pub unsafe extern "C" fn nova_kernel_pic_irq_handler(registers: *const UserRegis
     unsafe { crate::task::resume_from_block(registers as u64) }
 }
 
+/// The device interrupt stub: the same machine shape as [`timer_stub`], with
+/// the full register file saved so the handler can resume the interrupted code
+/// without the scheduler's involvement.
+#[unsafe(naked)]
+unsafe extern "C" fn virtio_irq_stub() -> ! {
+    core::arch::naked_asm!(
+        // SAFETY: as `timer_stub` — the interrupted register file goes to the
+        // current kernel stack, one word per push.
+        "push rax",
+        "push rbx",
+        "push rcx",
+        "push rdx",
+        "push rsi",
+        "push rdi",
+        "push rbp",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        // SAFETY: an eight-byte pad restores 16-byte alignment for the call.
+        "sub rsp, 8",
+        "mov rdi, rsp",
+        "add rdi, 8",
+        "call nova_kernel_virtio_irq_handler",
+        // SAFETY: the handler is declared `-> !`.
+        "ud2",
+    )
+}
+
+/// Acknowledge one device interrupt and resume the interrupted code.
+///
+/// MSI messages name their vector, so reaching this handler means the VirtIO
+/// network device raised it — there is no source to disambiguate and the EOI
+/// is unambiguous by construction. The handler's whole job is to mark the
+/// event (the waiting driver reads the count) and return: the interrupted
+/// thread, not the interrupt, drains the queue, which keeps the device's own
+/// state lock in the code path that already holds it.
+///
+/// # Safety
+///
+/// Reached only from `virtio_irq_stub`, with a valid kernel stack and an
+/// installed IDT.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nova_kernel_virtio_irq_handler(registers: *const UserRegisters) -> ! {
+    // SAFETY: an EOI is only valid while servicing the interrupt, which is
+    // exactly what this is.
+    unsafe {
+        super::apic::eoi();
+    }
+
+    // The waiting driver compares counts, so one increment is one wakeup
+    // signal. Queue state is not touched here: the device's state lock is
+    // held by the interrupted thread on this same CPU, and taking it again
+    // from an interrupt would be re-entrance the wait path never asked for.
+    crate::drivers::virtio::net::note_device_interrupt();
+
+    // Resume the interrupted code through the saved block: the stub pushed
+    // the full register file below the CPU's frame, and the block restores
+    // both. The scheduler never learns a device interrupt happened, which is
+    // the point — no quantum was consumed and no thread changed.
+    //
+    // SAFETY: the block addresses the stub's own saved register file, on the
+    // current kernel stack, with the same layout `resume_from_block` reads.
+    unsafe { crate::task::resume_from_block(registers as u64) }
+}
+
 /// The timer interrupt handler.
 ///
 /// # What it does
@@ -1539,6 +1609,12 @@ pub unsafe fn init() {
             set!(index, pic_irq_stub);
         }
 
+        // Device vectors: MSI messages name their vector, so the handler at
+        // the gate is the source, and its EOI is unambiguous by construction
+        // (§4.2). One vector per device; the VirtIO network device is the
+        // first claimant.
+        set!(super::intr::DEVICE_VECTOR_BASE as usize, virtio_irq_stub);
+
         // Vectors 22-31 are reserved. Leaving them zero would report an
         // uninformative "unexpected interrupt", so they share a stub that at
         // least names the vector.
@@ -1583,7 +1659,12 @@ pub fn gate_target(vector: usize) -> u64 {
     let low = unsafe { (*entry).offset_low } as u64;
     let middle = unsafe { (*entry).offset_mid } as u64;
     let high = unsafe { (*entry).offset_high } as u64;
-    (high << 48) | (middle << 16) | low
+    // `offset_high` holds bits 32-63 of the handler's address — the full high
+    // dword, because kernel text lives at `0xffff_ffxx_xxxx_xxxx` and every one
+    // of those 32 bits is meaningful. Shifting it by anything other than 32
+    // would both truncate the address and, for a `1`-filled high half, lose
+    // bits off the top of the `u64` entirely.
+    (high << 32) | (middle << 16) | low
 }
 
 /// Load the already-built IDT on a processor.

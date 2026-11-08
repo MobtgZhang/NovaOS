@@ -75,6 +75,9 @@ pub const MAX_CAPABILITIES: u8 = 32;
 const FIRST_CAPABILITY_OFFSET: u8 = 0x40;
 
 /// Intel's vendor ID, for recognising the host bridge.
+/// The MSI-X capability's ID in the capability list.
+pub const CAP_MSIX: u8 = 0x11;
+
 pub const VENDOR_INTEL: u16 = 0x8086;
 
 /// The vendor ID of every VirtIO device, legacy and modern alike.
@@ -483,6 +486,27 @@ pub fn enable_transport(location: Location) -> u32 {
     readback as u32
 }
 
+/// Write a 16-bit word of configuration space.
+///
+/// # Safety
+///
+/// Configuration space is device control: a write can detach a BAR, retarget a
+/// device's DMA, or mask its interrupts. Callers must know the device state
+/// they are changing.
+pub unsafe fn write_u16(location: Location, offset: u8, value: u16) {
+    // A word write is a dword read-modify-write: the two bytes of `offset`
+    // live in one dword, and the other half of that dword belongs to
+    // neighbouring registers the caller did not name.
+    let word = read_u32(location, offset);
+    let shifted = (value as u32) << (8 * (offset & 3));
+    let mask = 0xFFFFu32 << (8 * (offset & 3));
+    // SAFETY: the caller owns the device's configuration; this write changes
+    // exactly the sixteen bits the caller named.
+    unsafe {
+        write_u32(location, offset, (word & !mask) | shifted);
+    }
+}
+
 /// Read a byte of configuration space.
 pub fn read_u8(location: Location, offset: u8) -> u8 {
     let word = read_u32(location, offset);
@@ -495,6 +519,64 @@ pub fn read_u8(location: Location, offset: u8) -> u8 {
 pub fn read_u16(location: Location, offset: u8) -> u16 {
     let word = read_u32(location, offset);
     (word >> (8 * (offset & 3))) as u16
+}
+
+/// One MSI-X capability, as the config-space header described it.
+#[derive(Clone, Copy, Debug)]
+pub struct MsixCapability {
+    /// The config-space offset of the capability's own header; the enable bit
+    /// is a word at `offset + 2`.
+    pub offset: u8,
+    /// How many table entries the device provides.
+    pub table_size: u16,
+    /// The BAR that holds the message table.
+    pub table_bar: u8,
+    /// The byte offset of the message table within that BAR.
+    pub table_offset: u32,
+}
+
+impl MsixCapability {
+    /// The MSI-X enable bit, in the Message Control word.
+    const ENABLE: u16 = 1 << 15;
+}
+
+/// Read the device's MSI-X capability, if it advertises one.
+pub fn msix_capability(device: &Device) -> Option<MsixCapability> {
+    for capability in device.capabilities() {
+        if capability.id != CAP_MSIX {
+            continue;
+        }
+        let control = read_u16(device.location, capability.offset + 2);
+        // The table pointer packs a BAR index into its low three bits and the
+        // byte offset above them; the offset is dword-aligned by definition.
+        let table = read_u32(device.location, capability.offset + 4);
+        return Some(MsixCapability {
+            offset: capability.offset,
+            table_size: (control & 0x7FF) + 1,
+            table_bar: (table & 0x7) as u8,
+            table_offset: table & !0x3,
+        });
+    }
+    None
+}
+
+/// Set the MSI-X enable bit, directing the device's interrupts at the message
+/// table the driver programmed.
+///
+/// # Safety
+///
+/// Must be called only after every table entry the device will use has been
+/// written: an enabled MSI-X device delivers to whatever address/data pair its
+/// table holds, and a stale entry points at an arbitrary vector.
+pub unsafe fn enable_msix(location: Location, cap_offset: u8) {
+    // Read-modify-write: the control word also carries the table size and the
+    // function-mask bit, none of which this call means to change.
+    let control = read_u16(location, cap_offset + 2);
+    // SAFETY: delegated to this function's contract; the caller has
+    // programmed the table first.
+    unsafe {
+        write_u16(location, cap_offset + 2, control | MsixCapability::ENABLE);
+    }
 }
 
 /// Probe a memory or IO BAR, returning its base and size.

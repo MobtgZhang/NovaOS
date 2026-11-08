@@ -141,6 +141,9 @@ pub enum VirtioError {
     DeviceNeedsReset,
     /// The queue index the driver selected does not exist.
     NoQueue,
+    /// The device advertises no MSI-X capability, so it cannot raise
+    /// interrupts at a driver-chosen vector.
+    NoMsix,
     /// Writing the queue's addresses or enabling it did not stick.
     QueueSetupFailed,
 }
@@ -158,6 +161,7 @@ impl VirtioError {
             VirtioError::NegotiationFailed => "V_NEGOTIATION_FAILED",
             VirtioError::DeviceNeedsReset => "V_DEVICE_NEEDS_RESET",
             VirtioError::NoQueue => "V_NO_QUEUE",
+            VirtioError::NoMsix => "V_NO_MSIX",
             VirtioError::QueueSetupFailed => "V_QUEUE_SETUP_FAILED",
         }
     }

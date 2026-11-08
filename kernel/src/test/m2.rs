@@ -250,6 +250,10 @@ pub static M2_SUITES: &[TestSuite] = &[
                 "spurious_interrupts_start_unaccounted",
                 spurious_interrupts_start_unaccounted,
             ),
+            (
+                "the_first_device_vector_names_the_virtio_handler",
+                the_first_device_vector_names_the_virtio_handler,
+            ),
         ],
     },
 ];
@@ -290,6 +294,33 @@ fn the_pic_range_shares_one_spurious_handler() -> Result<(), &'static str> {
         if crate::arch::x86_64::idt::gate_target(vector) != first {
             return Err("the PIC range's gates do not share one handler");
         }
+    }
+    Ok(())
+}
+
+/// The device-vector gate must be distinct from every other interrupt source.
+///
+/// §4.2's first claimant installs its handler at `DEVICE_VECTOR_BASE`: MSI
+/// messages name their vector, so the gate's target IS the source, and that
+/// only holds if no other source shares the gate. The timer's gate and the
+/// PIC range's shared handler are the two neighbours this case separates it
+/// from.
+fn the_first_device_vector_names_the_virtio_handler() -> Result<(), &'static str> {
+    let device = crate::arch::x86_64::intr::DEVICE_VECTOR_BASE as usize;
+    let timer = crate::arch::x86_64::apic::TIMER_VECTOR as usize;
+    if device == timer {
+        return Err("the device vector collides with the APIC timer's");
+    }
+    let target = crate::arch::x86_64::idt::gate_target(device);
+    if target == 0 {
+        return Err("the device vector's gate was never installed");
+    }
+    if target == crate::arch::x86_64::idt::gate_target(timer) {
+        return Err("the device gate shares the timer's handler");
+    }
+    let pic_base = crate::arch::x86_64::intr::IRQ_BASE_MASTER as usize;
+    if target == crate::arch::x86_64::idt::gate_target(pic_base) {
+        return Err("the device gate shares the PIC range's handler");
     }
     Ok(())
 }

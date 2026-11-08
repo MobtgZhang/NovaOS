@@ -51,6 +51,13 @@ pub const STATUS_FEATURES_OK: u8 = 0x08;
 /// Device status: the device has irrecoverably failed and needs a reset.
 pub const STATUS_FAILED: u8 = 0x80;
 
+/// One MSI-X table entry is four dwords.
+const MSI_X_ENTRY_BYTES: u64 = 16;
+/// The local APIC's MSI delivery window.
+const MSI_ADDRESS_BASE: u32 = 0xFEE0_0000;
+/// The page size the kernel's mappings are built at.
+const PAGE_SIZE: u64 = 0x1000;
+
 /// Common-configuration byte offsets, from the VirtIO 1.0 specification.
 mod common {
     pub const DEVICE_FEATURE_SELECT: usize = 0x00;
@@ -58,9 +65,11 @@ mod common {
     pub const DRIVER_FEATURE_SELECT: usize = 0x08;
     pub const DRIVER_FEATURE: usize = 0x0C;
     pub const NUM_QUEUES: usize = 0x12;
+    pub const MSIX_CONFIG: usize = 0x10;
     pub const DEVICE_STATUS: usize = 0x14;
     pub const QUEUE_SELECT: usize = 0x16;
     pub const QUEUE_SIZE: usize = 0x18;
+    pub const QUEUE_MSIX: usize = 0x1A;
     pub const QUEUE_ENABLE: usize = 0x1C;
     pub const QUEUE_NOTIFY_OFF: usize = 0x1E;
     pub const QUEUE_DESC: usize = 0x20;
@@ -99,6 +108,16 @@ pub struct Transport {
     isr: *mut u8,
     /// The queue-notify offset this device's single queue uses.
     queue_notify_off: u16,
+    /// Whether MSI-X is enabled and every queue is pointed at [`Self::msix_vector`].
+    ///
+    /// MSI-X changes two things at once: the device raises MSI messages at the
+    /// programmed vector instead of polling-friendly register state, and each
+    /// queue's vector must be named through the common configuration's
+    /// `queue_msix_vector` register — a modern device starts with every queue
+    /// at `NO_VECTOR`, and a queue left there never raises anything.
+    msix: bool,
+    /// The vector every queue is pointed at once MSI-X is enabled.
+    msix_vector: u16,
     /// The notify offset for every queue the driver has configured.
     ///
     /// A block device uses one queue, but a network device uses a receive and a
@@ -152,6 +171,8 @@ impl Transport {
             device_config: device_config.unwrap_or(core::ptr::null_mut()),
             isr,
             queue_notify_off: 0,
+            msix: false,
+            msix_vector: 0,
             notify_offs: [0; MAX_VIRTIO_QUEUES],
         })
     }
@@ -282,6 +303,13 @@ impl Transport {
             }
             mmio::write_u16(self.common, common::QUEUE_SIZE, chosen);
 
+            // A modern device starts every queue at `NO_VECTOR`: without this
+            // write the queue never raises an interrupt, MSI-X or not. The
+            // queue is still selected here, which is all the register needs.
+            if self.msix {
+                mmio::write_u16(self.common, common::QUEUE_MSIX, self.msix_vector);
+            }
+
             mmio::write_u64(self.common, common::QUEUE_DESC, desc_phys);
             mmio::write_u64(self.common, common::QUEUE_AVAIL, avail_phys);
             mmio::write_u64(self.common, common::QUEUE_USED, used_phys);
@@ -337,6 +365,92 @@ impl Transport {
 
     /// Tell the device to look at `index`.
     ///
+    /// Enable MSI-X and point every table entry at one vector.
+    ///
+    /// `vector` must have an IDT gate with a handler; `destination` is the
+    /// local APIC id the messages go to (the bootstrap processor). Every entry
+    /// — not just the queues this driver configures — is programmed to the
+    /// same pair, because the handler does not need to know which queue
+    /// raised: it counts, and the waiter drains.
+    ///
+    /// Returns `Err` when the device has no MSI-X capability or its table
+    /// cannot be reached; the caller decides whether polling remains.
+    pub fn enable_msix(
+        &mut self,
+        device: &pci::Device,
+        vector: u32,
+        destination: u32,
+    ) -> Result<(), VirtioError> {
+        let capability = pci::msix_capability(device).ok_or(VirtioError::NoMsix)?;
+        let bar = pci::probe_bar(device.location, capability.table_bar)
+            .ok_or(VirtioError::BarTooSmall)?;
+        if bar.io {
+            return Err(VirtioError::NotMemoryMapped);
+        }
+        let table_bytes = capability.table_size as u64 * MSI_X_ENTRY_BYTES;
+        if capability.table_offset as u64 + table_bytes > bar.size {
+            return Err(VirtioError::BarTooSmall);
+        }
+
+        // x86 MSI message: the address names the local APIC's delivery
+        // window, the data names the vector. Physical destination, fixed
+        // delivery, edge trigger — the zeros the reset state would carry,
+        // written explicitly so the meaning is not left to luck.
+        let message_address = MSI_ADDRESS_BASE | (destination << 12);
+        let message_data = vector & 0xFF;
+
+        // The table lives in a MMIO BAR, not in RAM: the direct map only
+        // covers memory the bootloader described, so the table's pages get
+        // their own kernel mappings — the same thing `map_structure` does for
+        // every control structure. Page granularity, because that is what the
+        // page tables sell.
+        let table_phys = bar.address + capability.table_offset as u64;
+        let first_page = table_phys & !0xFFF;
+        let last_page = (table_phys + table_bytes - 1) & !0xFFF;
+        for page in (first_page..=last_page).step_by(PAGE_SIZE as usize) {
+            let virtual_address = direct_map::phys_to_virt(page) as u64;
+            address_space::map_kernel_mmio(virtual_address, page)
+                .map_err(|_| VirtioError::MapFailed)?;
+        }
+        let table = direct_map::phys_to_virt(table_phys) as *mut u8;
+        for entry in 0..capability.table_size as usize {
+            // SAFETY: the bounds check above proved the table covers every
+            // entry, and each field is one aligned dword inside it.
+            unsafe {
+                mmio::write_u32(table, entry * 4, message_address);
+                mmio::write_u32(table, entry * 4 + 4, 0);
+                mmio::write_u32(table, entry * 4 + 8, message_data);
+                // The masked bit is the low word of the vector control: zero
+                // means this entry may deliver.
+                mmio::write_u32(table, entry * 4 + 12, 0);
+            }
+        }
+        mmio::fence();
+
+        // Only now is it safe to enable: every entry names a programmed pair.
+        // SAFETY: the table is fully programmed, per this function's contract.
+        unsafe { pci::enable_msix(device.location, capability.offset) };
+
+        self.msix = true;
+        self.msix_vector = vector as u16;
+
+        klog!(
+            Level::Info,
+            "virtio: msi-x enabled, {} entries -> vector {:#x} dest {:#x} (bar {} offset {:#x})",
+            capability.table_size,
+            vector,
+            destination,
+            capability.table_bar,
+            capability.table_offset,
+        );
+        Ok(())
+    }
+
+    /// Whether this transport raises interrupts through MSI-X.
+    pub const fn uses_msix(&self) -> bool {
+        self.msix
+    }
+
     /// The notify register is `queue_notify_off * multiplier`, and the value
     /// written is the queue index. A wrong offset or a wrong value names a
     /// queue the device does not have, and the symptom is a request that never

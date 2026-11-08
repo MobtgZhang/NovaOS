@@ -48,6 +48,14 @@ const ICW4_8086: u8 = 0x01;
 pub const IRQ_BASE_MASTER: u8 = 0x20;
 /// Base vector for slave IRQs.
 pub const IRQ_BASE_SLAVE: u8 = 0x28;
+
+/// The first vector devices may use for MSI messages.
+///
+/// The PIC's remapped range ends at 0x2F and the local APIC timer owns 0x30,
+/// so device vectors start just above the timer. One device vector per
+/// allocation keeps every handler's EOI unambiguous: MSI messages name their
+/// vector explicitly, so the handler at the gate IS the source.
+pub const DEVICE_VECTOR_BASE: u32 = 0x31;
 /// Cascade line on the master, routed to IRQ2.
 const CASCADE_IRQ: u8 = 2;
 

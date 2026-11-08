@@ -37,6 +37,8 @@ use super::{FEATURE_VERSION_1, VirtioError};
 use crate::arch::ADDRESS_SPACE;
 use crate::drivers::mmio;
 use crate::drivers::pci;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::klog;
 use crate::logger::Level;
 use crate::mm::{direct_map, frame_allocator};
@@ -112,10 +114,49 @@ pub struct TcpConnection {
 
 /// How many poll iterations one request may wait.
 ///
+/// With MSI-X armed this is only a ceiling against a device that stopped
+/// interrupting: the wait ends on the first interrupt, not on the budget, and
+/// the spin between interrupts reads one local flag rather than the device's
+/// mapped ring. Without MSI-X it remains the plain poll bound it always was.
+///
 /// An iteration bound rather than a wall-clock deadline, for the same reason as
 /// the block driver's budget: under emulation the instruction stream and the
 /// machine clock are not the same measure.
 const POLL_BUDGET: u64 = 100_000_000;
+
+/// How many iterations to keep draining *after* an interrupt arrived.
+///
+/// The interrupt says a completion landed, not that the waiter's first read
+/// saw it: the ring's used index and the flag can race by one read. A short
+/// bounded window of ordinary queue reads after the flag covers that race
+/// without ever re-entering the long pre-interrupt wait.
+const IRQ_DRAIN_BUDGET: u64 = 1_000_000;
+
+/// The vector this device raises interrupts on.
+///
+/// Allocated from [`crate::arch::x86_64::intr::DEVICE_VECTOR_BASE`]: the PIC's
+/// range is masked, the APIC timer owns 0x30, so 0x31 is the first device
+/// vector. The IDT installs this module's handler at exactly this gate.
+pub const IRQ_VECTOR: u32 = crate::arch::x86_64::intr::DEVICE_VECTOR_BASE;
+
+/// How many device interrupts have been acknowledged since boot.
+///
+/// The count, not a boolean, is the wakeup contract: a completion can land
+/// between the waiter's queue read and its flag read, and a boolean set before
+/// the wait even starts would be indistinguishable from one set after. The
+/// waiter compares against the count it observed when it began waiting.
+static DEVICE_IRQS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one acknowledged device interrupt. Called from the interrupt
+/// handler on whichever CPU the message was delivered to.
+pub fn note_device_interrupt() {
+    DEVICE_IRQS.fetch_add(1, Ordering::Release);
+}
+
+/// The current device-interrupt count, for diagnostics and tests.
+pub fn device_irq_count() -> u64 {
+    DEVICE_IRQS.load(Ordering::Acquire)
+}
 
 /// How many received packets a DNS lookup or ARP lookup will inspect.
 const LOOKUP_ATTEMPTS: usize = 8;
@@ -209,12 +250,42 @@ pub struct VirtioNet {
     rx_primed: bool,
     mac: MacAddr,
     link_up: bool,
+    /// Whether the transport raises interrupts through MSI-X.
+    msix: bool,
 }
 
 impl VirtioNet {
     /// Take over a network device: negotiate, allocate both queues, and go live.
     pub fn open(device: &pci::Device) -> Result<Self, NetError> {
         let mut transport = transport::Transport::open(device).map_err(NetError::Transport)?;
+
+        // MSI-X goes first: the device must not pass ACKNOWLEDGE before its
+        // interrupt delivery is configured. The destination is the bootstrap
+        // processor — the CPU whose snapshot the boot report carries — and the
+        // waiter reads a shared count, so a message delivered to a different
+        // CPU than the waiter still ends the wait.
+        //
+        // A device without MSI-X capability is not fatal: the driver falls
+        // back to the polling wait it has always had. The failure is logged,
+        // not swallowed, so the fallback is visible in the boot output.
+        // SAFETY: the boot snapshot was captured before drivers started, and
+        // reads are read-only; the same call pattern the rest of the kernel
+        // uses after `boot::capture`.
+        let msix = match transport.enable_msix(
+            device,
+            IRQ_VECTOR,
+            unsafe { crate::boot::read_boot_info() }.bsp_lapic_id,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                klog!(
+                    Level::Warn,
+                    "virtio-net: msi-x unavailable ({}), polling remains",
+                    error.name(),
+                );
+                false
+            }
+        };
 
         let wanted = super::Features {
             low: (1 << FEATURE_NET_MAC) | (1 << FEATURE_NET_STATUS),
@@ -298,6 +369,7 @@ impl VirtioNet {
             rx_primed: false,
             mac,
             link_up,
+            msix,
         })
     }
 
@@ -1199,6 +1271,10 @@ impl VirtioNet {
     /// Poll one queue until the device answers, the budget runs out, or the
     /// device reports a completion this driver cannot accept.
     fn await_completion(&mut self, transmit: bool) -> Result<queue::Completion, NetError> {
+        // The count this wait began with: any later increment is an interrupt
+        // that arrived *during* the wait, which is the signal this function
+        // exists to receive.
+        let irqs_at_start = device_irq_count();
         let mut budget = POLL_BUDGET;
         loop {
             let result = if transmit {
@@ -1210,6 +1286,14 @@ impl VirtioNet {
                 Ok(Some(completion)) => return Ok(completion),
                 Ok(None) => {}
                 Err(error) => return Err(NetError::Queue(error)),
+            }
+
+            // An interrupt since the wait began: switch from waiting to
+            // draining. The first read after the flag can still miss the
+            // completion (the used ring's index and the flag race by one
+            // read), so the drain window stays bounded rather than single.
+            if self.msix && device_irq_count() != irqs_at_start {
+                budget = budget.min(IRQ_DRAIN_BUDGET);
             }
 
             if budget == 0 {
