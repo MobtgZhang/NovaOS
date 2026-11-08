@@ -124,10 +124,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-type"
+version = "0.1.0"
+
+[[package]]
 name = "nova-ui"
 version = "0.1.0"
 dependencies = [
  "nova-protocols",
+ "nova-type",
 ]
 
 [[package]]

@@ -16,6 +16,10 @@ bench = false
 
 [dependencies]
 nova-protocols = { workspace = true }
+# The toolkit's `Canvas::draw_text` renders through the shared vector
+# typography crate: one font engine for the kernel console, the boot menu,
+# and every window, so a glyph looks the same in all three.
+nova-type = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

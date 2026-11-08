@@ -226,6 +226,20 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 - `drivers/display.rs` 依赖 boot protocol 的 framebuffer 信息；无 EDID/模式切换、无 GPU 加速。可接受，但合成器（`services/compositor.rs`，1222 行）在 100 Hz tick 驱动下的重绘节奏没有 vsync/脏矩形优化。
 
+### 5.6 排版：唯一的"字体"是 8×16 位图字体〔已建立矢量排版子系统（2026-11-08）：`nova-type`〕**High**
+
+- **原始状态**：`nova-ui` 内嵌 8×16 像素字体，UEFI 菜单 5×7 位图；无任何矢量字体、无可缩放渲染、无抗锯齿，更没有中文。像素级字体正是用户明令禁止的方向。
+- **已实现（`crates/nova-type`，no_std、无 alloc、无 float、`forbid(unsafe)`）**：
+  - `parser.rs`：sfnt/TrueType 表解析（head/maxp/cmap4+cmap12/hhea/hmtx/loca/glyf），全部经边界检查——截断与垃圾输入返回错误而非 panic；简单字形 + 复合字形（F2Dot14 缩放、点匹配参数置零、深度帽 4）；`cmap` 走 Unicode (3,1)/(3,10)/(0,*)。
+  - `raster.rs`：26.6 定点扫描线光栅化器——轮廓缩放至 q6 子像素、二次贝塞尔偏差有界细分（de Casteljau 整数平分）、每像素 4×4 采样 + 非零环绕规则的排序交点游走，覆盖率 0..255 即抗锯齿；字形上限 64×64 px。
+  - `cache.rs`：32 槽固定环形字形缓存，键 =（glyph, size）。
+  - 宿主测试 15 项（`tests/render.rs`）针对提交进仓库的固定测试资产 `assets/fonts/iosevka-test.ttf`（2.6 KB）渲染验证：字形正确性（ASCII art 可视化比对）、'A' 左右对称性、基线语义、等宽 advance、确定性、截断安全、缓存语义。
+- **字体资产**（`tools/fonts/build.py` 从上游 release 可复现，`assets/fonts/` 提交子集）：
+  - `iosevka-console.ttf` 17.8 KB（be5invis/Iosevka：ASCII + 制表符 + 箭头）→ 内核控制台 + UEFI 菜单；
+  - `sarasa-terminal.ttf` 1.03 MB（be5invis/Sarasa-Gothic Mono SC：ASCII + GB2312 一级汉字 3755 + CJK 标点）→ 终端字体（用户指定）；
+  - `han-sans-gui.ttf` 1.03 MB（adobe-fonts/source-han-sans SC：经 cu2qu CFF→glyf 转换后子集化）→ GUI 应用（editor/file-manager）。
+- **集成进度**：`nova-ui` 已挂依赖；内核屏显控制台、UEFI 菜单矢量字、终端 `nova>` 界面的接入随后续阶段提交。
+
 ---
 
 ## 6. 文件系统与存储服务

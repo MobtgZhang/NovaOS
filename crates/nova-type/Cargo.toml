@@ -1,0 +1,44 @@
+[package]
+name = "nova-type"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NovaOS scalable typography: sfnt/TrueType parsing and anti-aliased scanline rasterization in fixed point"
+
+# A library, and a host-testable one: everything in it is `core`-only logic
+# with no allocation and no floating point, so the kernel's boot console, the
+# UEFI boot manager, and ring-3 applications all render through the same code
+# the host test runner exercises. That shared testability is the whole reason
+# it is a crate of its own rather than modules inside each consumer.
+[lib]
+bench = false
+
+[dependencies]
+# None, deliberately: a font engine underneath the kernel should not reach
+# sideways into the ABI or the runtime, and every consumer hands it plain
+# byte slices.
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# The crate must never grow an `unsafe` block: it reads font bytes supplied
+# from firmware, disks, and embedded images, and its safety argument is that
+# *no* input can make it dereference a pointer it did not derive from a
+# bounds-checked slice index. An `unsafe` here would be a hole in that
+# argument.
+unsafe_code = "deny"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+# Font coordinates *cannot* overflow by construction, and the proof is
+# local: every outline coordinate starts as an i16 (|v| ≤ 32 767) and is
+# scaled once through an i64 intermediate — units × size × 64 over
+# units-per-em — so the q6 values that flow through the rasterizer are
+# bounded by roughly 2^28, and sums of a few of them stay under 2^31 with
+# headroom to spare. Products that could grow (scale × coordinate) are
+# computed in i64 explicitly. The lint is therefore allowed rather than
+# denied: the array indexing that actually guards memory safety goes
+# through bounds-checked accessors, not arithmetic the lint could misjudge,
+# and re-proving the bound at each of the hundreds of integer adds in the
+# scanline hot loop would buy nothing but noise.
+arithmetic_side_effects = "allow"
