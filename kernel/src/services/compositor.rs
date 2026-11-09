@@ -569,6 +569,11 @@ impl CompositorService {
             surface.damage_count = 0;
         }
         self.frame_count = self.frame_count.saturating_add(1);
+        // Draw the mouse pointer on top of every surface.
+        if let Some((x, y)) = crate::drivers::input::mouse_position() {
+            draw_mouse_pointer(x, y)?;
+        }
+
         Ok(self.surface_count())
     }
 
@@ -1219,4 +1224,46 @@ mod tests {
         );
         assert_eq!(required_buffer_bytes(10, 4, 39), None);
     }
+}
+
+/// Draw the mouse pointer on the screen — a classic arrow.
+///
+/// The cursor is drawn as the last step of `present()`: all window blits are already complete when we write it, so the pointer is the topmost thing on the screen.
+fn draw_mouse_pointer(x: u32, y: u32) -> Result<(), DisplayError> {
+    // Rows: each entry is a sequence of `#` (black border), `.` (white fill),
+    // or ' ' (transparent). Pointer tip is the first row.
+    const PATTERN: &[&str] = &[
+        "#", "##", "#.#", "#..#", "#...#", "#....#", "#######", "#.....#", "#..#..#", "#.#.#.#",
+        "##...##", "..   ..",
+    ];
+
+    if let Some(mode) = display::mode() {
+        for (row, pattern) in PATTERN.iter().enumerate() {
+            let Some(row_u32) = row.try_into().ok() else {
+                continue;
+            };
+            for (col, ch) in pattern.bytes().enumerate() {
+                let (r, g, b) = match ch {
+                    b'#' => (0, 0, 0),
+                    b'.' => (255, 255, 255),
+                    _ => continue,
+                };
+                let Some(col_u32) = col.try_into().ok() else {
+                    continue;
+                };
+                let _ = put_pixel(
+                    x.saturating_add(col_u32),
+                    y.saturating_add(row_u32),
+                    r,
+                    g,
+                    b,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) -> Result<(), DisplayError> {
+    display::put_pixel(x, y, r, g, b)
 }

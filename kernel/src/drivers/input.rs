@@ -54,6 +54,87 @@ const INPUT_FULL: u8 = 1 << 1;
 /// A device that never clears its output buffer would otherwise hold the
 /// kernel in a loop. The bound is a quota, not a correctness claim.
 const MAX_DRAIN: usize = 32;
+/// The bit in the 8042 status register that flags which device produced
+/// the byte: 0 = keyboard, 1 = mouse.
+const MOUSE_BIT: u8 = 0x20;
+
+/// Track the mouse packet state. Each mouse packet is 3 bytes (flags, dx, dy).
+#[derive(Clone, Copy, Debug)]
+struct MousePacket {
+    bytes: [u8; 3],
+    index: usize,
+}
+
+impl MousePacket {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 3],
+            index: 0,
+        }
+    }
+    fn feed(&mut self, byte: u8) -> Option<MouseDecoded> {
+        self.bytes[self.index] = byte;
+        self.index += 1;
+        if self.index < 3 {
+            return None;
+        }
+        self.index = 0;
+        let flags = self.bytes[0];
+        let buttons = flags & 0x07;
+        // Set-1 mouse: dx / dy are signed 8-bit magnitudes with the sign in
+        // flags bits 4/5. Casting through `i8` performs the sign extension
+        // we need, and avoids rewriting by hand.
+        let dx = if flags & 0x10 != 0 {
+            (self.bytes[1] as i8) as i16
+        } else {
+            self.bytes[1] as i16
+        };
+        let dy = if flags & 0x20 != 0 {
+            (self.bytes[2] as i8) as i16
+        } else {
+            self.bytes[2] as i16
+        };
+        Some(MouseDecoded {
+            buttons: buttons as u32,
+            dx,
+            dy,
+        })
+    }
+}
+
+/// A decoded mouse packet: button mask (low 3 bits) and signed deltas.
+#[derive(Clone, Copy, Debug)]
+struct MouseDecoded {
+    buttons: u32,
+    dx: i16,
+    dy: i16,
+}
+
+/// The mouse packet being assembled, guarded to a static.
+///
+/// # Safety
+///
+/// The poller owns this state and runs single-threaded on one CPU. The
+/// `poll()` call path is `&mut`-only. Hence `Sync` is hand-written, and no
+/// accessor exposes a shared reference. This field must stay private.
+static MOUSE_PACKET: MousePacketCell = MousePacketCell::new();
+
+/// A `Sync` wrapper around the mouse packet assembly state.
+struct MousePacketCell(core::cell::UnsafeCell<MousePacket>);
+
+impl MousePacketCell {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new(MousePacket::new()))
+    }
+    // SAFETY: single-CPU, interrupts masked, only owner.
+    unsafe fn get(&self) -> &mut MousePacket {
+        // SAFETY: the caller is the only reference operator of MT single CPU end.
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+// SAFETY: `poll()` runs with one CPU at a time and interrupts masked.
+unsafe impl Sync for MousePacketCell {}
 
 /// Wait until the controller can accept a command byte.
 ///
@@ -74,15 +155,28 @@ unsafe fn input_buffer_clear() -> bool {
 ///
 /// Returns `None` when no byte is ready. Reading the data port consumes the
 /// byte, which is exactly what polling needs.
-unsafe fn read_byte() -> Option<u8> {
+/// One byte from the 8042 output port, paired with the device that sent it.
+struct PortByte {
+    /// The raw data byte.
+    byte: u8,
+    /// Whether the data port reports a mouse produced the byte.
+    from_mouse: bool,
+}
+
+unsafe fn read_byte() -> Option<PortByte> {
     // SAFETY: `0x64` is the status port and `0x60` is the data port; the
     // driver owns both and runs single-CPU.
-    if unsafe { inb(COMMAND_PORT) } & OUTPUT_FULL == 0 {
+    let status = unsafe { inb(COMMAND_PORT) };
+    if status & OUTPUT_FULL == 0 {
         return None;
     }
     // SAFETY: the status bit said a byte is ready, and reading the data port
     // acknowledges it.
-    Some(unsafe { inb(DATA_PORT) })
+    let byte = unsafe { inb(DATA_PORT) };
+    Some(PortByte {
+        byte,
+        from_mouse: status & MOUSE_BIT != 0,
+    })
 }
 
 /// Send a command byte to the controller.
@@ -103,6 +197,51 @@ unsafe fn drain_output() {
             break;
         }
     }
+}
+
+/// The mouse's absolute coordinate, owned by the poller.
+///
+/// # Safety
+///
+/// The polling path is single CPU at a time (interrupts masked) and the
+/// cell is only aliased inside this module.
+struct MousePosCell(core::cell::UnsafeCell<(u32, u32)>);
+impl MousePosCell {
+    const fn new() -> Self {
+        Self(core::cell::UnsafeCell::new((512, 384)))
+    }
+    // SAFETY: poller-single-instance; returns copy; never aliased.
+    unsafe fn get_copy(&self) -> (u32, u32) {
+        // SAFETY: the caller is the only operator of the cell.
+        unsafe { *self.0.get() }
+    }
+    // SAFETY: poller-single-instance; the cell is never aliased by two
+    // callers, as the poller is `&mut`-owned from one path at a time.
+    unsafe fn set(&self, value: (u32, u32)) {
+        // SAFETY: the caller is the only operator of the cell.
+        unsafe { *self.0.get() = value };
+    }
+}
+
+// SAFETY: poller-single-instance and interrupts are masked on the caller.
+unsafe impl Sync for MousePosCell {}
+
+static MOUSE_POS: MousePosCell = MousePosCell::new();
+
+pub fn mouse_position() -> Option<(u32, u32)> {
+    // SAFETY: poller-single-instance.
+    Some(unsafe { MOUSE_POS.get_copy() })
+}
+
+fn mouse_move(dx: i16, dy: i16) {
+    // SAFETY: poller-single-instance; the cell is never aliased by two
+    // callers, as the poller is `&mut`-owned from one path at a time.
+    let pos = unsafe { MOUSE_POS.get_copy() };
+    // Do not allow underflow.
+    let new_x = pos.0 as i32 + dx as i32;
+    let new_y = pos.1 as i32 - dy as i32;
+    // SAFETY: poller-single-instance.
+    unsafe { MOUSE_POS.set((new_x.max(0) as u32, new_y.max(0) as u32)) };
 }
 
 /// Bring up the PS/2 controller.
@@ -154,9 +293,32 @@ pub unsafe fn poll() -> usize {
     let mut routed = 0usize;
 
     for _ in 0..MAX_DRAIN {
-        let Some(byte) = (unsafe { read_byte() }) else {
+        let Some(port_byte) = (unsafe { read_byte() }) else {
             break;
         };
+
+        // The mouse has its own packet framing; keyboard bytes are never
+        // interpreted as mouse packets. Mouse packets are 3 bytes; the
+        // header carries button bits, overflow markers and the sign of the
+        // deltas. We track the cursor position locally, then forward delta
+        // routing through the input service so the compositor can move the
+        // focused window's pointer.
+        if port_byte.from_mouse {
+            let packet = unsafe { MOUSE_PACKET.get() };
+            if let Some(decoded) = packet.feed(port_byte.byte) {
+                mouse_move(decoded.dx, decoded.dy);
+                let _btn = decoded.buttons;
+                // Route pointer through service; let GUI apps react to clicks.
+                let (mx, my) = mouse_position().unwrap_or((0, 0));
+                let _ =
+                    parts
+                        .input
+                        .route_pointer(i64::from(mx), i64::from(my), _btn, parts.compositor);
+            }
+            continue;
+        }
+
+        let byte = port_byte.byte;
 
         // Decode the byte and feed stdin: the emergency console has no
         // window to route to, so bytes land in the kernel's stdin ring and

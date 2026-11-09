@@ -85,6 +85,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nova-graphic"
+version = "0.1.0"
+dependencies = [
+ "nova-ui",
+]
+
+[[package]]
 name = "nova-ipc"
 version = "0.1.0"
 dependencies = [
