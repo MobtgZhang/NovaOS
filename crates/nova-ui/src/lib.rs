@@ -229,6 +229,11 @@ impl Canvas {
         }
     }
 
+    /// Paint one pixel, clipping silently to the surface bounds.
+    pub fn set_pixel(&mut self, x: i32, y: i32, word: u32) {
+        self.set(x, y, word);
+    }
+
     /// Fill the whole surface.
     pub fn clear(&mut self, word: u32) {
         self.fill_rect(Rect::new(0, 0, self.width as u32, self.height as u32), word);

@@ -78,7 +78,9 @@ static mut INITRAMFS_LEN: usize = 0;
 /// the storage is `.bss`: raising the bound costs RAM the machine already has
 /// and no image bytes, while lowering the risk of the next application silently
 /// pushing the desktop past a boot it used to pass.
-const INITRAMFS_CAPACITY: usize = 6 * 1024 * 1024;
+/// The archive outgrew the original 6 MiB once the desktop's programs
+/// accumulated embedded typefaces; 8 MiB of `.bss` is the current fence.
+const INITRAMFS_CAPACITY: usize = 8 * 1024 * 1024;
 
 /// Record the snapshot pointer the entry stub received.
 ///

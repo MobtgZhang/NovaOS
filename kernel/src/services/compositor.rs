@@ -52,6 +52,8 @@ use nova_protocols::surface::{
     SURFACE_REPLY_SIZE, SURFACE_VERSION, SurfaceRect, required_buffer_bytes,
 };
 
+use nova_desktop_server::damage::{DamageAccumulator, DamageRect};
+
 use crate::drivers::display::{self, DisplayError};
 use crate::mm::direct_map;
 use crate::services::object::ObjectKind;
@@ -150,10 +152,12 @@ pub struct CompositorService {
     next_z: u32,
     frame_count: u64,
     /// Whether the pointer moved since the last presented frame. A cursor
-    /// has no backing surface, so its motion cannot ride the damage path:
-    /// the only way to show the arrow at its new cell (and not leave one at
-    /// the old cell) is to repaint the frame.
+    /// has no backing surface, so its motion cannot ride the damage path;
+    /// the paint logic uses it as a cheap frame-trigger hint.
     pointer_moved: bool,
+    /// The arrow cell drawn last time, in output pixels — the region that
+    /// must be repainted to erase the old arrow when it moves.
+    last_cursor: Option<DamageRect>,
 }
 
 impl CompositorService {
@@ -166,6 +170,7 @@ impl CompositorService {
             next_z: 1,
             frame_count: 0,
             pointer_moved: false,
+            last_cursor: None,
         }
     }
 
@@ -177,6 +182,7 @@ impl CompositorService {
         self.next_z = 1;
         self.frame_count = 0;
         self.pointer_moved = false;
+        self.last_cursor = None;
     }
 
     /// The surface with `id`.
@@ -564,23 +570,80 @@ impl CompositorService {
         let Some(mode) = display::mode() else {
             return Err(DisplayError::NoDisplay);
         };
-        let _ = mode;
 
-        let full = self.pointer_moved
-            || self
-                .surfaces
-                .iter()
-                .flatten()
-                .any(|surface| surface.full && surface.has_buffer());
+        // The whole-frame repaint stays for attach/move/resize, where a
+        // full redraw is the only correct answer. Anything narrower runs
+        // the region path: fill the damaged region with the background,
+        // blit each surface clipped to it, draw the cursor on top.
+        let full = self
+            .surfaces
+            .iter()
+            .flatten()
+            .any(|surface| surface.full && surface.has_buffer());
 
-        if full {
-            display::clear(BACKGROUND_RED, BACKGROUND_GREEN, BACKGROUND_BLUE)?;
-            self.draw_all()?;
+        let cursor = crate::drivers::input::mouse_position();
+
+        enum Plan {
+            Nothing,
+            Regions(DamageRect),
+            Full,
+        }
+
+        let plan = if full {
+            Plan::Full
+        } else if let Some(region) = paint_region(self, &mode) {
+            match region.intersect(&DamageRect::new(0, 0, mode.width, mode.height)) {
+                Some(clipped) => Plan::Regions(clipped),
+                None => Plan::Nothing,
+            }
         } else {
-            self.draw_damage()?;
+            Plan::Nothing
+        };
+
+        match plan {
+            Plan::Full => {
+                display::clear(BACKGROUND_RED, BACKGROUND_GREEN, BACKGROUND_BLUE)?;
+                self.draw_all()?;
+            }
+            Plan::Regions(region) => {
+                // 1) background
+                display::fill_rect(
+                    region.x.max(0) as u64,
+                    region.y.max(0) as u64,
+                    u64::from(region.w),
+                    u64::from(region.h),
+                    BACKGROUND_RED,
+                    BACKGROUND_GREEN,
+                    BACKGROUND_BLUE,
+                )?;
+                // 2) surfaces in z-order, clipped to the region
+                let mut last_z: i64 = -1;
+                for _ in 0..MAX_SURFACES {
+                    let mut best: Option<(u32, usize)> = None;
+                    for (index, entry) in self.surfaces.iter().enumerate() {
+                        let Some(surface) = entry else {
+                            continue;
+                        };
+                        if !surface.has_buffer() || (surface.z as i64) <= last_z {
+                            continue;
+                        }
+                        if best.is_none_or(|(z, _)| surface.z < z) {
+                            best = Some((surface.z, index));
+                        }
+                    }
+                    let Some((z, index)) = best else {
+                        break;
+                    };
+                    last_z = z as i64;
+                    let surface = self.surfaces[index].expect("the selected entry exists");
+                    self.blit_clipped(&surface, region)?;
+                }
+            }
+            Plan::Nothing => {}
         }
 
         self.pointer_moved = false;
+        self.last_cursor = cursor.map(|(x, y)| DamageRect::new(x as i32, y as i32, 12, 12));
         for surface in self.surfaces.iter_mut().flatten() {
             surface.dirty = false;
             surface.full = false;
@@ -593,6 +656,46 @@ impl CompositorService {
         }
 
         Ok(self.surface_count())
+    }
+
+    /// Blit the part of `surface` that lies inside `region` (output pixels).
+    fn blit_clipped(&self, surface: &Surface, region: DamageRect) -> Result<(), DisplayError> {
+        let bounds = DamageRect::new(
+            surface.x.max(0) as u32 as i32,
+            surface.y.max(0) as u32 as i32,
+            surface.width,
+            surface.height,
+        );
+        let bounds = DamageRect::new(
+            surface.x.max(0) as i32,
+            surface.y.max(0) as i32,
+            surface.width,
+            surface.height,
+        );
+        let Some(intersection) = bounds.intersect(&region) else {
+            return Ok(());
+        };
+        let Some(buffer) = surface.buffer else {
+            return Err(DisplayError::InvalidBuffer);
+        };
+        let source = match usize::try_from(buffer.size) {
+            Ok(size) => {
+                // SAFETY: as in `blit_full`: the buffer is kernel-owned while
+                // the surface exists, and the direct map is live.
+                unsafe { direct_map::frame_bytes(buffer.base, size) }
+            }
+            Err(_) => return Err(DisplayError::InvalidBuffer),
+        };
+        display::blit_window(
+            source,
+            surface.stride,
+            (intersection.x - bounds.x) as u32,
+            (intersection.y - bounds.y) as u32,
+            intersection.w,
+            intersection.h,
+            intersection.x as u64,
+            intersection.y as u64,
+        )
     }
 
     /// Draw every buffer-bearing surface in z-order.
@@ -617,26 +720,6 @@ impl CompositorService {
             last_z = z as i64;
             let surface = self.surfaces[index].expect("the selected entry exists");
             self.blit_full(&surface)?;
-        }
-        Ok(())
-    }
-
-    /// Draw the damaged rectangles of every dirty surface.
-    fn draw_damage(&mut self) -> Result<(), DisplayError> {
-        for entry in self.surfaces.iter() {
-            let Some(surface) = entry else {
-                continue;
-            };
-            if !surface.dirty || !surface.has_buffer() {
-                continue;
-            }
-            if surface.full {
-                self.blit_full(surface)?;
-                continue;
-            }
-            for rect in surface.damage.iter().take(surface.damage_count) {
-                self.blit_rect(surface, *rect)?;
-            }
         }
         Ok(())
     }
@@ -1284,4 +1367,47 @@ fn draw_mouse_pointer(x: u32, y: u32) -> Result<(), DisplayError> {
 
 fn put_pixel(x: u32, y: u32, r: u8, g: u8, b: u8) -> Result<(), DisplayError> {
     display::put_pixel(x, y, r, g, b)
+}
+
+/// Compute the rectangle the compositor must repaint this frame, from every
+/// damaged surface and the last-drawn cursor cell.
+///
+/// Returns `None` when nothing was damaged. The accumulator collapses
+/// everything into one tight bounding box, clipped to the output — the
+/// minimum region that makes the frame correct.
+fn paint_region(
+    compositor: &CompositorService,
+    mode: &crate::drivers::display::DisplayMode,
+) -> Option<DamageRect> {
+    let mut accumulator = DamageAccumulator::new(mode.width, mode.height);
+    for surface in compositor.surfaces.iter().flatten() {
+        if !surface.has_buffer() {
+            continue;
+        }
+        for rect in surface.damage.iter().take(surface.damage_count) {
+            accumulator.damage(
+                0,
+                DamageRect::new(
+                    surface.x as i32 + rect.x as i32,
+                    surface.y as i32 + rect.y as i32,
+                    rect.width,
+                    rect.height,
+                ),
+                mode.width,
+                mode.height,
+            );
+        }
+    }
+    if let Some(cell) = compositor.last_cursor {
+        accumulator.set_extra(cell);
+    }
+    match accumulator.plan() {
+        nova_desktop_server::damage::Repaint::Nothing => None,
+        nova_desktop_server::damage::Repaint::Full => {
+            Some(DamageRect::new(0, 0, mode.width, mode.height))
+        }
+        nova_desktop_server::damage::Repaint::Regions(rects, count) => {
+            (count > 0).then_some(rects[0])
+        }
+    }
 }

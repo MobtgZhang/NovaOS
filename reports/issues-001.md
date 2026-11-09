@@ -423,7 +423,6 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **交互**：cwd 追踪到 `user@novaos:<path>` 格式（2026-11-09 起含冒号，`root@novaos:/docs>`），`cd`、`pwd`、`ls`、`ls -l`、`cat`、`echo`、`ps`、`whoami`、`id`、`su` 全部实现并实测通过。
 - **Safe Terminal 实测（QEMU + vncdotool 注入键盘事件）**：以 `root` 身份登录、运行 `cd /docs`、`pwd`、`cat readme.txt`、`cd ..`、`pwd`、`chmod 600 /hello.txt`、`chown 1000 /docs/readme.txt`、`ls -l /`、`ls -l /docs`、`su zhang`、切回密码 `zhang` 登录并执行命令，全部正常工作（密码不回显、权限检查正确、`id`、`whoami` 依次输出 root@uid=0 zhang@uid=1000）。
 - **当前不足**：PS/2 键盘映射登记在 `kernel/src/drivers/input.rs`（framebuffer ASCII 渲染路径缺失），目前只在 kernel console 中为 `read()` 写入缓冲；Safe Terminal 的输入走键盘映射到 stdin ring `kernel/src/stdin.rs`，支持 US 键盘布局（shift 跟踪）、退格、回车、Tab。中文输入未做。
-
 ### 13.2 桌面、鼠标指针、nova-graphic（2026-11-09）〔进度中〕
 
 - **PS/2 鼠标**：`drivers/input.rs` 同时识别 0x60 端口的 KB/MS 数据字节（状态端口 bit 5 区分），汇编 3 字节 mouse packet（flags/dx/dy），用 `i8 as i16` 符号扩展。绝对坐标保存在静态 `MOUSE_POS`，以 `(0,0)` 初始、每次 poll 更新基于鼠标增量（dy 在屏幕坐标系为反向）。
@@ -433,24 +432,6 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - 当前实现：`QPushButton`、`QCheckBox`、`QRadioButton`、`QLineEdit`（含 Normal/Password echo）、`QSlider`、`QProgressBar`、`QListWidget`、`QLabel`、`VBox`（占位容器）、`Colour`、`Event`/`MouseButton`/`MouseState`。
   - 每个 widget 都是 host 可测的（`nova-graphic` 在 HOST_PACKAGES 中）。
 - **当前不足**：`nova-graphic` 仅提供原语；没有把它接到 `init` 的桌面启动序列——也就是说用户不会看到 QPushButton/QCheckBox 渲染出来的窗口。widget 的键盘处理没接入，只处理鼠标点击；窗口的标题/关闭按钮没有做。VNC 注入验证了鼠标指针在 Desktop 模式确实出现。
-
-
-### 13.4 Safe Terminal 输入与真实 VFS（2026-11-09）〔已修复〕**Medium**
-
-- **退格不擦除**：`drivers::screen::feed` 原对 0x08 一律静默丢弃 → 光标退回、单元格残留。修复：kernel console 现在对 `0x08` 执行「退一格 + 该单元格用背景色整体重绘」（等价终端的 `BS` = 退格 + 清格），Iosevka 的 cell 宽度由 `cell_advance()` 现算。shell 的 `\x08 \x08` 序列现在干净擦除。**实测**：敲 abcde、退格 3 次，屏幕只剩 `ab`，光标在正确位置。
-- **clear 后提示符在底部**：原 `clear` 打印 40 个换行，只滚屏不回顶。新增 syscall **`CONSOLE_CLEAR`（ABI 0.3，syscall 25）**：清整个 console frame 为背景色并把 pen 重置到第一个 cell（即真正的 `clear(1)`）。Shell 的 `clear` 命令改调 `nova_apps::syscall::console_clear()`。**实测**：`clear` 后 `root@novaos:/>` 出现在屏幕左上角。
-- **文件系统是假的（私有 RamFs，`cd /` 只看到 hello.txt/docs）**：shell 此前用**自己进程内的私有 RamFs**（boot seed 了 4 个假文件）。修复：shell 的文件操作全部走 **`fsclient` → 内核 file service（SERVICE_FILE）→ 内核 RamFs/挂载磁盘**：
-  - `ls`/`ls -l`/`cat`/`cd`/`pwd` 全部经 `fsclient::list_at/Records`、`stat`、`open/read`；
-  - `ls -l` 显示 `rwx` 串、owner/gid/size（stat 回复由 24B 扩到 40B，新增 owner/gid/mode 三元组；FILE_VERSION 1.2；协议布局 pin 更新）；
-  - 启动时内核往 RamFs 播种 **真实系统树**（`/etc/hostname`、`/system/version`、`/system/runtime/{cpu-count,memory,abi}`、`/EFI/NovaOS/{boot-mode,initramfs.list}`（启动时真实 initramfs 清单）、`/home/nova/notes.txt`）——内容全部来自 boot 时内核真实观测，无硬编码内容假文件；
-  - `/media/test`、`/media/ro` 是真实 virtio-blk 挂载（DiskFs，`/media/test/hello.txt` 内容可达）；
-  - **新增 FILE_OP_CHMOD(10) / FILE_OP_CHOWN(11)**：mode 9 位、owner/gid；服务端校验 scope WRITE，RamFs::chmod/chown 再按 owner-or-root / root-only 校验（shell 层再按会话 uid 预检：root 可改任何文件；zhang 只能改自己是 owner 的文件；chown 仅 root）。
-  - 真实效果：`cd /` 看到 `system/ devices/ proc/ tmp/ var/ home/ media/ dev/ etc/ EFI/`；`cat /system/version` → `NovaOS 0.1.0 (x86_64)`；`cat /EFI/NovaOS/initramfs.list` → 启动镜像真实清单（init/file-server/…/widgets-demo）；`cat /etc/hostname` → `novaos`。
-- **fsclient::read 永远失败（根因）**：`read()` 对 `out.len() > 48`（READ_CHUNK 协议上限）直接 `E_INVALID`，shell 传 1024B buffer 必挂——**文件服务的读路径从未真正被验证过**（M6 测试只走 write 路径和小文件）。修复：read 按 `READ_CHUNK` 裁剪，调用方循环读取。顺带修复 shell `cat` 的报错：现在打印真实 `error.name()`（`cat: E_INVALID` 风格）。
-- **init 授权**：shell（desktop 与 safe-terminal 两种模式）、terminal 现在拿到 `/` 的 `READ|WRITE` grant（此前 shell 只有自己的假 RamFs）。
-- **验收（QEMU, safe-terminal）**：`ls /`（真系统树）、`ls /system`、`ls -l /etc`（`-rw-r--r-- 0 0 7 hostname`）、`chmod 600 /etc/hostname` → `ls -l` 显示 `-rw-------`、`su zhang` → `chmod` → `operation not permitted`（zhang 不是 owner）、`ls -l /media/test`（`-rw-r--r-- 0 0 32 hello.txt`）、`cat /media/test/hello.txt` → `hello from the NovaOS test disk`、`whoami`/`id` 全部正确。
-- **Gates**：fmt、clippy `-D warnings`、host 70/251、`cargo xtask test --timeout 240`、裸机构建——全绿。
-
 ### 13.3 Safe Terminal / 桌面交互修复与 widgets-demo 验收（2026-11-09）〔已修复〕**Medium**
 
 - **桌面黑屏死锁（已 root-cause 修复）**：Qt/GUI 代码合入后桌面 boot 静默停在 `sched: cpu 0 idle, no runnable thread`，串口无任何错误。根因：initramfs 从 8 个 ELF 增至 9 个（新增 widgets-demo），而内核 `initramfs::Archive` 的 `MAX_FILES` 硬上限为 8 → `Archive::parse` 返回 `Err("initramfs-file-quota")`，而 `main.rs` 把该错误吞掉，init 根本未被启动 → 零可运行线程 → 永久 idle 黑屏。**修复**：`MAX_FILES` 提升至 16；`main.rs` 在 parse 失败时打印 `initramfs: parse failed: {reason}`（与 spawn 失败同级的 ERROR，不再静默）。
@@ -472,3 +453,32 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 ---
 
 ---
+### 13.4 Safe Terminal 输入与真实 VFS（2026-11-09）〔已修复〕**Medium**
+
+- **退格不擦除**：`drivers::screen::feed` 原对 0x08 一律静默丢弃 → 光标退回、单元格残留。修复：kernel console 现在对 `0x08` 执行「退一格 + 该单元格用背景色整体重绘」（等价终端的 `BS` = 退格 + 清格），Iosevka 的 cell 宽度由 `cell_advance()` 现算。shell 的 `\x08 \x08` 序列现在干净擦除。**实测**：敲 abcde、退格 3 次，屏幕只剩 `ab`，光标在正确位置。
+- **clear 后提示符在底部**：原 `clear` 打印 40 个换行，只滚屏不回顶。新增 syscall **`CONSOLE_CLEAR`（ABI 0.3，syscall 25）**：清整个 console frame 为背景色并把 pen 重置到第一个 cell（即真正的 `clear(1)`）。Shell 的 `clear` 命令改调 `nova_apps::syscall::console_clear()`。**实测**：`clear` 后 `root@novaos:/>` 出现在屏幕左上角。
+- **文件系统是假的（私有 RamFs，`cd /` 只看到 hello.txt/docs）**：shell 此前用**自己进程内的私有 RamFs**（boot seed 了 4 个假文件）。修复：shell 的文件操作全部走 **`fsclient` → 内核 file service（SERVICE_FILE）→ 内核 RamFs/挂载磁盘**：
+  - `ls`/`ls -l`/`cat`/`cd`/`pwd` 全部经 `fsclient::list_at/Records`、`stat`、`open/read`；
+  - `ls -l` 显示 `rwx` 串、owner/gid/size（stat 回复由 24B 扩到 40B，新增 owner/gid/mode 三元组；FILE_VERSION 1.2；协议布局 pin 更新）；
+  - 启动时内核往 RamFs 播种 **真实系统树**（`/etc/hostname`、`/system/version`、`/system/runtime/{cpu-count,memory,abi}`、`/EFI/NovaOS/{boot-mode,initramfs.list}`（启动时真实 initramfs 清单）、`/home/nova/notes.txt`）——内容全部来自 boot 时内核真实观测，无硬编码内容假文件；
+  - `/media/test`、`/media/ro` 是真实 virtio-blk 挂载（DiskFs，`/media/test/hello.txt` 内容可达）；
+  - **新增 FILE_OP_CHMOD(10) / FILE_OP_CHOWN(11)**：mode 9 位、owner/gid；服务端校验 scope WRITE，RamFs::chmod/chown 再按 owner-or-root / root-only 校验（shell 层再按会话 uid 预检：root 可改任何文件；zhang 只能改自己是 owner 的文件；chown 仅 root）。
+  - 真实效果：`cd /` 看到 `system/ devices/ proc/ tmp/ var/ home/ media/ dev/ etc/ EFI/`；`cat /system/version` → `NovaOS 0.1.0 (x86_64)`；`cat /EFI/NovaOS/initramfs.list` → 启动镜像真实清单（init/file-server/…/widgets-demo）；`cat /etc/hostname` → `novaos`。
+- **fsclient::read 永远失败（根因）**：`read()` 对 `out.len() > 48`（READ_CHUNK 协议上限）直接 `E_INVALID`，shell 传 1024B buffer 必挂——**文件服务的读路径从未真正被验证过**（M6 测试只走 write 路径和小文件）。修复：read 按 `READ_CHUNK` 裁剪，调用方循环读取。顺带修复 shell `cat` 的报错：现在打印真实 `error.name()`（`cat: E_INVALID` 风格）。
+- **init 授权**：shell（desktop 与 safe-terminal 两种模式）、terminal 现在拿到 `/` 的 `READ|WRITE` grant（此前 shell 只有自己的假 RamFs）。
+- **验收（QEMU, safe-terminal）**：`ls /`（真系统树）、`ls /system`、`ls -l /etc`（`-rw-r--r-- 0 0 7 hostname`）、`chmod 600 /etc/hostname` → `ls -l` 显示 `-rw-------`、`su zhang` → `chmod` → `operation not permitted`（zhang 不是 owner）、`ls -l /media/test`（`-rw-r--r-- 0 0 32 hello.txt`）、`cat /media/test/hello.txt` → `hello from the NovaOS test disk`、`whoami`/`id` 全部正确。
+- **Gates**：fmt、clippy `-D warnings`、host 70/251、`cargo xtask test --timeout 240`、裸机构建——全绿。
+### 13.5 nova-desktop-server + 差分合成（消除鼠标闪烁）（2026-11-09）〔已修复〕**Medium**
+
+- **鼠标移动整屏闪烁**：上一轮的临时修复（鼠标包 → `pointer_moved → full repaint`）让每次 pass 全屏重绘，视觉上持续 flicker。根因：compositor 的 `present()` 只在有 damage 时工作，鼠标箭头没有 damage 通道，于是每帧整屏重画。
+- **修复（Wayland 式 damage 模型）**：新增 crate **`nova-desktop-server`**（no_std，host 可测，20 个单元测试）——`DamageAccumulator` 按 surface 累积 damage 并合并重叠/相邻矩形、折叠超限矩形为边界盒、output 裁剪；`DesktopServer` 作为 policy 参考实现（z-order、hit_test、seat、click→focus+raise、frame 决策 `Frame::Nothing | Regions | Full`），`Seat` 做指针/键盘焦点路由；`protocol` 模块定义 Wayland 风格的 wire 消息（CreateSurface/Attach/Damage/Commit/Place/Raise/DestroySurface + FrameDone/Pointer*/KeyEvent 事件，opcode 稳定、布局 pin 测试）。
+- **内核 compositor 改用差分路径**：`present()` 现在计算本帧 paint plan——任何 surface `full` damage → 全屏重绘（保留 attach/move/resize 的正确语义）；否则 **区域重绘**：把所有 damaged 输出区域 + 旧箭头 cell + 新箭头 cell 合成为一个 tight 区域 → `fill_rect` 背景 → z 序按区域裁剪 blit 各 surface（新增 `display::blit_window` 支持源偏移的 sub-rect 拷贝）→ 最后画箭头。指针移动**零整屏重绘**。
+- **验收**：1024×768 QEMU 下鼠标做 8 步小幅扫动并前后截图，差异区域恰为 `(512,384)-(551,444)`——仅箭头的新旧位置，窗口内容像素级不变；`widgets-demo` 窗口不再闪烁、文件管理器列表完整可读。
+- **额外修复**：`blit_window` 长度校验（`stride*(sy+h)`，曾多出一行导致底边相交时 `E_INVALID` 让多个 app 报 `present failed E_INVALID`——已消除，串口干净）。
+### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
+
+- **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。
+- **app `desktop-shell`**：全屏 1024×768 背景窗口（compositor `SURFACE_OP_MOVE` 请求 (0,0) 放置），启动时位于 z 序最底层；点击图标或面板芯片 → exec 对应应用（在桌面上拉起新窗口）。
+- **layout**：`USER_HEAP_SIZE` 1 MiB→4 MiB（桌面全屏 buffer 3 MiB 之需，ABI 常量，文档同步 `0x4040_0000`）；内核 `INITRAMFS_CAPACITY` 6→8 MiB（desktop-shell 使镜像到 6.4 MB）。
+- **验收（QEMU VNC/QMP）**：桌面以 desktop-shell 为最底层启动；壁纸+星空+图标+面板全部渲染；点击 "Widgets" 图标 → `desktop-shell: launch widgets-demo` → 新 widgets-demo 窗口出现在图标列旁；点击面板 "Terminal" 芯片 → 新终端窗口出现（`NovaOS terminal (Sarasa Gothic)`，`NovaOS terminal (Sarasa Gothic)` + 输入行可用）；`-smp 1`/512MB 下 desktop-shell 正常启动（file-manager 窗口在该最小配置报 `E_NO_MEMORY`，`-smp 4`/2048MB 无此问题；属于小内存配置的容量限制，非本次回归）。
+- **Gates**：fmt、clippy `-D warnings`（workspace 含两新 crate）、host 70/251、`cargo xtask test --timeout 240`、裸机构建——全绿。

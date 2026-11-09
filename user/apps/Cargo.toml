@@ -70,6 +70,12 @@ path = "src/bin/widgets-demo.rs"
 test = false
 bench = false
 
+[[bin]]
+name = "desktop-shell"
+path = "src/bin/desktop-shell.rs"
+test = false
+bench = false
+
 [dependencies]
 nova-abi = { workspace = true }
 nova-ipc = { workspace = true }
@@ -78,6 +84,7 @@ nova-fs = { workspace = true }
 nova-ui = { workspace = true }
 nova-user = { workspace = true }
 nova-graphic = { workspace = true }
+nova-desktop = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

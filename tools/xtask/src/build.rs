@@ -42,7 +42,7 @@ pub const DEFAULT_PROFILE: &str = "release";
 /// created, because a package named in this list and missing from the workspace
 /// fails with a clear Cargo error rather than being silently skipped — which is
 /// the failure mode that lets a crate rot unnoticed.
-pub const HOST_PACKAGES: &[&str] = &["nova-abi", "nova-user", "nova-graphic"];
+pub const HOST_PACKAGES: &[&str] = &["nova-abi", "nova-user", "nova-graphic", "nova-desktop"];
 
 /// Build the kernel for the bare-metal target with `profile`.
 ///

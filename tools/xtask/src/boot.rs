@@ -60,6 +60,7 @@ pub const APP_NAMES: &[&str] = &[
     "editor",
     "file-manager",
     "widgets-demo",
+    "desktop-shell",
 ];
 
 /// Build a bounded `NOVAFS1` archive from named ELF files.

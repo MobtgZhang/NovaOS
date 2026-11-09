@@ -35,6 +35,7 @@ name = "nova-apps"
 version = "0.1.0"
 dependencies = [
  "nova-abi",
+ "nova-desktop",
  "nova-fs",
  "nova-graphic",
  "nova-ipc",
@@ -70,6 +71,17 @@ version = "0.1.0"
 dependencies = [
  "nova-abi",
 ]
+
+[[package]]
+name = "nova-desktop"
+version = "0.1.0"
+dependencies = [
+ "nova-ui",
+]
+
+[[package]]
+name = "nova-desktop-server"
+version = "0.1.0"
 
 [[package]]
 name = "nova-elf"
@@ -108,6 +120,7 @@ dependencies = [
  "nova-boot",
  "nova-cap",
  "nova-core",
+ "nova-desktop-server",
  "nova-elf",
  "nova-fs",
  "nova-ipc",

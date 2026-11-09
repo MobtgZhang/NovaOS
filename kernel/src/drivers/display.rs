@@ -525,6 +525,73 @@ pub fn blit(
     Ok(())
 }
 
+/// Copy a sub-rectangle out of `source` into the display at `(x, y)`.
+///
+/// `blit` copies the whole buffer; this copies the `source_width` x
+/// `source_height` window rooted at `source_x`, `source_y` — everything a
+/// partially-repainted surface needs to put only the intersection on screen.
+pub fn blit_window(
+    source: &[u8],
+    source_stride: u32,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    x: u64,
+    y: u64,
+) -> Result<(), DisplayError> {
+    let row_bytes = u64::from(source_width)
+        .checked_mul(4)
+        .ok_or(DisplayError::InvalidBuffer)?;
+    if u64::from(source_stride) < row_bytes {
+        return Err(DisplayError::InvalidBuffer);
+    }
+    let required = u64::from(source_stride)
+        .checked_mul(u64::from(source_y + source_height))
+        .ok_or(DisplayError::InvalidBuffer)?;
+    if required > source.len() as u64 {
+        return Err(DisplayError::InvalidBuffer);
+    }
+    let Some(mode) = mode() else {
+        return Err(DisplayError::NoDisplay);
+    };
+    let right = x.saturating_add(u64::from(source_width)).min(mode.right());
+    let bottom = y
+        .saturating_add(u64::from(source_height))
+        .min(mode.bottom());
+    let x_clip = (right - x).min(u64::from(source_width)) as u32;
+    let y_clip = (bottom - y).min(u64::from(source_height)) as u32;
+    if x_clip == 0 || y_clip == 0 {
+        return Ok(());
+    }
+    for row in 0..y_clip {
+        let source_index = (u64::from(source_y + row))
+            .checked_mul(u64::from(source_stride))
+            .unwrap()
+            + u64::from(source_x) * 4;
+        let mut column = 0u32;
+        while column < x_clip {
+            let offset = usize::try_from(source_index + u64::from(column) * 4)
+                .map_err(|_| DisplayError::InvalidBuffer)?;
+            let word = u32::from_le_bytes([
+                source[offset],
+                source[offset + 1],
+                source[offset + 2],
+                source[offset + 3],
+            ]);
+            let red = ((word >> SOURCE_RED_SHIFT) & 0xff) as u8;
+            let green = ((word >> SOURCE_GREEN_SHIFT) & 0xff) as u8;
+            let blue = ((word >> SOURCE_BLUE_SHIFT) & 0xff) as u8;
+            let destination = compose(mode, red, green, blue);
+            // SAFETY: the clipped bounds are inside the display, and `init`
+            // mapped the visible framebuffer writable.
+            unsafe { write_pixel(mode, x + u64::from(column), y + u64::from(row), destination) }
+            column += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Read one framebuffer pixel, for tests and diagnostics.
 pub fn get_pixel(x: u32, y: u32) -> Result<u32, DisplayError> {
     let Some(mode) = mode() else {

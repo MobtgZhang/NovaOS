@@ -232,7 +232,7 @@ Concretely, on a 48-bit address space the corrected window is
 | --- | --- | --- |
 | `USER_IMAGE_BASE` | `0x0000_0000_0000_1000` | yes |
 | `USER_HEAP_BASE` | `0x0000_0000_4000_0000` | yes |
-| `USER_HEAP_BASE + USER_HEAP_SIZE` | `0x0000_0000_4010_0000` | yes |
+| `USER_HEAP_BASE + USER_HEAP_SIZE` | `0x0000_0000_4040_0000` | yes |
 | `USER_GUARD_BASE` | `0x0000_0000_7FFE_F000` | yes |
 | `USER_STACK_BASE` | `0x0000_0000_7FEF_F000` | yes |
 | `USER_STACK_TOP` | `0x0000_0000_7FFF_F000` | yes |
@@ -259,7 +259,7 @@ the tests agree on which page it is.
 
 ### User heap — **ABI constant, shared with `user/linker.ld`**
 
-`nova_abi::layout::USER_HEAP_BASE` reserves a 1 MiB heap region at
+`nova_abi::layout::USER_HEAP_BASE` reserves a 4 MiB heap region at
 `0x0000_0000_4000_0000`. The kernel does not map it eagerly; it is the region
 a user program's allocator draws from once the mapping call exists.
 Reserving it here keeps two processes' heaps from overlapping.

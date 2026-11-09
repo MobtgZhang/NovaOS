@@ -67,6 +67,7 @@ nova-ipc = { workspace = true }
 nova-fs = { workspace = true }
 nova-net = { workspace = true }
 nova-protocols = { workspace = true }
+nova-desktop-server = { workspace = true }
 
 [lints.rust]
 # An `unsafe` operation inside an `unsafe fn` must be inside its own `unsafe`

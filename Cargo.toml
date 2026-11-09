@@ -20,6 +20,9 @@ members = [
     "crates/nova-type",
     "crates/nova-ui",
     "crates/nova-graphic",
+    "crates/nova-desktop-server",
+    "crates/nova-desktop",
+    "crates/nova-desktop-server",
     "tools/xtask",
     "user/nova-rt",
     "user/apps",
@@ -77,6 +80,8 @@ nova-protocols = { path = "crates/nova-protocols" }
 nova-type = { path = "crates/nova-type" }
 nova-ui = { path = "crates/nova-ui" }
 nova-graphic = { path = "crates/nova-graphic" }
+nova-desktop-server = { path = "crates/nova-desktop-server" }
+nova-desktop = { path = "crates/nova-desktop" }
 nova-user = { path = "crates/nova-user" }
 
 # Bare-metal kernel profile.
