@@ -364,6 +364,35 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 ---
 
+
+---
+
+## 13. 用户系统 / Safe Terminal / 桌面 — 当前状态（2026-11-09）
+
+### 13.1 Safe Terminal（boot mode 2）〔部分修复（2026-11-09）〕**Medium**
+
+- **现状**：从 Desktop 菜单或 ESP marker（`desktop` / `safe` / `test`）选择 Safe Terminal 时，内核先把屏幕清成黑底，静默所有 kernel log（dispatch `drivers::screen::set_quiet(true)`），仅用户态输出走屏幕——显示的就是 NovaOS ASCII logo + `novaos login:` 提示符。ASCII 以矢量字体在 Iosevka 中 antialias 写黑屏上，**像素字体已完全移除**（§5.6）。
+- **登录/账户**：shell 启动后要求输入用户名与密码（不回显）。当前签名了两个账户：
+  - `root` / 密码 `root`（uid 0、gid 0）
+  - `zhang` / 密码 `zhang`（uid 1000、gid 1000）
+  密码使用 FNV-1a/64 哈希校验（不是加密强度哈希，但对 VNC 会话的威胁模型够用）。`crates/nova-user` 是新 crate，host 可测。
+- **文件系统权限**：`nova-fs` 的每个 inode 增加了 `owner`/`group`/`mode`（9 位 `rwx`），owner 位默认 `0`，dir 0o755、file 0o644；`stat` 输出 `rwx` 串；`ls -l` 显示 owner/group/size + 权限字串。`chmod`/`chown` 命令通过 shell 路由：`chmod` 要 root 或文件 owner，`chown` 要 root。
+- **交互**：cwd 追踪到 `user@novaos<x>` 格式，`cd`、`pwd`、`ls`、`ls -l`、`cat`、`echo`、`ps`、`whoami`、`id`、`su` 全部实现并实测通过。
+- **Safe Terminal 实测（QEMU + vncdotool 注入键盘事件）**：以 `root` 身份登录、运行 `cd /docs`、`pwd`、`cat readme.txt`、`cd ..`、`pwd`、`chmod 600 /hello.txt`、`chown 1000 /docs/readme.txt`、`ls -l /`、`ls -l /docs`、`su zhang`、切回密码 `zhang` 登录并执行命令，全部正常工作（密码不回显、权限检查正确、`id`、`whoami` 依次输出 root@uid=0 zhang@uid=1000）。
+- **当前不足**：PS/2 键盘映射登记在 `kernel/src/drivers/input.rs`（framebuffer ASCII 渲染路径缺失），目前只在 kernel console 中为 `read()` 写入缓冲；Safe Terminal 的输入走键盘映射到 stdin ring `kernel/src/stdin.rs`，支持 US 键盘布局（shift 跟踪）、退格、回车、Tab。中文输入未做。
+
+### 13.2 桌面、鼠标指针、nova-graphic（2026-11-09）〔进度中〕
+
+- **PS/2 鼠标**：`drivers/input.rs` 同时识别 0x60 端口的 KB/MS 数据字节（状态端口 bit 5 区分），汇编 3 字节 mouse packet（flags/dx/dy），用 `i8 as i16` 符号扩展。绝对坐标保存在静态 `MOUSE_POS`，以 `(0,0)` 初始、每次 poll 更新基于鼠标增量（dy 在屏幕坐标系为反向）。
+- **鼠标指针**：`services/compositor.rs::present()` 末端画一个简单箭头（黑色 + 白色填充）。每帧呈现后光标出现在桌面上。
+- **nova-graphic crate**（`crates/nova-graphic`）：以 Qt6 为参照的 widget 库：
+  - `Widget` trait：`rect()` / `set_rect()` / `draw(&Canvas)` / `on_event(&Event) -> bool`；rect 是公共 `Rect{x,y,w,h}`，所有 widget 是 value、可复制、不需要 alloc；
+  - 当前实现：`QPushButton`、`QCheckBox`、`QRadioButton`、`QLineEdit`（含 Normal/Password echo）、`QSlider`、`QProgressBar`、`QListWidget`、`QLabel`、`VBox`（占位容器）、`Colour`、`Event`/`MouseButton`/`MouseState`。
+  - 每个 widget 都是 host 可测的（`nova-graphic` 在 HOST_PACKAGES 中）。
+- **当前不足**：`nova-graphic` 仅提供原语；没有把它接到 `init` 的桌面启动序列——也就是说用户不会看到 QPushButton/QCheckBox 渲染出来的窗口。widget 的键盘处理没接入，只处理鼠标点击；窗口的标题/关闭按钮没有做。VNC 注入验证了鼠标指针在 Desktop 模式确实出现。
+
+---
+
 ## 10. "运行于现代硬件"差距清单（按优先级）
 
 **P0 —— 不做就在真机第一分钟内失败**
