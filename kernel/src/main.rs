@@ -49,6 +49,7 @@ mod logger;
 mod mm;
 mod sched;
 mod services;
+mod stdin;
 mod sync;
 mod syscall;
 mod task;
@@ -363,6 +364,22 @@ pub unsafe fn boot_after_stack_switch() -> ! {
             test::harness::run_all();
         }
         _ => {
+            // A safe-terminal boot abandons kernel log output on the display:
+            // the person who selected Safe Terminal wants the ASCII logo and
+            // the login prompt, not the boot-time INFO lines. The display is
+            // cleared first so the quiet handover looks like a black screen,
+            // and the quiet flag stays set until the user exits to a desktop.
+            if matches!(
+                boot_info.boot_mode(),
+                Some(nova_boot::BootMode::SafeTerminal)
+            ) {
+                // SAFETY: the display is initialised (main's `display::init`),
+                // so clearing the framebuffer is one fill_rect away from the
+                // black background the safe terminal wants.
+                unsafe { crate::drivers::screen::clear_for_userland() };
+                crate::drivers::screen::set_quiet(true);
+            }
+
             // The boot thread was never a scheduler thread — the bootstrap
             // processor's `current_slot` is still `None` — so there is no
             // context to save and no thread to exit: the scheduler simply

@@ -39,6 +39,7 @@ dependencies = [
  "nova-ipc",
  "nova-protocols",
  "nova-ui",
+ "nova-user",
 ]
 
 [[package]]
@@ -136,6 +137,10 @@ dependencies = [
  "nova-protocols",
  "nova-type",
 ]
+
+[[package]]
+name = "nova-user"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

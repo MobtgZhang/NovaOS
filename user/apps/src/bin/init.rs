@@ -35,7 +35,6 @@ const SAFE_TERMINAL_SERVICES: &[Service] = &[
     ("file-server", None),
     ("console-server", None),
     ("shell", None),
-    ("terminal", None),
 ];
 
 /// Select the services the boot mode asks for.
@@ -53,27 +52,38 @@ fn start(name: &str, scope: Option<(&str, Rights)>) -> Option<u64> {
     }
 }
 
+/// Whether this boot mode is the quiet one. The safe terminal stays silent;
+/// desktop stays verbose so the screen shows the boot list as each service
+/// reports in.
+fn is_quiet() -> bool {
+    matches!(syscall::boot_mode(), Ok(2))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i64 {
-    let mode = syscall::boot_mode().unwrap_or(0);
-    let mode_name = match mode {
-        1 => "desktop",
-        2 => "safe-terminal",
-        _ => "unknown",
-    };
-    let _ = console::write_str("[NOVA] init ready (");
-    let _ = console::write_str(mode_name);
-    let _ = console::write_str(")\r\n");
+    let quiet = is_quiet();
+
+    if !quiet {
+        let mode_name = match syscall::boot_mode().unwrap_or(0) {
+            1 => "desktop",
+            2 => "safe-terminal",
+            _ => "unknown",
+        };
+        let _ = console::write_str("[NOVA] init ready (");
+        let _ = console::write_str(mode_name);
+        let _ = console::write_str(")\r\n");
+    }
 
     for (name, scope) in services() {
         if start(name, *scope).is_none() {
+            // A spawn failure is always a bug worth being loud about — even
+            // in safe-terminal mode, where the user otherwise sees nothing.
             let _ = console::write_str("[NOVA] init failed to start service\r\n");
             return -1;
         }
-        // One line per service, on the console and therefore on the screen:
-        // the boot sequence a person watches is exactly this list, in this
-        // order, so a service that hangs is visible by its missing line.
-        let _ = console::write_fmt(format_args!("[NOVA] init: started {}\r\n", name));
+        if !quiet {
+            let _ = console::write_fmt(format_args!("[NOVA] init: started {}\r\n", name));
+        }
         yield_now();
     }
 

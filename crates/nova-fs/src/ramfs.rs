@@ -191,6 +191,12 @@ pub struct Metadata {
     pub kind: FileKind,
     /// The size of the file's contents, in bytes. Zero for a directory.
     pub size: u32,
+    /// The uid that owns the file. Zero is `root`.
+    pub owner: u32,
+    /// The gid that owns the file.
+    pub group: u32,
+    /// The permission bits: `rwxrwxrwx`, layout bit-for-bit the POSIX one.
+    pub mode: u16,
 }
 
 /// One entry of a directory listing.
@@ -229,6 +235,9 @@ struct Inode {
     data_len: u32,
     children: [u16; MAX_CHILDREN],
     child_count: u8,
+    owner: u32,
+    group: u32,
+    mode: u16,
     in_use: bool,
 }
 
@@ -288,6 +297,9 @@ impl RamFs {
             data_len: 0,
             children: [0; MAX_CHILDREN],
             child_count: 0,
+            owner: 0,
+            group: 0,
+            mode: 0o755,
             in_use: true,
         };
         fs.inode_count = 1;
@@ -316,6 +328,9 @@ impl RamFs {
             data_len: 0,
             children: [0; MAX_CHILDREN],
             child_count: 0,
+            owner: 0,
+            group: 0,
+            mode: 0o755,
             in_use: true,
         };
         self.inode_count = 1;
@@ -423,6 +438,10 @@ impl RamFs {
         let slot = self.inode_count;
         let mut inode = blank_inode();
         inode.kind = kind;
+        inode.mode = match kind {
+            FileKind::Directory => 0o755,
+            FileKind::File => 0o644,
+        };
         inode.name_len = name.len() as u8;
         inode.name[..name.len()].copy_from_slice(name);
         inode.parent = parent_index as u16;
@@ -627,7 +646,44 @@ impl RamFs {
         Ok(Metadata {
             kind: self.inodes[inode].kind,
             size: self.inodes[inode].data_len,
+            owner: self.inodes[inode].owner,
+            group: self.inodes[inode].group,
+            mode: self.inodes[inode].mode,
         })
+    }
+
+    /// Change the mode bits on `path`.
+    ///
+    /// The caller must be `root` or the file's current owner: nobody else's
+    /// mode may be edited.
+    pub fn chmod(&mut self, path: &[u8], mode: u16, caller: u32) -> Result<(), FsError> {
+        let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
+        let inode = self.resolve(&canonical)?;
+        if caller != 0 && caller != self.inodes[inode].owner {
+            return Err(FsError::Denied);
+        }
+        self.inodes[inode].mode = mode & 0o777;
+        Ok(())
+    }
+
+    /// Change the owner and group on `path`.
+    ///
+    /// Only `root` may transfer a file to a different uid or gid.
+    pub fn chown(
+        &mut self,
+        path: &[u8],
+        owner: u32,
+        group: u32,
+        caller: u32,
+    ) -> Result<(), FsError> {
+        if caller != 0 {
+            return Err(FsError::Denied);
+        }
+        let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
+        let inode = self.resolve(&canonical)?;
+        self.inodes[inode].owner = owner;
+        self.inodes[inode].group = group;
+        Ok(())
     }
 
     /// List a directory into `out`, returning the number of entries written.
@@ -683,6 +739,9 @@ const fn blank_inode() -> Inode {
         data_len: 0,
         children: [0; MAX_CHILDREN],
         child_count: 0,
+        owner: 0,
+        group: 0,
+        mode: 0o644,
         in_use: false,
     }
 }

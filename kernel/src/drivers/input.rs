@@ -31,7 +31,11 @@
 use crate::arch::x86_64::port_io::{inb, outb};
 use crate::klog;
 use crate::logger::Level;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use nova_protocols::input::KeyState;
+
+use crate::stdin;
 
 /// The PS/2 data port.
 const DATA_PORT: u16 = 0x60;
@@ -132,6 +136,10 @@ pub unsafe fn init() {
     }
 }
 
+/// The two shift keys. Tracked here because they are the only modifiers
+/// that ever flip the decode of a printable key. Caps lock is not modelled.
+static SHIFT_HELD: AtomicBool = AtomicBool::new(false);
+
 /// Poll the PS/2 keyboard and route any scancode to the focused surface.
 ///
 /// # Safety
@@ -150,15 +158,37 @@ pub unsafe fn poll() -> usize {
             break;
         };
 
-        // Set 1 scancodes use bit 7 for release. The low seven bits are the
-        // scancode the protocol's `Input.key` carries.
-        let state = if byte & 0x80 != 0 {
-            KeyState::Released
-        } else {
+        // Decode the byte and feed stdin: the emergency console has no
+        // window to route to, so bytes land in the kernel's stdin ring and
+        // every user-space `read(0)` picks them up. The compositor gets a
+        // copy through the usual route so the GUI keeps working as before.
+        let scancode_u8 = stdin::scancode_of(byte);
+        let state = if stdin::is_press(byte) {
             KeyState::Pressed
+        } else {
+            KeyState::Released
         };
-        let scancode = (byte & 0x7f) as u16;
 
+        // Shift tracking is local to the scancode stream, not shared with
+        // the service layer; an extra copy keeps the two independent.
+        match scancode_u8 {
+            stdin::LSHIFT | stdin::RSHIFT => {
+                SHIFT_HELD.store(state == KeyState::Pressed, Ordering::Relaxed);
+            }
+            _ => {
+                if state == KeyState::Pressed {
+                    let ascii =
+                        stdin::decode_press(scancode_u8, SHIFT_HELD.load(Ordering::Relaxed));
+                    if ascii != 0 {
+                        // SAFETY: interrupts are masked, as this function's
+                        // contract requires.
+                        unsafe { stdin::write_byte(ascii) };
+                    }
+                }
+            }
+        }
+
+        let scancode = scancode_u8 as u16;
         if parts
             .input
             .route_key(scancode, state, parts.compositor)

@@ -16,6 +16,7 @@ members = [
     "crates/nova-ipc",
     "crates/nova-net",
     "crates/nova-protocols",
+    "crates/nova-user",
     "crates/nova-type",
     "crates/nova-ui",
     "tools/xtask",
@@ -50,6 +51,7 @@ default-members = [
     "crates/nova-ipc",
     "crates/nova-net",
     "crates/nova-protocols",
+    "crates/nova-user",
     "crates/nova-type",
     "crates/nova-ui",
     "tools/xtask",
@@ -73,6 +75,7 @@ nova-net = { path = "crates/nova-net" }
 nova-protocols = { path = "crates/nova-protocols" }
 nova-type = { path = "crates/nova-type" }
 nova-ui = { path = "crates/nova-ui" }
+nova-user = { path = "crates/nova-user" }
 
 # Bare-metal kernel profile.
 #

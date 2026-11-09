@@ -903,7 +903,7 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
             // The same bytes go to the screen: a user program's output is
             // visible on the display the boot manager left behind, not just
             // over the serial port a test harness reads.
-            crate::drivers::screen::push_bytes(bytes);
+            crate::drivers::screen::push_bytes_always(bytes);
         }
 
         copied += chunk;
@@ -962,7 +962,14 @@ fn read_from_console(args: [u64; 6]) -> Outcome {
     let mut copied: u64 = 0;
 
     while copied < length {
-        let Some(byte) = console.try_recv() else {
+        // Prefer bytes the kernel's stdin ring produced (keyboard scancodes,
+        // decoded at the 8042 poll); fall back to the UART for the runtimes
+        // that drive the machine with a serial console.
+        //
+        // SAFETY: interrupts are masked on this path, matching the 8042
+        // poller's contract.
+        let byte = unsafe { crate::stdin::read_byte() }.or_else(|| console.try_recv());
+        let Some(byte) = byte else {
             break; // No more input pending.
         };
 

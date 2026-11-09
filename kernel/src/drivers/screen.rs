@@ -31,6 +31,8 @@
 //! interleave at a line boundary, which the logger's line-buffered output
 //! already ensures.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::drivers::display;
 use crate::klog;
 use crate::logger::Level;
@@ -318,12 +320,54 @@ fn parse_error_code(error: FontError) -> i64 {
 /// The one console. Constructed empty; the font parses on first use.
 static CONSOLE: SpinLock<ScreenConsole> = SpinLock::new(ScreenConsole::new());
 
+/// Clear the display to the safe-terminal black background and reset the
+/// cursor back to the top-left cell.
+///
+/// # Safety
+///
+/// The display must be initialised ([`crate::drivers::display::init`] must
+/// have run) — every `display::fn` the clear internally uses panics or
+/// errors otherwise; this function swallows those errors, so a missing
+/// display simply leaves the screen untouched.
+pub fn clear_for_userland() {
+    let mut console = CONSOLE.lock();
+    console.reset();
+}
+
+/// Whether the quiet flag is set for the on-screen console.
+///
+/// When quiet, kernel log output does not reach the display. User-space
+/// output is routed through [`push_bytes_always`] and keeps working — which
+/// is what lets the safe-terminal show only the ASCII logo and the login
+/// prompt on a black screen, uncluttered by kernel INFO lines.
+static SCREEN_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Set or clear the quiet flag.
+pub fn set_quiet(quiet: bool) {
+    SCREEN_QUIET.store(quiet, Ordering::Relaxed);
+}
+
 /// Send bytes to the on-screen console.
 ///
 /// Lines logged before the display is mapped are buffered and replayed by
 /// [`on_display_ready`]; lines after that are drawn immediately. Errors are
 /// swallowed by design — a console must never turn a log line into a fault.
+///
+/// When the quiet flag is set the line is dropped on the floor rather than
+/// drawn. Everything after `set_quiet(true)` is kernel log output, and a
+/// safe-terminal session must show only the user's own output.
 pub fn push_bytes(bytes: &[u8]) {
+    if SCREEN_QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    push_bytes_always(bytes);
+}
+
+/// Send bytes to the on-screen console regardless of the quiet flag.
+///
+/// Used by the `WRITE` syscall path so user programs' bytes reach the
+/// screen even after `set_quiet(true)` has silenced kernel logs.
+pub fn push_bytes_always(bytes: &[u8]) {
     let mut console = CONSOLE.lock();
     if display::mode().is_none() {
         console.buffer_pending(bytes);
