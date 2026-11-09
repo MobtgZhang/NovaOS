@@ -536,18 +536,11 @@ static DISPATCH_CURSOR: AtomicUsize = AtomicUsize::new(0);
 /// tables by construction. The bootstrap processor is always online (this
 /// code is running on it).
 pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
-    // Scan each slot at most once: `MAX_CPUS` probes cover every CPU. The
-    // fallback names the bootstrap processor explicitly, so a boot snapshot
-    // with no online APs (the single-processor configuration) still creates
-    // the thread rather than dropping it.
-    let start = DISPATCH_CURSOR.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
-    for step in 0..MAX_CPUS {
-        let cpu = (start + step) % MAX_CPUS;
-        let online = cpu == 0 || crate::boot::smp::is_online(cpu);
-        if online && let Some(thread) = create_thread_for_cpu(cpu, id, process, space, entry) {
-            return Some(thread);
-        }
-    }
+    // Temporary SMP hardening: pin every user thread to the bootstrap
+    // processor. Application processors run only their idle threads until the
+    // cross-CPU page-table and scheduler bring-up is fully hardened. This
+    // keeps the system bootable under -smp N while the multi-CPU user path is
+    // being hardened.
     create_thread_for_cpu(0, id, process, space, entry)
 }
 

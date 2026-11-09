@@ -521,28 +521,6 @@ pub fn write_leaf(root: &PageTable, virt: u64, entry: u64) -> Result<(), VmmErro
     Ok(())
 }
 
-/// The raw leaf PTE for `virt`, without allocating tables.
-///
-/// Temporary diagnosis helper: returns the leaf entry's exact value, or `0`
-/// when the walk reaches a not-present intermediate entry.
-pub fn raw_leaf_entry(root: &PageTable, virt: u64) -> u64 {
-    let mut table = *root;
-
-    for level in [WalkLevel::Pml4, WalkLevel::Pdpt, WalkLevel::Pd] {
-        let index = level.index_of(virt);
-        let entry = table.read(index);
-        if !entry_is_present(entry) || entry_flags(entry).contains(PageFlags::HUGE) {
-            return entry;
-        }
-        match table.target(index) {
-            Some(phys) => table = PageTable::at(phys),
-            None => return 0,
-        }
-    }
-
-    table.read(WalkLevel::Pt.index_of(virt))
-}
-
 /// The physical frame mapped at `virt`, if any.
 ///
 /// Huge leaves are handled: a 2 MiB or 1 GiB leaf contributes the offset
