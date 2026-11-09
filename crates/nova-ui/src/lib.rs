@@ -50,6 +50,9 @@ pub mod font;
 /// PS/2 set-1 scancodes decoded into characters and editing keys.
 pub mod keyboard;
 
+/// The vector typeface a process may select over the bitmap fallback.
+pub mod typeface;
+
 use font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 
 /// The XRGB8888 word for a colour.
@@ -291,13 +294,66 @@ impl Canvas {
         }
     }
 
+    /// Read back one pixel, or `None` outside the surface.
+    ///
+    /// The vector text path blends against whatever is already on the
+    /// pixel, which needs the read as well as the write.
+    fn get(&self, x: i32, y: i32) -> Option<u32> {
+        if x < 0 || y < 0 {
+            return None;
+        }
+        let (x, y) = (x as usize, y as usize);
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        // SAFETY: `x < width` and `y < height`, so the index is inside the
+        // buffer the constructor was given.
+        Some(unsafe { *self.pixels.add(y * self.stride + x) })
+    }
+
+    /// The width one character advances the pen, with the active vector
+    /// face or the bitmap cell.
+    pub fn char_advance(&self, ch: char) -> u32 {
+        typeface::with_face(|face| face.char_advance(ch)).unwrap_or(GLYPH_WIDTH as u32)
+    }
+
+    /// The height of one text row, with the active vector face or the
+    /// bitmap cell.
+    pub fn text_row_height(&self) -> u32 {
+        typeface::with_face(|face| face.row_height()).unwrap_or(GLYPH_HEIGHT as u32)
+    }
+
     /// Draw ASCII text at `(x, y)`, one glyph per pixel column.
     ///
-    /// Bytes outside printable ASCII are drawn as the missing-glyph cell
-    /// rather than skipped, so a client that passes a Latin-1 or UTF-8 byte
-    /// sees a box where the character should be instead of a silently
-    /// shortened line.
+    /// When a vector face is active ([`typeface::set_face`]) the text is
+    /// UTF-8 decoded and rendered from the face's outlines, anti-aliased,
+    /// each character advancing by the face's own metric — CJK glyphs land
+    /// at their full width, not a cell per byte. The coverage blends
+    /// against whatever is already on each pixel: callers that need an
+    /// opaque background paint it first, exactly as the bitmap path's
+    /// `Some(background)` callers already do.
+    ///
+    /// Without a face, bytes outside printable ASCII are drawn as the
+    /// missing-glyph cell rather than skipped, so a client that passes a
+    /// Latin-1 or UTF-8 byte sees a box where the character should be
+    /// instead of a silently shortened line.
     pub fn draw_text(
+        &mut self,
+        x: i32,
+        y: i32,
+        text: &str,
+        foreground: u32,
+        background: Option<u32>,
+    ) {
+        let Some(face) = typeface::active_face() else {
+            self.draw_text_bitmap(x, y, text, foreground, background);
+            return;
+        };
+        self.draw_text_vector(face, x, y, text, foreground);
+    }
+
+    /// The bitmap text path: one 8x16 cell per byte.
+    fn draw_text_bitmap(
         &mut self,
         x: i32,
         y: i32,
@@ -314,9 +370,57 @@ impl Canvas {
         }
     }
 
+    /// The vector text path: UTF-8 characters, per-character advance,
+    /// coverage alpha-blended onto the surface.
+    fn draw_text_vector(
+        &mut self,
+        face: &mut typeface::Face,
+        mut pen_x: i32,
+        y: i32,
+        text: &str,
+        foreground: u32,
+    ) {
+        let baseline = y + face.ascent() as i32;
+        for ch in text.chars() {
+            let (bitmap, advance) = match face.glyph(ch) {
+                Some(glyph) => glyph,
+                None => {
+                    // No outline for this character: skip its advance so a
+                    // mixed line keeps the rest of its text in step.
+                    pen_x += face.char_advance(ch) as i32;
+                    continue;
+                }
+            };
+
+            let origin_x = pen_x + bitmap.left;
+            let origin_y = baseline - bitmap.top;
+            for row in 0..bitmap.height {
+                let py = origin_y + row as i32;
+                for column in 0..bitmap.width {
+                    let alpha =
+                        bitmap.coverage[row as usize * bitmap.width as usize + column as usize];
+                    if alpha == 0 {
+                        continue;
+                    }
+                    let px = origin_x + column as i32;
+                    let Some(existing) = self.get(px, py) else {
+                        continue;
+                    };
+                    let blended = mix(foreground, existing, alpha);
+                    self.set(px, py, blended);
+                }
+            }
+            pen_x += advance as i32;
+        }
+    }
+
     /// The width `text` occupies when drawn with [`Canvas::draw_text`].
     pub fn text_width(text: &str) -> u32 {
-        (text.len() as u32).saturating_mul(GLYPH_WIDTH as u32)
+        match typeface::with_face(|face| text.chars().map(|ch| face.char_advance(ch)).sum::<u32>())
+        {
+            Some(width) => width,
+            None => (text.len() as u32).saturating_mul(GLYPH_WIDTH as u32),
+        }
     }
 
     /// Draw `text` centred inside `rect`, clipped to it.
@@ -330,6 +434,22 @@ impl Canvas {
         let y = rect.y + (rect.height.saturating_sub(GLYPH_HEIGHT as u32) / 2) as i32;
         self.draw_text(x, y, text, foreground, background);
     }
+}
+
+/// Blend an XRGB8888 `foreground` over `background` at `alpha` coverage
+/// (0..=255), rounding to nearest.
+///
+/// The vector text path's per-pixel composite. Both words are read as
+/// opaque colours — the surface has no alpha channel, so the coverage is
+/// the only thing being mixed.
+fn mix(foreground: u32, background: u32, alpha: u8) -> u32 {
+    let a = u32::from(alpha);
+    let channel = |shift: u32| -> u32 {
+        let fg = (foreground >> shift) & 0xFF;
+        let bg = (background >> shift) & 0xFF;
+        ((fg * a + bg * (255 - a) + 127) / 255) << shift
+    };
+    channel(16) | channel(8) | channel(0)
 }
 
 /// A push button.
@@ -494,29 +614,41 @@ impl TextBox {
         true
     }
 
-    /// Delete the byte before the cursor.
+    /// Delete the character before the cursor.
+    ///
+    /// A UTF-8 multi-byte character is deleted whole: a cursor left inside
+    /// one would let the next insertion split it into invalid bytes.
     pub fn backspace(&mut self, bytes: &mut [u8]) -> bool {
-        if self.cursor == 0 || self.cursor > self.len {
+        if self.cursor == 0 || self.cursor > self.len || self.cursor > bytes.len() {
             return false;
         }
+        let Some(start) = char_start_before(bytes, self.cursor) else {
+            return false;
+        };
         for index in self.cursor..self.len {
-            bytes[index - 1] = bytes[index];
+            bytes[index - (self.cursor - start)] = bytes[index];
         }
-        self.len -= 1;
-        self.cursor -= 1;
+        self.len -= self.cursor - start;
+        self.cursor = start;
         true
     }
 
-    /// Move the cursor one byte left.
-    pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+    /// Move the cursor one character left, never splitting a UTF-8
+    /// sequence.
+    pub fn cursor_left(&mut self, bytes: &[u8]) {
+        let Some(start) = char_start_before(bytes, self.cursor) else {
+            return;
+        };
+        self.cursor = start;
     }
 
-    /// Move the cursor one byte right, never past the end.
-    pub fn cursor_right(&mut self) {
-        if self.cursor < self.len {
-            self.cursor += 1;
+    /// Move the cursor one character right, never past the end and never
+    /// into the middle of a UTF-8 sequence.
+    pub fn cursor_right(&mut self, bytes: &[u8]) {
+        if self.cursor >= self.len {
+            return;
         }
+        self.cursor = char_end_after(bytes, self.cursor).min(self.len);
     }
 
     /// The cursor's byte index.
@@ -526,14 +658,17 @@ impl TextBox {
 
     /// Draw the field and its contents, scrolled so the cursor stays visible.
     ///
-    /// A byte other than `\n` fills the next cell of the current row; `\n`
-    /// ends it; and a row that fills up wraps onto the next one. That makes
-    /// the field a small multi-line editor rather than one long line that
-    /// runs off the side — which is what a text box in an editor has to be.
+    /// Layout is per *character*, not per byte: a UTF-8 multi-byte character
+    /// is one glyph that advances by the active face's own metric, so CJK
+    /// text occupies its full width rather than a cell per byte. A `\n` ends
+    /// a row; a character that does not fit wraps onto the next one. That
+    /// makes the field a small multi-line editor rather than one long line
+    /// that runs off the side — which is what a text box in an editor has to
+    /// be.
     ///
     /// Rows above the window are laid out and skipped rather than ignored:
-    /// every byte belongs to exactly one row, so scrolling changes which rows
-    /// are *drawn* and never which bytes appear in them.
+    /// every character belongs to exactly one row, so scrolling changes
+    /// which rows are *drawn* and never which characters appear in them.
     pub fn draw(&self, canvas: &mut Canvas, bytes: &[u8]) {
         canvas.fill_rect(self.rect, palette::FIELD);
         canvas.stroke_rect(
@@ -549,48 +684,74 @@ impl TextBox {
         if inner.width == 0 || inner.height == 0 {
             return;
         }
-        let columns = (inner.width as usize / GLYPH_WIDTH).max(1);
-        let rows = (inner.height as usize / GLYPH_HEIGHT).max(1);
+        let row_height = canvas.text_row_height();
+        let rows = (inner.height / row_height).max(1) as usize;
 
         let end = self.len.min(bytes.len());
         let text = &bytes[..end];
-        let (cursor_row, cursor_column) = position(text, self.cursor.min(end), columns);
+        let (cursor_row, cursor_pen) =
+            layout_position(text, self.cursor.min(end), inner.width, canvas);
         let scroll = cursor_row.saturating_sub(rows.saturating_sub(1));
 
         let mut index = 0usize;
         let mut row = 0usize;
         while index < end && row < scroll + rows {
             let start = index;
-            let mut column = 0usize;
-            // Lay out one row: as many glyphs as fit, or the newline that
-            // ends it, whichever comes first.
+            let mut pen = 0u32;
+            let mut overflowed = false;
+            // Lay out one row: as many characters as fit, or the newline
+            // that ends it, whichever comes first.
             while index < end {
-                let byte = text[index];
-                if byte == b'\n' {
+                let Some((ch, size)) = decode_char(&text[index..]) else {
+                    // Not a valid UTF-8 start byte. Draw the missing-glyph
+                    // treatment for it — one bitmap cell's worth of width,
+                    // so a corrupt byte is visible rather than silently
+                    // swallowed — and move past it.
+                    if pen + GLYPH_WIDTH as u32 > inner.width {
+                        overflowed = true;
+                        break;
+                    }
+                    if row >= scroll {
+                        canvas.draw_glyph(
+                            inner.x + pen as i32,
+                            inner.y + ((row - scroll) as i32) * row_height as i32,
+                            text[index],
+                            palette::TEXT,
+                            Some(palette::FIELD),
+                        );
+                    }
+                    pen += GLYPH_WIDTH as u32;
                     index += 1;
+                    continue;
+                };
+                if ch == '\n' {
+                    index += size;
                     break;
                 }
-                if column == columns {
+                let advance = canvas.char_advance(ch);
+                if pen + advance > inner.width {
+                    overflowed = true;
                     break;
                 }
                 if row >= scroll {
-                    canvas.draw_glyph(
-                        inner.x + (column as i32) * GLYPH_WIDTH as i32,
-                        inner.y + ((row - scroll) as i32) * GLYPH_HEIGHT as i32,
-                        byte,
+                    let mut encoded = [0u8; 4];
+                    canvas.draw_text(
+                        inner.x + pen as i32,
+                        inner.y + ((row - scroll) as i32) * row_height as i32,
+                        ch.encode_utf8(&mut encoded),
                         palette::TEXT,
-                        Some(palette::FIELD),
+                        None,
                     );
                 }
-                column += 1;
-                index += 1;
+                pen += advance;
+                index += size;
             }
             // A row that filled exactly and is followed by a newline: the
             // wrap already moved the cursor to where that newline would, so
             // consuming it here is what stops it from opening a line of its
             // own. Without this, every line typed to exactly the field's
             // width would be followed by a blank one.
-            if column == columns && index < end && text[index] == b'\n' {
+            if overflowed && index < end && text[index] == b'\n' {
                 index += 1;
             }
             if index == start {
@@ -606,10 +767,10 @@ impl TextBox {
             // character the user is about to type in front of.
             canvas.fill_rect(
                 Rect::new(
-                    inner.x + (cursor_column as i32) * GLYPH_WIDTH as i32 + GLYPH_WIDTH as i32 - 1,
-                    inner.y + ((cursor_row - scroll) as i32) * GLYPH_HEIGHT as i32,
+                    inner.x + cursor_pen as i32,
+                    inner.y + ((cursor_row - scroll) as i32) * row_height as i32,
                     1,
-                    GLYPH_HEIGHT as u32,
+                    row_height,
                 ),
                 palette::TEXT,
             );
@@ -617,41 +778,100 @@ impl TextBox {
     }
 }
 
-/// Which row and column a byte index lands in, for a field `columns` wide.
+/// Decode one UTF-8 character from the front of `bytes`, returning it with
+/// its length in bytes.
 ///
-/// This is the layout [`TextBox::draw`] draws — a newline ends a row, a full
-/// row wraps, and a newline directly after a full row belongs to that row —
-/// because the caret must be placed by the same rules that placed the glyphs.
-/// Two implementations that disagreed would put the caret on the line above
-/// or below the one it is actually in, and only when the text happened to
-/// wrap at exactly the wrong moment.
-fn position(text: &[u8], cursor: usize, columns: usize) -> (usize, usize) {
+/// `None` for a byte that cannot start a character: the caller draws that
+/// case as a missing glyph rather than pretending it was text.
+fn decode_char(bytes: &[u8]) -> Option<(char, usize)> {
+    let first = *bytes.first()?;
+    let length = match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        // 0xC0 and 0xC1 are overlong encodings, and 0x80..=0xBF are
+        // continuation bytes with no lead — neither decodes.
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return None,
+    };
+    let slice = bytes.get(..length)?;
+    let mut chars = core::str::from_utf8(slice).ok()?.chars();
+    let ch = chars.next()?;
+    // A valid encoding decodes to exactly one character; a multi-character
+    // slice would mean the length above lied.
+    if chars.next().is_some() {
+        return None;
+    }
+    Some((ch, length))
+}
+
+/// Which row a byte index sits in, and the pen's x-offset inside that row,
+/// for a field `width` pixels wide.
+///
+/// This is the layout [`TextBox::draw`] draws — a newline ends a row, a
+/// character that does not fit wraps, and a newline directly after a full
+/// row belongs to that row — because the caret must be placed by the same
+/// rules that placed the glyphs. Two implementations that disagreed would
+/// put the caret on the line above or below the one it is actually in, and
+/// only when the text happened to wrap at exactly the wrong moment.
+fn layout_position(text: &[u8], cursor: usize, width: u32, canvas: &Canvas) -> (usize, u32) {
     let mut row = 0usize;
-    let mut column = 0usize;
+    let mut pen = 0u32;
     let mut index = 0usize;
     while index < cursor {
-        let byte = text[index];
-        if byte == b'\n' {
-            row += 1;
-            column = 0;
+        let Some((ch, size)) = decode_char(&text[index..]) else {
+            pen += GLYPH_WIDTH as u32;
             index += 1;
             continue;
+        };
+        if ch == '\n' {
+            row += 1;
+            pen = 0;
+            index += size;
+            continue;
         }
-        column += 1;
-        if column >= columns {
+        let advance = canvas.char_advance(ch);
+        if pen + advance > width {
             // The same absorption the drawing loop performs, and only when
-            // the newline is already behind the cursor: a cursor resting *on*
-            // the newline has not consumed it, and sits at the start of the
-            // row the wrap just opened.
-            if index + 1 < cursor && text[index + 1] == b'\n' {
-                index += 1;
+            // the newline is already behind the cursor: a cursor resting
+            // *on* the newline has not consumed it, and sits at the start
+            // of the row the wrap just opened.
+            if index + size < cursor && text.get(index + size) == Some(&b'\n') {
+                index += size;
             }
             row += 1;
-            column = 0;
+            pen = 0;
         }
-        index += 1;
+        pen += advance;
+        index += size;
     }
-    (row, column)
+    (row, pen)
+}
+
+/// The index of the character boundary at or immediately before `cursor`.
+///
+/// `None` when `cursor` is zero or past the bytes' end — a caller whose
+/// cursor is out of bounds refuses to move rather than silently clamping.
+fn char_start_before(bytes: &[u8], cursor: usize) -> Option<usize> {
+    if cursor == 0 || cursor > bytes.len() {
+        return None;
+    }
+    let mut start = cursor - 1;
+    // Continuation bytes (0b10xxxxxx) trail their lead byte; walking back
+    // over them lands on the character's first byte.
+    while start > 0 && bytes[start] & 0xC0 == 0x80 {
+        start -= 1;
+    }
+    Some(start)
+}
+
+/// The index of the character boundary immediately after `cursor`.
+fn char_end_after(bytes: &[u8], cursor: usize) -> usize {
+    let mut end = cursor + 1;
+    while end < bytes.len() && bytes[end] & 0xC0 == 0x80 {
+        end += 1;
+    }
+    end
 }
 
 #[cfg(test)]

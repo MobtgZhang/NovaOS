@@ -70,6 +70,10 @@ pub extern "C" fn main() -> i64 {
             let _ = console::write_str("[NOVA] init failed to start service\r\n");
             return -1;
         }
+        // One line per service, on the console and therefore on the screen:
+        // the boot sequence a person watches is exactly this list, in this
+        // order, so a service that hangs is visible by its missing line.
+        let _ = console::write_fmt(format_args!("[NOVA] init: started {}\r\n", name));
         yield_now();
     }
 

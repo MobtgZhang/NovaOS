@@ -9,7 +9,8 @@
 //!
 //! 1. the `syscall` stub, which must stash the user's stack pointer and load
 //!    the kernel stack of *the CPU that executed the instruction*;
-//! 2. `return_to_user`, which must read that stashed pointer back.
+//! 2. the syscall return path, which must read that stashed pointer back
+//!    when it saves the thread's context.
 //!
 //! Both used a single global (`NOVA_KERNEL_USER_STACK_POINTER`) and a single
 //! TSS (`nova_kernel_tss`), which is correct exactly as long as one processor
@@ -45,8 +46,8 @@ pub const OFFSET_CPU_INDEX: usize = 0x10;
 /// shared line would make the writes ping-pong.
 #[repr(C, align(64))]
 pub struct PerCpuData {
-    /// The user stack pointer the `syscall` stub stashed. Read back by
-    /// `return_to_user`.
+    /// The user stack pointer the `syscall` stub stashed. Read back by the
+    /// syscall return path when it saves the thread's context.
     user_stack_pointer: u64,
     /// The kernel stack top this CPU's syscall entry switches to. Written by
     /// the scheduler when it resumes a thread on this CPU — the same value the

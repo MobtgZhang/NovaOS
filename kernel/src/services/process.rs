@@ -117,10 +117,24 @@ pub(crate) fn exec_image_in_state_with_grant(
     let archive =
         crate::initramfs::Archive::parse(archive_bytes).map_err(|_| ErrorCode::Invalid)?;
     if name.len() > MAX_SERVICE_NAME {
-        klog!(Level::Error, "process: service name overflow");
+        klog!(
+            Level::Error,
+            "process: service name overflow len={} max={MAX_SERVICE_NAME}",
+            name.len()
+        );
         return Err(ErrorCode::Invalid);
     }
-    let image = archive.get(name).ok_or(ErrorCode::BadHandle)?;
+    let image = match archive.get(name) {
+        Some(image) => image,
+        None => {
+            klog!(
+                Level::Error,
+                "process: service name not in archive name={}",
+                core::str::from_utf8(name).unwrap_or("?")
+            );
+            return Err(ErrorCode::BadHandle);
+        }
+    };
 
     if parent_slot >= MAX_TASKS {
         klog!(Level::Error, "process: parent slot overflow");
@@ -146,6 +160,7 @@ pub(crate) fn exec_image_in_state_with_grant(
     };
 
     let space = address_space::create_process_space(boot_info).map_err(|_| ErrorCode::NoMemory)?;
+
     let loaded = loader::load(&space, image, boot_info).map_err(|error| {
         klog!(Level::Error, "process: load failed {error}");
         ErrorCode::NoMemory
@@ -179,6 +194,22 @@ pub(crate) fn exec_image_in_state_with_grant(
                 error
             })?;
     }
+
+    let dbg_space = space;
+    let dbg_entry_mapped = crate::loader::is_mapped(&dbg_space, loaded.entry);
+    let dbg_stack_top = loaded.stack_pointer - 8;
+    let dbg_stack_mapped = crate::loader::is_mapped(&dbg_space, dbg_stack_top);
+    let dbg_stack_phys = crate::loader::translate(&dbg_space, dbg_stack_top);
+    klog!(
+        Level::Info,
+        "dbg: loaded pml4={:#x} entry {:#x} mapped={} | stack-8 {:#x} mapped={} phys={:?}",
+        dbg_space.pml4_phys(),
+        loaded.entry,
+        dbg_entry_mapped,
+        dbg_stack_top,
+        dbg_stack_mapped,
+        dbg_stack_phys,
+    );
 
     let Some(mut thread) = task::create_thread(
         next_thread_id(),

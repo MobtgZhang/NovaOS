@@ -65,7 +65,6 @@
 use core::arch::asm;
 
 use crate::arch::shared::console::Console;
-use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::msr;
 use crate::klog;
 use crate::logger::Level;
@@ -346,10 +345,18 @@ pub unsafe extern "C" fn nova_kernel_syscall_dispatch(registers: *mut UserRegist
     // SAFETY: `rax` is at a fixed offset within the region `registers` points
     // at — the fifteenth word — and the region is on the kernel stack and
     // writable.
-    // SAFETY: the return frame has been fully built, and returning to ring 3
-    // is the point at which user-mode preemption becomes valid.
+    //
+    // Interrupts stay masked through here. Every transition below ends in an
+    // `iretq` that restores the thread's own `RFLAGS` — for a user thread
+    // those carry `IF` — so preemption becomes possible again at exactly the
+    // `iretq`, not a word earlier. Enabling interrupts here would let a timer
+    // fire between the save and the resume, and the timer handler would save
+    // this half-finished path as the thread's context: a register file of
+    // kernel values and a frame built from whatever sat above the CPU's
+    // three-word same-privilege interrupt frame. That context is resumed
+    // later at a garbage stack pointer, and the machine dies a few faults
+    // later with no report in the log.
     unsafe {
-        crate::arch::x86_64::port_io::sti();
         asm!(
             "mov qword ptr [{base} + 112], {result}",
             base = in(reg) registers,
@@ -358,18 +365,23 @@ pub unsafe extern "C" fn nova_kernel_syscall_dispatch(registers: *mut UserRegist
         );
     }
 
-    // A syscall can end in any of three scheduler transitions. Save the exact
-    // machine state first; the scheduler writes it into a resume block before
-    // it picks another thread.
+    // A syscall can end in any of four scheduler transitions. All four go
+    // through the same two steps — save the exact machine state into the
+    // thread record, then let the scheduler resume — because a resume block
+    // restores all fifteen general-purpose registers while an ad-hoc frame
+    // would not. The `Continue` case in particular must go through it: the
+    // user's registers exist *only* in the save area the stub pushed, and
+    // the dispatcher's own Rust code has long since clobbered the live
+    // registers. Resuming through the block is what hands the caller its
+    // registers back.
     //
     // SAFETY: the entry path is serialised with interrupts masked, and the
     // scheduler functions never return into this dispatcher.
     match outcome.effect {
-        nova_core::syscall::ThreadEffect::Continue => {
-            // SAFETY: the user's `RIP`, `RFLAGS` and `RSP` are all known, and
-            // the kernel stack has room for the frame.
-            unsafe { return_to_user(registers) }
-        }
+        nova_core::syscall::ThreadEffect::Continue => unsafe {
+            crate::sched::save_current_syscall_context(registers);
+            crate::sched::resume_current_for_cpu(crate::task::current_cpu())
+        },
         nova_core::syscall::ThreadEffect::Yield => unsafe {
             crate::sched::save_current_syscall_context(registers);
             crate::sched::yield_current_and_switch()
@@ -864,82 +876,5 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
     Outcome {
         result: nova_core::syscall::SyscallResult::Value(copied as i64),
         effect: nova_core::syscall::ThreadEffect::Continue,
-    }
-}
-
-/// Return to ring 3 with an `iretq` frame.
-///
-/// The frame is built on the kernel stack, below the saved user registers, and
-/// holds the user's `RIP`, `CS`, `RFLAGS`, `RSP` and `SS`.
-///
-/// # Safety
-///
-/// The caller must have restored the user's `RIP` and `RSP` into `registers`,
-/// and the kernel stack must have room for the five-word frame.
-unsafe fn return_to_user(registers: &UserRegisters) -> ! {
-    // The user's `RIP` is the address after the `syscall` instruction, which
-    // the CPU put in `RCX`.
-    let user_rip = registers.user_rip();
-    // The user's `RFLAGS`, which the CPU put in `R11` before the entry.
-    let user_rflags = registers.user_rflags();
-    // The user's `RSP`. The `syscall` instruction did not change it, and the
-    // stub stashed it in this CPU's per-CPU cell before switching stacks.
-    //
-    // SAFETY: delegated to this function's contract; the stub wrote it on
-    // this same CPU, with interrupts masked.
-    let user_rsp = unsafe { crate::arch::x86_64::percpu::user_stack_pointer() };
-    klog!(Level::Info, "debug: return rflags={user_rflags:#x}");
-
-    // The frame is built *below* the saved registers: the stack grows down,
-    // and the saved register file must survive the return path so the caller
-    // can inspect it afterwards.
-    //
-    // Forty-eight bytes are reserved so that the frame's base is 16-byte
-    // aligned. The CPU does not require the frame's base to be aligned, but an
-    // aligned frame is one less thing to be wrong about, and the kernel's own
-    // stack discipline is 16-byte aligned throughout.
-    //
-    // The user's `RFLAGS` has `IF` restored by the `iretq` — the frame
-    // carries the flags the CPU saved in `R11`, which are the flags the user
-    // had *before* `SFMASK` cleared `IF`. So the user returns with interrupts
-    // enabled, exactly as it had them.
-    //
-    // SAFETY: the kernel stack is mapped and has room for five more words.
-    // The values pushed are the user's own, and the `SS`/`CS` immediates name
-    // the ring 3 descriptors the GDT installs.
-    unsafe {
-        asm!(
-            "sub rsp, 48",
-            "mov qword ptr [rsp], {rip}",
-            "mov qword ptr [rsp + 8], {cs}",
-            "mov qword ptr [rsp + 16], {rflags}",
-            "mov qword ptr [rsp + 24], {rsp}",
-            "mov qword ptr [rsp + 32], {ss}",
-            rip = in(reg) user_rip,
-            cs = in(reg) USER_CODE_SELECTOR as u64,
-            rflags = in(reg) user_rflags,
-            rsp = in(reg) user_rsp,
-            ss = in(reg) USER_DATA_SELECTOR as u64,
-            options(nomem),
-        );
-    }
-
-    // The `iretq` itself. Everything it needs is in the frame above.
-    //
-    // The kernel stack pointer is restored from the frame's `RSP` slot, which
-    // holds the *user's* stack pointer — so after this instruction the kernel
-    // stack is no longer in use, and the next thing that runs is user code on
-    // the user's stack.
-    //
-    // `iretq` is the only way back to ring 3 that this kernel uses.
-    // `sysretq` would be faster but validates `RCX` against the kernel's
-    // canonical addresses and faults in a way that loses all context; see the
-    // module documentation.
-    //
-    // SAFETY: the frame was just built on the kernel stack, and it names the
-    // user's `RIP`, `CS`, `RFLAGS`, `RSP` and `SS`. The `CS` and `SS`
-    // selectors name present ring 3 descriptors in the installed GDT.
-    unsafe {
-        asm!("iretq", options(noreturn),);
     }
 }

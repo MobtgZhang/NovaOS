@@ -1,16 +1,21 @@
 #![no_std]
 #![no_main]
 
-//! The terminal window: a scrollback, a command line, and a keyboard.
+//! The terminal window: a `nova>` shell, a scrollback, and a keyboard.
 //!
 //! The M6 desktop needs a terminal as one of its three first applications
-//! (§20.8). This one has no process behind it yet — there is no shell to
-//! attach to and no PTY to carry one — so it is a *local* terminal: it takes
-//! keystrokes, echoes them into a scrollback, and answers a handful of
-//! built-in commands. What it proves is the part M6 is actually about: a
-//! window receives routed keyboard input, decodes scancodes into characters,
-//! draws them with the built-in font, and redraws only when something
-//! happened.
+//! (§20.8). This one speaks to the system's services directly through their
+//! protocols: a handful of built-in commands reach the file service (`ls`,
+//! `cat`, `stat`), the process table (`ps`), and the kernel's own ABI
+//! (`uname`) — the working core of a shell, without a PTY or a separate
+//! shell process behind it.
+//!
+//! # Text
+//!
+//! The terminal renders with Sarasa Gothic Mono SC, embedded below: ASCII
+//! at a half-em advance, GB2312 level-1 hanzi at full width, all vector
+//! outlines through `nova-type` — any size, anti-aliased. A command's
+//! Chinese output is text, not boxes.
 //!
 //! # Why the scrollback and the command line are two text boxes
 //!
@@ -22,15 +27,34 @@
 //! accident, because there is exactly one place for it to go.
 
 use nova_apps::graphics::{InputEvent, Window};
-use nova_apps::{console, yield_now};
+use nova_apps::{console, fsclient, process, yield_now};
 use nova_protocols::input::{INPUT_BUTTON_PRIMARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER};
 use nova_ui::keyboard::{Decoder, Key};
 use nova_ui::{Button, Canvas, Rect, TextBox, palette};
+
+/// The terminal face embedded in this program: Sarasa Gothic Mono SC,
+/// subset to ASCII, CJK punctuation, and the GB2312 level-1 hanzi — the
+/// user-designated terminal face.
+static SARASA: &[u8] = include_bytes!("../../../../assets/fonts/sarasa-terminal.ttf");
 
 /// Window width in pixels.
 const WIDTH: u32 = 440;
 /// Window height in pixels.
 const HEIGHT: u32 = 320;
+
+/// The boot services `ps` reports on, by their initramfs names.
+///
+/// A fixed list rather than a process-table walk: the kernel's process
+/// service answers for a *named* process, and the desktop's roster is a
+/// boot-time fact this file already documents.
+const SERVICES: &[(&str, &str)] = &[
+    ("file-server", "file-server"),
+    ("console-server", "console-server"),
+    ("shell", "shell"),
+    ("terminal", "terminal"),
+    ("editor", "editor"),
+    ("file-manager", "file-manager"),
+];
 
 /// Bytes held in the scrollback.
 ///
@@ -80,10 +104,11 @@ impl Terminal {
         // The command line takes keys from the moment the window opens: a
         // terminal the user has to click into first feels broken.
         terminal.input_box.focused = true;
-        terminal.append(
-            b"NovaOS terminal\n\
-              type `help` for the commands this one knows\n",
-        );
+        terminal.append(b"NovaOS terminal (Sarasa Gothic)\n");
+        // The second line is in Chinese on purpose: it exercises the CJK
+        // half of the embedded face on the very first screen, so a subset
+        // regression is visible before any command runs.
+        terminal.append("输入 help 查看命令\n".as_bytes());
         terminal
     }
 
@@ -137,8 +162,8 @@ impl Terminal {
             Key::Backspace => {
                 self.input_box.backspace(&mut self.input);
             }
-            Key::Left => self.input_box.cursor_left(),
-            Key::Right => self.input_box.cursor_right(),
+            Key::Left => self.input_box.cursor_left(&self.input),
+            Key::Right => self.input_box.cursor_right(&self.input),
             Key::Escape => {
                 // Escape abandons the line, as it does in every shell.
                 self.input_box.clear();
@@ -157,7 +182,7 @@ impl Terminal {
         true
     }
 
-    /// Run one command line against the built-ins.
+    /// Run one command line against the built-ins and the system services.
     fn run(&mut self, line: &[u8]) {
         self.append(line);
         self.append(b"\n");
@@ -166,8 +191,13 @@ impl Terminal {
         if command.is_empty() {
             return;
         }
+
         if command == b"help" {
-            self.append(b"commands: help, about, echo <text>, clear\n");
+            self.append(
+                b"help  about  clear  echo <text>\n\
+                 ls [path]  cat <path>  stat <path>\n\
+                 ps  uname\n",
+            );
         } else if command == b"about" {
             self.append(b"NovaOS desktop, milestone M6\n");
         } else if command == b"clear" {
@@ -177,6 +207,18 @@ impl Terminal {
         } else if let Some(rest) = command.strip_prefix(b"echo ") {
             self.append(rest);
             self.append(b"\n");
+        } else if command == b"ls" {
+            self.list(b"/");
+        } else if let Some(rest) = command.strip_prefix(b"ls ") {
+            self.list(trim(rest));
+        } else if let Some(rest) = command.strip_prefix(b"cat ") {
+            self.cat(trim(rest));
+        } else if let Some(rest) = command.strip_prefix(b"stat ") {
+            self.stat(trim(rest));
+        } else if command == b"ps" {
+            self.ps();
+        } else if command == b"uname" {
+            self.uname();
         } else {
             self.append(b"unknown command: ");
             self.append(command);
@@ -185,6 +227,122 @@ impl Terminal {
             return;
         }
         self.status = "ready";
+    }
+
+    /// `ls [path]`: list a directory through the file service.
+    fn list(&mut self, path: &[u8]) {
+        let mut page_buffer = [0u8; fsclient::PAGE_BYTES];
+        let mut offset = 0u32;
+        loop {
+            let page = match fsclient::list_at(path, offset, &mut page_buffer) {
+                Ok(page) => page,
+                Err(error) => {
+                    self.append(b"ls: ");
+                    self.append(error.name().as_bytes());
+                    self.append(b"\n");
+                    return;
+                }
+            };
+            if page.count == 0 {
+                break;
+            }
+            let mut records = fsclient::Records::new(&page_buffer[..page.bytes]);
+            while let Some(record) = records.next() {
+                self.append(record.name);
+                if record.directory {
+                    self.append(b"/");
+                } else {
+                    self.append(b"  ");
+                    self.append_decimal(record.size);
+                }
+                self.append(b"\n");
+            }
+            offset += page.count;
+            if offset >= page.total {
+                break;
+            }
+        }
+    }
+
+    /// `cat <path>`: read a file and put it in the scrollback.
+    fn cat(&mut self, path: &[u8]) {
+        let mut contents = [0u8; 1024];
+        match fsclient::read_all(path, &mut contents) {
+            Ok(count) => {
+                self.append(&contents[..count]);
+                if count == 0 || contents[count - 1] != b'\n' {
+                    self.append(b"\n");
+                }
+            }
+            Err(error) => {
+                self.append(b"cat: ");
+                self.append(error.name().as_bytes());
+                self.append(b"\n");
+            }
+        }
+    }
+
+    /// `stat <path>`: what the file service knows about one path.
+    fn stat(&mut self, path: &[u8]) {
+        match fsclient::stat(path) {
+            Ok(info) => {
+                self.append(if info.directory {
+                    b"directory  "
+                } else {
+                    b"file  "
+                });
+                self.append_decimal(info.size);
+                self.append(b" bytes\n");
+            }
+            Err(error) => {
+                self.append(b"stat: ");
+                self.append(error.name().as_bytes());
+                self.append(b"\n");
+            }
+        }
+    }
+
+    /// `ps`: the kernel's process count and each boot service's state.
+    fn ps(&mut self) {
+        self.append(b"processes: ");
+        self.append_decimal(process::count());
+        self.append(b"\n");
+        for (name, label) in SERVICES {
+            self.append(label.as_bytes());
+            self.append(if process::status(name) {
+                b"  up\n"
+            } else {
+                b"  down\n"
+            });
+        }
+    }
+
+    /// `uname`: the kernel and ABI the session runs on.
+    fn uname(&mut self) {
+        self.append(b"NovaOS x86_64 (ABI ");
+        self.append_decimal(u64::from(nova_abi::ABI_VERSION.major));
+        self.append(b".");
+        self.append_decimal(u64::from(nova_abi::ABI_VERSION.minor));
+        self.append(b")\n");
+    }
+
+    /// Append a number in decimal, bounded to a scratch buffer.
+    fn append_decimal(&mut self, value: u64) {
+        let mut digits = [0u8; 20];
+        let mut length = 0usize;
+        // Fixed-buffer decimal, shortest last: the scrollback's own append
+        // does the bounds work.
+        if value == 0 {
+            self.append(b"0");
+            return;
+        }
+        let mut rest = value;
+        while rest > 0 && length < digits.len() {
+            digits[digits.len() - 1 - length] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            length += 1;
+        }
+        self.append(&digits[digits.len() - length..]);
     }
 
     /// Handle one pointer event. Returns whether the window must be
@@ -244,6 +402,11 @@ fn trim(line: &[u8]) -> &[u8] {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i64 {
+    // The terminal face: Sarasa Gothic, ASCII plus the GB2312 level-1
+    // hanzi. Every draw from here on renders from its outlines; a parse
+    // failure degrades to the bitmap font inside nova-ui.
+    nova_ui::typeface::set_face(SARASA);
+
     let _ = console::write_str("[NOVA] terminal ready\r\n");
 
     let mut window = match Window::open(WIDTH, HEIGHT) {

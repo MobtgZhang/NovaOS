@@ -406,75 +406,73 @@ const _: () = {
 /// # The layout must be reproduced byte for byte
 ///
 /// This is a hardware structure the CPU reads on every exception and privilege
-/// transition, so every offset is ABI. The canonical 64-bit TSS is **104 bytes**:
+/// transition, so every offset is ABI. The canonical 64-bit TSS (AMD APM vol. 2
+/// fig. 12-8, Intel SDM vol. 3A fig. 7-11) is:
 ///
 /// ```text
 ///    0  reserved0        (4, zero)
-///    4  reserved1        (4, zero)      <-- easy to omit
-///    8  rsp0             (8)
-///   16  rsp1             (8)
-///   24  rsp2             (8)
-///   32  reserved2        (8, zero)
-///   40  ist[0] .. ist[6] (7 * 8 = 56)   <-- ist[0] is IST1, NOT IST0
-///   96  reserved3        (8, zero)
-///  104  i64Reserved      (2, zero)
-///  106  istIndex         (2)
-///  108  reserved4        (8, zero)
-///  116  -- end, 124 bytes total
+///    4  rsp0             (8)
+///   12  rsp1             (8)
+///   20  rsp2             (8)
+///   28  reserved2        (8, zero)
+///   36  ist[0] .. ist[6] (7 * 8 = 56)   <-- ist[0] is IST1, NOT IST0
+///   92  reserved3        (8, zero)
+///  100  iomap base       (2, zero)       <-- I/O map base address; unused
+///  102  reserved4        (2, zero)
+///  104  -- end, 112 bytes total
 /// ```
 ///
 /// Three ways this goes wrong, all of which are invisible until the first
 /// exception is taken:
 ///
-/// 1. Omitting the second reserved word shifts every meaningful field down four
-///    bytes, so `ist[0]` is read from where `reserved2` should be and the CPU
-///    switches stacks to an address that is not a stack. The resulting fault in
-///    the fault handler is itself unreportable, and the machine triple-faults
-///    with an empty serial log.
+/// 1. Adding a second reserved word after `reserved0` shifts every meaningful
+///    field down four bytes, so the CPU reads `rsp0` as
+///    `reserved | rsp0's low half << 32` — a non-canonical address. The first
+///    interrupt arriving from ring 3 then raises `#SS`, whose delivery raises
+///    `#SS` again, which is a double fault, whose delivery faults again, which
+///    is a triple fault: the machine resets with an empty serial log.
 /// 2. Treating `ist` as a 7-entry array indexed by *IST number* rather than
 ///    *offset*, so `ist[1]` is IST2 and IST1 reads `ist[0]`.
-/// 3. Adding the trailing reserved words the diagram above does not list, which
-///    pushes the size past 124 and makes the descriptor's limit point at memory
-///    the kernel does not own.
+/// 3. Padding past the I/O map base the diagram above does not list, which
+///    pushes the descriptor's limit over memory the kernel does not own.
 ///
-/// The `const _: () = assert!` below turns all three into compile errors.
+/// The `const _: () = assert!` below turns the first two into compile errors.
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 pub struct TaskStateSegment {
     reserved0: u32,
-    /// Second reserved word. Must be present; see the type note.
-    reserved1: u32,
-    /// Ring 0 stack pointer used on a privilege transition (`RSP0`).
+    /// Ring 0 stack pointer used on a privilege transition (`RSP0`), at the
+    /// architectural offset of 4.
     pub privilege_stack_table: [u64; 3],
-    /// Reserved. Keeps `ist` at its architectural offset of 40.
+    /// Reserved. Keeps `ist` at its architectural offset of 36.
     reserved2: u64,
     /// The seven IST entries. `ist[0]` is **IST1**; IST0 does not exist.
     pub interrupt_stack_table: [u64; 7],
+    /// Reserved, bytes 92-99.
     reserved3: u64,
-    /// `I64Reserved`. Must be zero.
-    i64reserved: u16,
-    /// IST index for exceptions arriving from ring 3.
-    pub interrupt_stack_table_index: u16,
-    reserved4: u64,
+    /// The I/O map base address, bytes 100-101. No I/O permission bitmap is
+    /// published, so it stays zero.
+    pub iomap_base: u16,
+    /// Reserved, bytes 102-103. The CPU never reads this; a gate's IST index
+    /// lives in the gate descriptor, not here.
+    pub reserved4: u16,
 }
 
 /// Compile-time proof that the fields sit at their architectural offsets.
 ///
-/// Deliberately asserts *offsets* rather than a total size. The size of a 64-bit
-/// TSS is reported inconsistently across references — 104 bytes in some, 116 in
-/// others, the difference being whether the trailing reserved word is counted —
-/// so pinning the size would encode one source's convention as a hard rule. The
-/// offsets, by contrast, are unambiguous and are the only thing the CPU actually
-/// uses: `RSP0` at 8, IST1 at 40, and the IST index at 106.
+/// Deliberately asserts *offsets* rather than a total size. Sources disagree
+/// about how many trailing reserved bytes to count, so pinning the size would
+/// encode one source's convention as a hard rule. The offsets, by contrast,
+/// are unambiguous and are the only thing the CPU actually
+/// uses: `RSP0` at 4, and IST1 at 36.
 ///
 /// Each of these is a field the kernel reads or the CPU loads, so getting one
 /// wrong is a silent misbehaviour rather than a compile error elsewhere.
 const _: () = {
     use core::mem::offset_of;
 
-    assert!(offset_of!(TaskStateSegment, privilege_stack_table) == 8);
-    assert!(offset_of!(TaskStateSegment, interrupt_stack_table) == 40);
-    assert!(offset_of!(TaskStateSegment, interrupt_stack_table_index) == 106);
+    assert!(offset_of!(TaskStateSegment, privilege_stack_table) == 4);
+    assert!(offset_of!(TaskStateSegment, interrupt_stack_table) == 36);
     // Three stack pointers, then the word that keeps the IST array at 40. Without
     // the check, dropping `reserved2` would slide every IST entry down eight
     // bytes and install the fault stack into what the CPU reads as IST0's
@@ -503,13 +501,11 @@ impl TaskStateSegment {
     const fn zeroed() -> Self {
         Self {
             reserved0: 0,
-            reserved1: 0,
             privilege_stack_table: [0; 3],
             reserved2: 0,
             interrupt_stack_table: [0; 7],
             reserved3: 0,
-            i64reserved: 0,
-            interrupt_stack_table_index: 0,
+            iomap_base: 0,
             reserved4: 0,
         }
     }
@@ -894,9 +890,10 @@ pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
         } else {
             return 0;
         };
-        // `privilege_stack_table` is at offset 8; the first entry is one word
-        // into the structure.
-        core::ptr::read_unaligned(tss.cast::<u64>().add(1))
+        // `privilege_stack_table[0]` is `RSP0` at the architectural offset of
+        // 4: the first word after `reserved0`. The TSS is `packed`, so the
+        // read goes through an unaligned load of the field's raw address.
+        core::ptr::read_unaligned((&raw const (*tss).privilege_stack_table[0]).cast::<u64>())
     }
 }
 
@@ -1007,7 +1004,6 @@ pub unsafe fn init() {
         // where the field happens to be aligned. Writing through a raw pointer to
         // a packed field is the documented way to do this.
         (&raw mut (*tss).privilege_stack_table[0]).write(kernel_top);
-        (&raw mut (*tss).interrupt_stack_table_index).write(FAULT_IST_INDEX);
         // `interrupt_stack_table[0]` is IST1, not IST0: the CPU's IST1 is the
         // first entry of the array. Indexing by `FAULT_IST_INDEX` directly
         // installs the IST2 stack and leaves IST1 holding zero, so a double fault
@@ -1020,7 +1016,7 @@ pub unsafe fn init() {
         // Fill the 16-byte TSS descriptor last: it needs the final TSS base.
         let tss_base = tss as u64;
         let tss_limit = (size_of::<TaskStateSegment>() - 1) as u16;
-        // A TSS limit is a byte count and the segment is 124 bytes, so this must
+        // A TSS limit is a byte count and the segment is 112 bytes, so this must
         // fit in 16 bits *without* the granularity bit doing any scaling.
         assert!(size_of::<TaskStateSegment>() <= 0x10000);
         write_tss_descriptor(gdt_base, TSS_SLOT, tss_base, tss_limit);
@@ -1167,7 +1163,6 @@ unsafe fn init_ap(cpu: usize) {
         );
 
         (&raw mut (*tss).privilege_stack_table[0]).write(kernel_top);
-        (&raw mut (*tss).interrupt_stack_table_index).write(FAULT_IST_INDEX);
         (&raw mut (*tss).interrupt_stack_table[FAULT_IST_INDEX as usize - IST_ARRAY_OFFSET])
             .write(fault_top);
 
@@ -1646,7 +1641,7 @@ fn write_tss_descriptor(gdt: *mut Gdt, slot: usize, base: u64, limit: u16) {
                 access: (1 << 7) | (DPL_RING0 << 5) | TSS_TYPE,
                 // A TSS limit is a **byte** count, so bit 7 (G, granularity) must
                 // be clear: set, it would multiply the limit by 4096 and describe
-                // a 64 KiB TSS while the kernel only owns 124 bytes.
+                // a 64 KiB TSS while the kernel only owns 112 bytes.
                 limit_flags: 0,
                 base_high: ((base >> 24) & 0xFF) as u8,
                 // The upper 8-byte slot. Every byte of it is part of the base

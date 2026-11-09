@@ -36,6 +36,11 @@ use nova_ui::keyboard::{Decoder, Key};
 use nova_ui::{Button, Canvas, Rect, colour, decimal, palette};
 
 /// Window width in pixels.
+/// The GUI face embedded in this program: Source Han Sans subset to ASCII,
+/// CJK punctuation, and the GB2312 level-1 hanzi, so a Chinese file name in
+/// the list is text rather than boxes.
+static HAN_SANS: &[u8] = include_bytes!("../../../../assets/fonts/han-sans-gui.ttf");
+
 const WIDTH: u32 = 440;
 /// Window height in pixels.
 const HEIGHT: u32 = 380;
@@ -571,6 +576,10 @@ fn error_status(error: ErrorCode) -> &'static str {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i64 {
+    // The GUI face, as the editor uses it: one selection, and every later
+    // draw renders from the outlines.
+    nova_ui::typeface::set_face(HAN_SANS);
+
     let _ = console::write_str("[NOVA] file-manager ready\r\n");
 
     let mut window = match Window::open(WIDTH, HEIGHT) {

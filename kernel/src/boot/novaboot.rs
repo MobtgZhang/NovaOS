@@ -68,17 +68,17 @@ static mut INITRAMFS_LEN: usize = 0;
 /// The largest initramfs this kernel will copy.
 ///
 /// The archive holds every packaged program, and the desktop's programs are not
-/// the handful of small IPC services this bound started with: eight binaries,
-/// three of which link the UI toolkit and the built-in font, run to about
-/// 270 KiB today — so the first value of this constant (256 KiB) is already a
-/// boot failure rather than a margin.
+/// the handful of small IPC services this bound started with. Today the eight
+/// binaries run to about 270 KiB *plus* the embedded typefaces: the terminal
+/// carries the Sarasa Gothic subset and the editor and file manager each carry
+/// the Source Han Sans subset, which puts the archive near 3.5 MiB.
 ///
 /// It is a guard, not a target. The length is checked *before* the copy, so an
 /// oversized archive is refused rather than truncated into a corrupt one, and
 /// the storage is `.bss`: raising the bound costs RAM the machine already has
 /// and no image bytes, while lowering the risk of the next application silently
 /// pushing the desktop past a boot it used to pass.
-const INITRAMFS_CAPACITY: usize = 512 * 1024;
+const INITRAMFS_CAPACITY: usize = 6 * 1024 * 1024;
 
 /// Record the snapshot pointer the entry stub received.
 ///

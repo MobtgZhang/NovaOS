@@ -34,6 +34,11 @@ use nova_ui::keyboard::{Decoder, Key};
 use nova_ui::{Button, Canvas, Rect, TextBox, decimal, palette};
 
 /// Window width in pixels.
+/// The GUI face embedded in this program: Source Han Sans subset to ASCII,
+/// CJK punctuation, and the GB2312 level-1 hanzi — 1 MiB of `.rodata`, the
+/// price of showing Chinese as text.
+static HAN_SANS: &[u8] = include_bytes!("../../../../assets/fonts/han-sans-gui.ttf");
+
 const WIDTH: u32 = 440;
 /// Window height in pixels.
 const HEIGHT: u32 = 340;
@@ -98,8 +103,8 @@ impl Editor {
             Key::Backspace => {
                 self.field.backspace(&mut self.text);
             }
-            Key::Left => self.field.cursor_left(),
-            Key::Right => self.field.cursor_right(),
+            Key::Left => self.field.cursor_left(&self.text),
+            Key::Right => self.field.cursor_right(&self.text),
             // Enter is the one editing key that is also a character: the
             // field lays a newline out as the start of a new row.
             Key::Enter => {
@@ -222,6 +227,12 @@ impl Editor {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i64 {
+    // The GUI face: Source Han Sans, ASCII plus the GB2312 level-1 hanzi, so
+    // a file's Chinese text is text on screen rather than boxes. Every later
+    // draw goes through the face; a failure to parse degrades to the bitmap
+    // font inside nova-ui, so this call cannot fail the startup.
+    nova_ui::typeface::set_face(HAN_SANS);
+
     let _ = console::write_str("[NOVA] editor ready\r\n");
 
     let mut window = match Window::open(WIDTH, HEIGHT) {
