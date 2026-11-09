@@ -611,9 +611,17 @@ pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
             if let Some(next_id) = next_id {
                 unsafe { resume_thread_for_cpu(cpu, next_id) };
             } else {
+                // Every thread on this CPU is blocked and the policy state
+                // machine cannot find anyone to run. `hlt` never wakes with
+                // interrupts masked — `switch_to_next_for_cpu` runs with
+                // interrupts masked, so unmask them here, or the loop never
+                // observes work becoming runnable.
                 klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
                 loop {
-                    unsafe { core::arch::asm!("hlt", options(nostack)) };
+                    unsafe {
+                        core::arch::asm!("sti", options(nomem, nostack));
+                        core::arch::asm!("hlt", options(nostack));
+                    }
                     if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
                         unsafe { resume_thread_for_cpu(cpu, id) };
                     }
@@ -622,7 +630,10 @@ pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
         } else {
             klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
             loop {
-                unsafe { core::arch::asm!("hlt", options(nostack)) };
+                unsafe {
+                    core::arch::asm!("sti", options(nomem, nostack));
+                    core::arch::asm!("hlt", options(nostack));
+                }
                 if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
                     unsafe { resume_thread_for_cpu(cpu, id) };
                 }

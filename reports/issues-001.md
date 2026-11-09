@@ -249,6 +249,12 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - `kernel/src/arch/x86_64/smp.rs`：AP trampoline `or eax, 0x101` 仅置 SCE+LME，**未置 NXE(bit 10)**；AP 上用户 PTE 的 NX bit(bit 63) 被当保留位 → 每个用户数据页 RSVD page fault。改为 `or eax, 0x501`（SCE|LME|NXE）。
   - `kernel/src/mm/address_space.rs`：用户页暂不设 NX bit（QEMU TCG 页表 walk 对 AP 的 NX bit 当保留位处理的 workaround；真实硬件 EFER.NXE 已置，可恢复 `!protection.is_executable()`）。
   - 验证：QEMU 下 `init ready (desktop)`、`init: started file-server`、`file-server ready` 依次打出；用户态在非 BSP CPU 上可正常首跑；`./scripts/gates.sh` 全绿，`cargo xtask test --timeout 240` 70 suites / 251 cases 全 pass，`cargo fmt --all --check`、clippy `-D warnings`、bare-metal build 通过。
+  - **SMP 用户态完整链路修复（2026-11-09）**：
+    - **root cause**：每个 AP 带有独立的 GDT/TSS/IDT、独自的线程池与调度器，`create_thread` 第一轮即分发到 AP，但 AP 从未安装 SYSCALL MSRs（`IA32_STAR`/`IA32_LSTAR`/`IA32_FM_SFMASK` 在 AP 上重置值为 0）。`init`、`file-server` 等用户线程在 AP 上首跑时 `syscall` 的 RIP=0 → 立即 #PF（`ip=0x0 errcode=0x150`），线程静默消失，串口只见 AP 起了、没人跑。修复在 `arch::x86_64::init_cpu()` 内同步安装 per-CPU syscall MSRs（`install_msrs` 单点实现，`init_ap()` 供 AP 专用路径）。
+    - **附带修复①（`IF=0` 下 `hlt` 永久睡眠）**：`switch_to_next_for_cpu()` 在 "no runnable thread" 的回退分支里直接 `hlt` 未 `sti`——x86-64 上 `IF=0` 时 CPU 不会再被 timer interrupt 唤醒，AP 上的 idle CPU 永远停住、自己的用户线程即使变可运行也没人投递。改为标准 `sti;hlt`（interrupt gate 自动清 IF、`iretq` 恢复，掩蔽契约不变），并保留原 `no_non_exited fallback` 作为防御性 requeue fallback（正常常规路径不会触发）。
+    - **附带修复②（syscall context 读了错的 pool）**：`current_syscall_context()` 原来读 `thread_in_slot(slot)`（硬编码 CPU 0 pool），AP 上恢复的线程经 `syscall` 时 slot 名义是 AP 的，读出来的却是 BSP pool 里的（或 None）同名 slot；改成 `current_cpu()` + `thread_in_slot_for_cpu(cpu, slot)` 完成同一 CPU 选择。
+    - **附带修复③（`create_thread` 轮转分发到在线 CPU，而不是一直 BSP）**：`task::create_thread` 中 fetch cursor + `is_online` 探测 + 回退 BSP 的循环。`tests::smp_cpu_state.rs` 的 `created_threads_dispatch_across_online_cpus` 事实上是 Round-Robin 分布断言。这是用户态能跨核跑真实负载的前提。
+    - **result**：真正的 round-robin 分发。`create_thread` 不再钉在 BSP；`-smp 4` QEMU TCG 下 desktop 端到端：`init ready`、6 个服务全部启动完毕（`file-server ready`、`console-server ready`、`shell ready: help ls cat echo ps`、`nova:>` 提示符、`terminal ready`、`editor ready`、`file-manager ready`），桌面 UI 截图（QMP screendump）显示 terminal / file-manager / editor 窗口正常渲染、Save/Load 按钮存在。
 - 用户态终端（Sarasa Gothic）与 GUI（han-sans）接入随后续阶段提交。
 ---
 

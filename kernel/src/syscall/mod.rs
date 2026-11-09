@@ -222,6 +222,34 @@ pub unsafe fn init() {
     );
 }
 
+/// Install the per-CPU syscall MSRs on a non-bootstrap processor.
+///
+/// `IA32_STAR`, `IA32_LSTAR` and `IA32_FM_SFMASK` reset to zero on *every*
+/// processor, so an application processor that never writes them executes
+/// its first ring-3 `syscall` with a zero `IA32_LSTAR`: the CPU loads
+/// `RIP` with zero and faults with `#PF` at address `0x0`. The bootstrap
+/// processor installs these in [`init`]; each AP must install them on itself
+/// before it can run user code.
+///
+/// # Safety
+///
+/// Must be called on the application processor with the GDT and TSS
+/// installed, exactly as [`init`] requires on the bootstrap processor.
+pub unsafe fn init_ap() {
+    // SAFETY: delegated to this function's contract. `STAR`, `LSTAR` and
+    // `SFMASK` are ordinary MSRs that may be written in ring 0.
+    unsafe {
+        // `EFER.SCE` is what makes the `syscall` instruction exist at all.
+        // Without it, executing `syscall` raises `#UD` — the same symptom as
+        // a missing entry point, which makes the two mistakes hard to tell
+        // apart.
+        msr::set_efer(msr::EFER_SCE);
+        msr::write(msr::MSR_STAR, crate::arch::x86_64::gdt::star_value());
+        msr::write(msr::MSR_LSTAR, syscall_entry as *const () as u64);
+        msr::write(msr::MSR_SFMASK, SFMASK);
+    }
+}
+
 /// The `syscall` entry stub.
 ///
 /// # What it does

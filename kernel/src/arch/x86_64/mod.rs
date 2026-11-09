@@ -187,6 +187,11 @@ pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
         gdt::init_cpu(cpu);
         idt::load();
         apic::init_for_cpu(cpu, direct_map_offset);
+        // The syscall MSRs are per-processor: an application processor
+        // boots with them zeroed, which would land the first ring-3
+        // `syscall` on address 0. They are installed after the GDT and TSS,
+        // exactly as on the bootstrap processor.
+        crate::syscall::init_ap();
     }
 }
 
