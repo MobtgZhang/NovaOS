@@ -32,7 +32,7 @@ use crate::ProtocolVersion;
 /// negotiation accepts an older minor, so a client that predates the two
 /// operations still talks to a server that has them: the version is a floor
 /// on what a peer may offer, not a requirement that it offer everything.
-pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
+pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
 
 /// Opcode for opening a file.
 pub const FILE_OP_OPEN: u64 = 1;
@@ -76,6 +76,25 @@ pub const FILE_OP_DELETE: u64 = 8;
 /// the old name first, then the new one. Renaming is only ever defined within
 /// one filesystem — a server never crosses a mount boundary to satisfy one.
 pub const FILE_OP_RENAME: u64 = 9;
+
+/// Opcode for changing a file's permission bits.
+///
+/// The scope policy is the same as any other write: the caller must hold a
+/// write grant on the file's path. This operation does not look at the
+/// file's owner — the user-space shell is where the root/owner rule lives,
+/// and a client that reaches here already passed the scope check that says
+/// "you may touch this path".
+///
+/// The mode word is the nine low bits, `rwxrwxrwx`, exactly as the RAM
+/// filesystem stores it. Added at protocol minor `2`.
+pub const FILE_OP_CHMOD: u64 = 10;
+
+/// Opcode for changing a file's owner and group.
+///
+/// Like [`FILE_OP_CHMOD`], the scope decides whether the caller may touch
+/// the path; the privilege convention — root only — is the caller's to
+/// enforce, and the shell enforces it. Added at protocol minor `2`.
+pub const FILE_OP_CHOWN: u64 = 11;
 
 /// Flag: open without failing if the file does not exist.
 pub const FILE_FLAG_CREATE: u32 = 1 << 0;
@@ -374,10 +393,18 @@ pub struct FileStatReply {
     pub kind: FileKind,
     /// The size of the file, in bytes. Zero for a directory.
     pub size: u64,
+    /// The uid that owns the file, or 0 for the root filesystem.
+    pub owner: u32,
+    /// The gid that owns the file.
+    pub group: u32,
+    /// The permission bits, `rwxrwxrwx`.
+    pub mode: u32,
+    /// Reserved. Must be zero.
+    pub reserved: u32,
 }
 
 /// Size of a file stat reply, in bytes.
-pub const FILE_STAT_REPLY_SIZE: usize = 24;
+pub const FILE_STAT_REPLY_SIZE: usize = 40;
 
 /// A request to delete a file.
 ///
@@ -421,6 +448,47 @@ pub struct FileRenameRequest {
 /// Size of a file rename request, in bytes.
 pub const FILE_RENAME_REQUEST_SIZE: usize = 16;
 
+/// A request to change a file's mode word.
+///
+/// The path follows the header in the payload, exactly as the other
+/// path-taking requests do. The mode word is the nine low bits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct FileChmodRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// The mode word to install; only the low nine bits are kept.
+    pub mode: u32,
+    /// How many payload bytes carry the path.
+    pub path_len: u32,
+    /// Reserved. Must be zero.
+    pub reserved: u32,
+}
+
+/// Size of a chmod request, in bytes.
+pub const FILE_CHMOD_REQUEST_SIZE: usize = 16;
+
+/// A request to change a file's owner and group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub struct FileChownRequest {
+    /// The protocol version the sender speaks.
+    pub version: ProtocolVersion,
+    /// The uid to install as the owner.
+    pub owner: u32,
+    /// The gid to install as the group.
+    pub group: u32,
+    /// How many payload bytes carry the path.
+    pub path_len: u32,
+    /// The uid of the caller, recorded as attribution rather than
+    /// authenticated authority. The scope grant is the authority; the shell
+    /// enforces the root-only convention for this operation.
+    pub caller_uid: u32,
+}
+
+/// Size of a chown request, in bytes.
+pub const FILE_CHOWN_REQUEST_SIZE: usize = 20;
+
 const _: () = assert!(size_of::<FileOpenRequest>() == FILE_OPEN_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileOpenReply>() == FILE_OPEN_REPLY_SIZE);
 const _: () = assert!(size_of::<FileReadRequest>() == FILE_READ_REQUEST_SIZE);
@@ -437,6 +505,9 @@ const _: () = assert!(size_of::<FileStatRequest>() == FILE_STAT_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileStatReply>() == FILE_STAT_REPLY_SIZE);
 const _: () = assert!(size_of::<FileDeleteRequest>() == FILE_DELETE_REQUEST_SIZE);
 const _: () = assert!(size_of::<FileRenameRequest>() == FILE_RENAME_REQUEST_SIZE);
+const _: () = assert!(size_of::<FileChmodRequest>() == FILE_CHMOD_REQUEST_SIZE);
+const _: () = assert!(size_of::<FileChownRequest>() == FILE_CHOWN_REQUEST_SIZE);
+const _: () = assert!(core::mem::offset_of!(FileChownRequest, caller_uid) == 16);
 
 const _: () = assert!(core::mem::offset_of!(FileOpenRequest, version) == 0);
 const _: () = assert!(core::mem::offset_of!(FileOpenRequest, flags) == 4);
@@ -528,12 +599,13 @@ impl WireHandle {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST,
-        FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE,
-        FILE_VERSION, FileCloseReply, FileCloseRequest, FileDirEntry, FileKind, FileListAtRequest,
-        FileListReply, FileListRequest, FileOpenReply, FileOpenRequest, FileReadReply,
-        FileReadRequest, FileStatReply, FileStatRequest, FileWriteReply, FileWriteRequest,
-        WireHandle,
+        FILE_CHMOD_REQUEST_SIZE, FILE_CHOWN_REQUEST_SIZE, FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE,
+        FILE_OP_CHMOD, FILE_OP_CHOWN, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST, FILE_OP_LIST_AT,
+        FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_VERSION,
+        FileChmodRequest, FileChownRequest, FileCloseReply, FileCloseRequest, FileDirEntry,
+        FileKind, FileListAtRequest, FileListReply, FileListRequest, FileOpenReply,
+        FileOpenRequest, FileReadReply, FileReadRequest, FileStatReply, FileStatRequest,
+        FileWriteReply, FileWriteRequest, WireHandle,
     };
     use crate::ProtocolVersion;
     use nova_abi::ipc::MAX_INLINE_PAYLOAD;
@@ -551,12 +623,17 @@ mod tests {
         assert_eq!(size_of::<FileWriteReply>(), 16);
         assert_eq!(size_of::<FileCloseRequest>(), 24);
         assert_eq!(size_of::<FileCloseReply>(), 16);
+        assert_eq!(size_of::<FileStatReply>(), 40);
+        assert_eq!(size_of::<FileChmodRequest>(), FILE_CHMOD_REQUEST_SIZE);
+        assert_eq!(size_of::<FileChownRequest>(), FILE_CHOWN_REQUEST_SIZE);
+        assert_eq!(FILE_OP_CHMOD, 10);
+        assert_eq!(FILE_OP_CHOWN, 11);
         assert_eq!(size_of::<FileListRequest>(), 16);
         assert_eq!(size_of::<FileListAtRequest>(), 16);
         assert_eq!(size_of::<FileDirEntry>(), 16);
         assert_eq!(size_of::<FileListReply>(), 16);
         assert_eq!(size_of::<FileStatRequest>(), 16);
-        assert_eq!(size_of::<FileStatReply>(), 24);
+        assert_eq!(size_of::<FileStatReply>(), 40);
 
         assert_eq!(core::mem::offset_of!(FileOpenRequest, version), 0);
         assert_eq!(core::mem::offset_of!(FileOpenRequest, flags), 4);
@@ -629,11 +706,15 @@ mod tests {
         assert_eq!(core::mem::offset_of!(FileStatReply, status), 4);
         assert_eq!(core::mem::offset_of!(FileStatReply, kind), 8);
         assert_eq!(core::mem::offset_of!(FileStatReply, size), 16);
+        assert_eq!(core::mem::offset_of!(FileStatReply, owner), 24);
+        assert_eq!(core::mem::offset_of!(FileStatReply, group), 28);
+        assert_eq!(core::mem::offset_of!(FileStatReply, mode), 32);
+        assert_eq!(core::mem::offset_of!(FileStatReply, reserved), 36);
     }
 
     #[test]
     fn the_version_is_checked_before_anything_else() {
-        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 1));
+        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 2));
         assert!(crate::negotiate(FILE_VERSION, FILE_VERSION).is_ok());
         // A minor-0 client still negotiates with a minor-1 server: the two
         // new operations are refused individually, not by version gate.
@@ -682,7 +763,7 @@ mod tests {
             reserved: 0,
         };
         assert_eq!(request.version.major, 1);
-        assert_eq!(request.version.minor, 1);
+        assert_eq!(request.version.minor, 2);
         assert_eq!(request.flags, FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE);
         assert_eq!(request.path_len, 11);
         assert_eq!(request.reserved, 0);
@@ -747,6 +828,10 @@ mod tests {
             status: 0,
             kind: FileKind::File,
             size: 4096,
+            owner: 1000,
+            group: 1000,
+            mode: 0o644,
+            reserved: 0,
         };
         assert_eq!(file.kind, FileKind::File);
         assert_eq!(file.size, 4096);
@@ -756,6 +841,10 @@ mod tests {
             status: 0,
             kind: FileKind::Directory,
             size: 0,
+            owner: 0,
+            group: 0,
+            mode: 0o755,
+            reserved: 0,
         };
         assert_eq!(directory.kind, FileKind::Directory);
     }

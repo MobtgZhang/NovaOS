@@ -125,3 +125,14 @@ pub fn exit_thread(status: i64) -> ! {
 pub fn boot_mode() -> Result<i64, SyscallError> {
     call(Syscall(nr::GET_BOOT_MODE.number()).raw(), [0; 6])
 }
+
+/// Clear the on-screen console and move the pen to the first cell of the
+/// first line.
+///
+/// This is the `clear(1)` of the emergency terminal. It touches the console
+/// frame the kernel draws; it is safe to call from any process, and in a GUI
+/// session it merely blanks the console frame, which the next desktop repaint
+/// replaces anyway.
+pub fn console_clear() -> Result<i64, SyscallError> {
+    call(Syscall(nr::CONSOLE_CLEAR.number()).raw(), [0; 6])
+}

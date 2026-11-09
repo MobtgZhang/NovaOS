@@ -468,6 +468,16 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         return boot_mode();
     }
 
+    if number == nova_abi::nr::CONSOLE_CLEAR.number() as u64 {
+        // SAFETY: the display driver owns the framebuffer, the console owns
+        // its cursor state, and the timer path holds no borrow of either.
+        unsafe { crate::drivers::screen::clear_for_userland() };
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Value(0),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
     if number == nova_abi::nr::READ.number() as u64 {
         return read_from_console(args);
     }

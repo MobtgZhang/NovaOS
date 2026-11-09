@@ -53,7 +53,7 @@ pub use syscall::{ObjectType, Syscall, nr};
 /// number a v0.1 binary never calls, so it keeps working against a v0.2
 /// kernel unchanged, which is exactly what "backwards-compatible addition"
 /// means.
-pub const ABI_VERSION: AbiVersion = AbiVersion { major: 0, minor: 2 };
+pub const ABI_VERSION: AbiVersion = AbiVersion { major: 0, minor: 3 };
 
 /// A major/minor ABI version.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -128,11 +128,11 @@ mod tests {
     #[test]
     fn the_version_is_reported_the_same_way_everywhere() {
         assert_eq!(ABI_VERSION.major, 0);
-        assert_eq!(ABI_VERSION.minor, 2);
+        assert_eq!(ABI_VERSION.minor, 3);
 
         let mut sink = Sink::new();
         write!(sink, "{ABI_VERSION}").expect("16 bytes is enough for a version");
-        assert_eq!(sink.as_str(), "0.2");
+        assert_eq!(sink.as_str(), "0.3");
     }
 
     #[test]

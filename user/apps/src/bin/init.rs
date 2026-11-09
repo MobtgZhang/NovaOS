@@ -23,8 +23,8 @@ const HOME: Rights = Rights::READ.union(Rights::WRITE);
 const DESKTOP_SERVICES: &[Service] = &[
     ("file-server", None),
     ("console-server", None),
-    ("shell", None),
-    ("terminal", None),
+    ("shell", Some(("/", HOME))),
+    ("terminal", Some(("/", HOME))),
     // The editor reads and writes the user's own files, and nothing else.
     ("editor", Some(("/home", HOME))),
     // The file manager browses; it never writes.
@@ -36,7 +36,7 @@ const DESKTOP_SERVICES: &[Service] = &[
 const SAFE_TERMINAL_SERVICES: &[Service] = &[
     ("file-server", None),
     ("console-server", None),
-    ("shell", None),
+    ("shell", Some(("/", HOME))),
 ];
 
 /// Select the services the boot mode asks for.

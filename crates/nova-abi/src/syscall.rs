@@ -200,6 +200,19 @@ pub mod nr {
     /// which services to start.
     pub const GET_BOOT_MODE: Syscall = Syscall(23);
 
+    /// Clear the on-screen console and move the pen to its home cell.
+    ///
+    /// Takes no arguments and returns nothing. The kernel console's visible
+    /// frame is cleared to the background colour and the cursor resets to the
+    /// first cell of the first line — what `clear(1)` means on any other
+    /// system, and what the emergency terminal needs to repaint its prompt
+    /// at the top of the screen rather than at the bottom of a scrollback.
+    ///
+    /// The clear is of the *console frame*, not of any window: a GUI window's
+    /// surface is its own owner's to repaint, and clearing that from a syscall
+    /// would let one process erase another's pixels.
+    pub const CONSOLE_CLEAR: Syscall = Syscall(25);
+
     /// Read bytes from standard input (the serial console).
     ///
     /// Arguments: `fd`, `buffer`, `length`. `fd` must be `0` (stdin). The
@@ -235,6 +248,7 @@ pub mod nr {
         PROCESS_STATUS,
         SERVICE_REQUEST,
         GET_BOOT_MODE,
+        CONSOLE_CLEAR,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -265,6 +279,7 @@ pub mod nr {
             SERVICE_REQUEST => "service_request",
             GET_BOOT_MODE => "get_boot_mode",
             READ => "read",
+            CONSOLE_CLEAR => "console_clear",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

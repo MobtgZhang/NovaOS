@@ -219,8 +219,25 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     // SAFETY: `services::init` above has published the state, nothing has
     // taken a borrow of it yet, and this is the boot path with interrupts
     // masked.
+    let seed_archive =
+        crate::boot::initramfs().and_then(|bytes| crate::initramfs::Archive::parse(bytes).ok());
+    let boot_mode_name = match boot_info.boot_mode() {
+        Some(nova_boot::BootMode::Desktop) => "desktop",
+        Some(nova_boot::BootMode::SafeTerminal) => "safe-terminal",
+        Some(nova_boot::BootMode::Tests) => "test",
+        _ => "unknown",
+    };
+    let seed = services::fs::SystemSeed {
+        cpu_count: boot_info.processor_count() as u32,
+        usable_memory: boot_info.usable_bytes(),
+        mapped_memory: boot_info.physical_limit(),
+        boot_mode: boot_mode_name,
+        initramfs: seed_archive,
+    };
+    // SAFETY: `services::init` installed the state, and nothing has borrowed
+    // it yet; the boot path runs with interrupts masked.
     unsafe {
-        services::state().files.seed_default_layout();
+        services::state().files.seed_default_layout(seed);
     }
 
     // The M2 machinery: the syscall MSRs, the timer, and the scheduler.

@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 
+use nova_apps::fsclient;
 use nova_apps::{console, process};
-use nova_fs::{DirEntry, FileKind, MAX_NAME_BYTES, MAX_PATH_BYTES, RamFs, path::canonicalize};
-use nova_user::{self /* ROOT_UID */};
+use nova_fs::MAX_PATH_BYTES;
+use nova_fs::path::canonicalize;
+use nova_user;
 
 const HELP: &str = "commands: help ls cat echo ps pwd cd whoami id su chmod chown exit clear";
 
@@ -14,16 +16,6 @@ const ASCII_LOGO: &[&str] = &[
     r" |_|\\  | |_| ||_| |_| |_||_||_/ ||_|",
     "",
 ];
-
-// SAFETY: the shell is single-threaded, and this static is only accessed by
-// `shell_fs()` from that thread. A value on the stack would overflow the user
-// stack because `RamFs` is a fixed-size pool.
-static mut SHELL_FS: RamFs = RamFs::new();
-
-fn shell_fs() -> &'static mut RamFs {
-    // SAFETY: see the `SHELL_FS` invariant above.
-    unsafe { &mut *core::ptr::addr_of_mut!(SHELL_FS) }
-}
 
 /// The per-session state: who is logged in and where the prompt currently is.
 struct Session {
@@ -185,7 +177,7 @@ fn resolve_path(session: &Session, path: &str, out: &mut [u8; MAX_PATH_BYTES]) -
     }
 }
 
-fn long_line(fs: &mut RamFs, dir_path: &[u8], entry: &DirEntry) {
+fn long_line(dir_path: &[u8], name: &[u8], directory: bool) {
     let mut full = [0u8; MAX_PATH_BYTES];
     let mut len = dir_path.len();
     full[..len].copy_from_slice(dir_path);
@@ -196,59 +188,84 @@ fn long_line(fs: &mut RamFs, dir_path: &[u8], entry: &DirEntry) {
         full[0] = b'/';
         len = 1;
     }
-    let name_len = entry.name_len as usize;
-    let name = &entry.name[..name_len];
     let take = name.len().min(MAX_PATH_BYTES - len);
     full[len..len + take].copy_from_slice(name);
     len += take;
     let target = &full[..len];
 
-    let meta = match fs.metadata(target) {
+    let meta = match fsclient::stat(target) {
         Ok(meta) => meta,
         Err(_) => return,
     };
     let mut mode_str = [0u8; 9];
-    let _ = nova_user::format_mode(meta.mode, &mut mode_str);
-    let kind = match entry.kind {
-        FileKind::Directory => 'd',
-        FileKind::File => '-',
-    };
+    let _ = nova_user::format_mode(meta.mode as u16, &mut mode_str);
+    let kind = if directory { 'd' } else { '-' };
     let _ = console::write_bytes(&[kind as u8]);
     let _ = console::write_bytes(&mode_str);
     let _ = console::write_fmt(format_args!(
         " {:>4} {:>4} {:>5} ",
         meta.owner, meta.group, meta.size
     ));
-    let _ = console::write_bytes(entry.name_bytes());
-    if entry.kind == FileKind::Directory {
+    let _ = console::write_bytes(name);
+    if directory {
         let _ = console::write_str("/");
     }
     let _ = console::write_str("\r\n");
 }
 
-fn list_long(fs: &mut RamFs, session: &Session, path: &str) {
-    let mut buf = [0u8; MAX_PATH_BYTES];
-    let len = resolve_path(session, path, &mut buf);
-    let dir_path = &buf[..len];
-    let mut entries = [DirEntry {
-        name: [0; MAX_NAME_BYTES],
-        name_len: 0,
-        kind: FileKind::File,
-        size: 0,
-    }; nova_fs::ramfs::MAX_CHILDREN];
-    match fs.list_dir(dir_path, &mut entries) {
-        Ok(count) => {
-            for entry in entries.iter().take(count) {
-                long_line(fs, dir_path, entry);
-            }
+/// Walk every record of a directory, page by page. `visit` is called once
+/// per entry. Returns false when the directory cannot be listed at all.
+fn for_each_entry(dir_path: &[u8], mut visit: impl FnMut(fsclient::Record<'_>)) -> bool {
+    let mut offset: u32 = 0;
+    let mut visited = false;
+    loop {
+        let mut page_bytes = [0u8; nova_apps::fsclient::PAGE_BYTES];
+        let page = match fsclient::list_at(dir_path, offset, &mut page_bytes) {
+            Ok(page) => page,
+            Err(_) => return false,
+        };
+        let mut records = fsclient::Records::new(&page_bytes[..page.bytes]);
+        while let Some(record) = records.next() {
+            visit(record);
+            visited = true;
         }
-        Err(_) => {
-            let _ = console::write_str("ls: not found\r\n");
+        offset = offset.saturating_add(page.count);
+        if page.count == 0 || offset >= page.total {
+            return visited || page.total > 0;
         }
     }
 }
 
-fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
+/// The short listing: name per line, directories suffixed with a slash.
+fn print_short_listing(dir_path: &[u8]) -> bool {
+    for_each_entry(dir_path, |record| {
+        let _ = console::write_bytes(record.name);
+        if record.directory {
+            let _ = console::write_str("/");
+        }
+        let _ = console::write_str("\r\n");
+    })
+}
+
+/// The long listing: `d|- mode owner group size name[/]`, one stat per
+/// entry. Directories on this system hold a handful of entries, not
+/// thousands, so the per-entry round trip is affordable.
+fn print_long_listing(dir_path: &[u8]) -> bool {
+    for_each_entry(dir_path, |record| {
+        long_line(dir_path, record.name, record.directory);
+    })
+}
+
+fn list_long(session: &Session, path: &str) {
+    let mut buf = [0u8; MAX_PATH_BYTES];
+    let len = resolve_path(session, path, &mut buf);
+    let dir_path = &buf[..len];
+    if !print_long_listing(dir_path) {
+        let _ = console::write_str("ls: not found\r\n");
+    }
+}
+
+fn execute(line: &str, session: &mut Session) {
     let (name, args) = split_command(line);
     match name {
         "help" => {
@@ -260,32 +277,15 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
             if arg == "-l" || arg.starts_with("-l ") {
                 let tail = arg[2..].trim();
                 let dir = if tail.is_empty() { "." } else { tail };
-                list_long(fs, session, dir);
+                list_long(session, dir);
                 return;
             }
             let path = if arg.is_empty() { "." } else { arg };
             let mut buf = [0u8; MAX_PATH_BYTES];
             let len = resolve_path(session, path, &mut buf);
             let dir_path = &buf[..len];
-            let mut entries = [DirEntry {
-                name: [0; MAX_NAME_BYTES],
-                name_len: 0,
-                kind: FileKind::File,
-                size: 0,
-            }; nova_fs::ramfs::MAX_CHILDREN];
-            match fs.list_dir(dir_path, &mut entries) {
-                Ok(count) => {
-                    for entry in entries.iter().take(count) {
-                        let _ = console::write_bytes(entry.name_bytes());
-                        if entry.kind == FileKind::Directory {
-                            let _ = console::write_str("/");
-                        }
-                        let _ = console::write_str("\r\n");
-                    }
-                }
-                Err(_) => {
-                    let _ = console::write_str("ls: not found\r\n");
-                }
+            if !print_short_listing(dir_path) {
+                let _ = console::write_str("ls: not found\r\n");
             }
         }
         "cat" => {
@@ -296,24 +296,34 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
             let mut buf = [0u8; MAX_PATH_BYTES];
             let len = resolve_path(session, args, &mut buf);
             let file_path = &buf[..len];
-            match fs.open(file_path) {
-                Ok(handle) => {
-                    let mut buffer = [0u8; nova_fs::ramfs::MAX_FILE_BYTES];
-                    match fs.read(handle, &mut buffer) {
-                        Ok(count) => {
-                            let _ = console::write_bytes(&buffer[..count]);
-                            if count == 0 || buffer[count - 1] != b'\n' {
-                                let _ = console::write_str("\r\n");
+            let mut buffer = [0u8; nova_fs::MAX_FILE_BYTES];
+            match fsclient::open(file_path, 0) {
+                Ok(file) => {
+                    let mut total = 0usize;
+                    loop {
+                        match fsclient::read(file.handle, &mut buffer[total..]) {
+                            Ok(0) => break,
+                            Ok(count) => total += count,
+                            Err(error) => {
+                                let _ = console::write_fmt(format_args!(
+                                    "cat: read: {}\r\n",
+                                    error.name()
+                                ));
+                                break;
                             }
                         }
-                        Err(_) => {
-                            let _ = console::write_str("cat: read failed\r\n");
+                        if total >= buffer.len() {
+                            break;
                         }
                     }
-                    let _ = fs.close(handle);
+                    let _ = console::write_bytes(&buffer[..total]);
+                    if total == 0 || buffer[total - 1] != b'\n' {
+                        let _ = console::write_str("\r\n");
+                    }
+                    let _ = fsclient::close(file.handle);
                 }
-                Err(_) => {
-                    let _ = console::write_str("cat: not found\r\n");
+                Err(error) => {
+                    let _ = console::write_fmt(format_args!("cat: open: {}\r\n", error.name()));
                 }
             }
         }
@@ -333,14 +343,8 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
             let mut buf = [0u8; MAX_PATH_BYTES];
             let len = resolve_path(session, target, &mut buf);
             let dir_path = &buf[..len];
-            let mut entries = [DirEntry {
-                name: [0; MAX_NAME_BYTES],
-                name_len: 0,
-                kind: FileKind::File,
-                size: 0,
-            }; 1];
-            match fs.list_dir(dir_path, &mut entries) {
-                Ok(_) => {
+            match fsclient::stat(dir_path) {
+                Ok(meta) if meta.directory => {
                     let canonical = match canonicalize(dir_path) {
                         Ok(c) => c,
                         Err(_) => {
@@ -349,6 +353,9 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
                         }
                     };
                     session.set_cwd(canonical.as_bytes());
+                }
+                Ok(_) => {
+                    let _ = console::write_str("cd: not a directory\r\n");
                 }
                 Err(_) => {
                     let _ = console::write_str("cd: no such directory\r\n");
@@ -394,7 +401,21 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
             let mut buf = [0u8; MAX_PATH_BYTES];
             let len = resolve_path(session, path_text, &mut buf);
             let file_path = &buf[..len];
-            match fs.chmod(file_path, mode, session.uid) {
+            // The gate for the permission model lives here in the shell,
+            // where the session's identity is known; the file service only
+            // knows scopes, so it cannot make this decision for us.
+            let meta = match fsclient::stat(file_path) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    let _ = console::write_str("chmod: not found\r\n");
+                    return;
+                }
+            };
+            if session.uid != 0 && session.uid != meta.owner {
+                let _ = console::write_str("chmod: operation not permitted\r\n");
+                return;
+            }
+            match fsclient::chmod(file_path, mode, session.uid) {
                 Ok(()) => {}
                 Err(_) => {
                     let _ = console::write_str("chmod: operation not permitted\r\n");
@@ -417,10 +438,14 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
                     return;
                 }
             };
+            if session.uid != 0 {
+                let _ = console::write_str("chown: operation not permitted\r\n");
+                return;
+            }
             let mut buf = [0u8; MAX_PATH_BYTES];
             let len = resolve_path(session, path_text, &mut buf);
             let file_path = &buf[..len];
-            match fs.chown(file_path, uid, uid, session.uid) {
+            match fsclient::chown(file_path, uid, uid, session.uid) {
                 Ok(()) => {}
                 Err(_) => {
                     let _ = console::write_str("chown: operation not permitted\r\n");
@@ -468,32 +493,11 @@ fn execute(line: &str, session: &mut Session, fs: &mut RamFs) {
             *session = login();
         }
         "clear" => {
-            for _ in 0..40 {
-                let _ = console::write_str("\r\n");
-            }
+            let _ = nova_apps::syscall::console_clear();
         }
         _ => {
             let _ = console::write_fmt(format_args!("unknown command: {name}\r\n"));
         }
-    }
-}
-
-fn seed_default_files(fs: &mut RamFs) {
-    let _ = fs.create_file(b"/hello.txt");
-    let _ = fs.create_dir(b"/docs");
-    let _ = fs.create_file(b"/docs/readme.txt");
-    let _ = fs.create_file(b"/etc/hostname");
-    if let Ok(handle) = fs.open(b"/hello.txt") {
-        let _ = fs.write(handle, b"NovaOS shell\n");
-        let _ = fs.close(handle);
-    }
-    if let Ok(handle) = fs.open(b"/docs/readme.txt") {
-        let _ = fs.write(handle, b"Docs for NovaOS.\n");
-        let _ = fs.close(handle);
-    }
-    if let Ok(handle) = fs.open(b"/etc/hostname") {
-        let _ = fs.write(handle, b"novaos\n");
-        let _ = fs.close(handle);
     }
 }
 
@@ -506,9 +510,6 @@ pub extern "C" fn main() -> i64 {
     let _ = console::write_str("NovaOS x86_64 (Safe Terminal)\r\n");
     let _ = console::write_str("Type 'help' for a list of commands.\r\n\r\n");
 
-    let fs = shell_fs();
-    seed_default_files(fs);
-
     loop {
         let mut session = login();
         loop {
@@ -519,7 +520,7 @@ pub extern "C" fn main() -> i64 {
                 continue;
             }
             let line = core::str::from_utf8(&line[..len]).unwrap_or("");
-            execute(line, &mut session, fs);
+            execute(line, &mut session);
         }
     }
 }

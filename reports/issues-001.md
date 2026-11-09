@@ -434,6 +434,23 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - 每个 widget 都是 host 可测的（`nova-graphic` 在 HOST_PACKAGES 中）。
 - **当前不足**：`nova-graphic` 仅提供原语；没有把它接到 `init` 的桌面启动序列——也就是说用户不会看到 QPushButton/QCheckBox 渲染出来的窗口。widget 的键盘处理没接入，只处理鼠标点击；窗口的标题/关闭按钮没有做。VNC 注入验证了鼠标指针在 Desktop 模式确实出现。
 
+
+### 13.4 Safe Terminal 输入与真实 VFS（2026-11-09）〔已修复〕**Medium**
+
+- **退格不擦除**：`drivers::screen::feed` 原对 0x08 一律静默丢弃 → 光标退回、单元格残留。修复：kernel console 现在对 `0x08` 执行「退一格 + 该单元格用背景色整体重绘」（等价终端的 `BS` = 退格 + 清格），Iosevka 的 cell 宽度由 `cell_advance()` 现算。shell 的 `\x08 \x08` 序列现在干净擦除。**实测**：敲 abcde、退格 3 次，屏幕只剩 `ab`，光标在正确位置。
+- **clear 后提示符在底部**：原 `clear` 打印 40 个换行，只滚屏不回顶。新增 syscall **`CONSOLE_CLEAR`（ABI 0.3，syscall 25）**：清整个 console frame 为背景色并把 pen 重置到第一个 cell（即真正的 `clear(1)`）。Shell 的 `clear` 命令改调 `nova_apps::syscall::console_clear()`。**实测**：`clear` 后 `root@novaos:/>` 出现在屏幕左上角。
+- **文件系统是假的（私有 RamFs，`cd /` 只看到 hello.txt/docs）**：shell 此前用**自己进程内的私有 RamFs**（boot seed 了 4 个假文件）。修复：shell 的文件操作全部走 **`fsclient` → 内核 file service（SERVICE_FILE）→ 内核 RamFs/挂载磁盘**：
+  - `ls`/`ls -l`/`cat`/`cd`/`pwd` 全部经 `fsclient::list_at/Records`、`stat`、`open/read`；
+  - `ls -l` 显示 `rwx` 串、owner/gid/size（stat 回复由 24B 扩到 40B，新增 owner/gid/mode 三元组；FILE_VERSION 1.2；协议布局 pin 更新）；
+  - 启动时内核往 RamFs 播种 **真实系统树**（`/etc/hostname`、`/system/version`、`/system/runtime/{cpu-count,memory,abi}`、`/EFI/NovaOS/{boot-mode,initramfs.list}`（启动时真实 initramfs 清单）、`/home/nova/notes.txt`）——内容全部来自 boot 时内核真实观测，无硬编码内容假文件；
+  - `/media/test`、`/media/ro` 是真实 virtio-blk 挂载（DiskFs，`/media/test/hello.txt` 内容可达）；
+  - **新增 FILE_OP_CHMOD(10) / FILE_OP_CHOWN(11)**：mode 9 位、owner/gid；服务端校验 scope WRITE，RamFs::chmod/chown 再按 owner-or-root / root-only 校验（shell 层再按会话 uid 预检：root 可改任何文件；zhang 只能改自己是 owner 的文件；chown 仅 root）。
+  - 真实效果：`cd /` 看到 `system/ devices/ proc/ tmp/ var/ home/ media/ dev/ etc/ EFI/`；`cat /system/version` → `NovaOS 0.1.0 (x86_64)`；`cat /EFI/NovaOS/initramfs.list` → 启动镜像真实清单（init/file-server/…/widgets-demo）；`cat /etc/hostname` → `novaos`。
+- **fsclient::read 永远失败（根因）**：`read()` 对 `out.len() > 48`（READ_CHUNK 协议上限）直接 `E_INVALID`，shell 传 1024B buffer 必挂——**文件服务的读路径从未真正被验证过**（M6 测试只走 write 路径和小文件）。修复：read 按 `READ_CHUNK` 裁剪，调用方循环读取。顺带修复 shell `cat` 的报错：现在打印真实 `error.name()`（`cat: E_INVALID` 风格）。
+- **init 授权**：shell（desktop 与 safe-terminal 两种模式）、terminal 现在拿到 `/` 的 `READ|WRITE` grant（此前 shell 只有自己的假 RamFs）。
+- **验收（QEMU, safe-terminal）**：`ls /`（真系统树）、`ls /system`、`ls -l /etc`（`-rw-r--r-- 0 0 7 hostname`）、`chmod 600 /etc/hostname` → `ls -l` 显示 `-rw-------`、`su zhang` → `chmod` → `operation not permitted`（zhang 不是 owner）、`ls -l /media/test`（`-rw-r--r-- 0 0 32 hello.txt`）、`cat /media/test/hello.txt` → `hello from the NovaOS test disk`、`whoami`/`id` 全部正确。
+- **Gates**：fmt、clippy `-D warnings`、host 70/251、`cargo xtask test --timeout 240`、裸机构建——全绿。
+
 ### 13.3 Safe Terminal / 桌面交互修复与 widgets-demo 验收（2026-11-09）〔已修复〕**Medium**
 
 - **桌面黑屏死锁（已 root-cause 修复）**：Qt/GUI 代码合入后桌面 boot 静默停在 `sched: cpu 0 idle, no runnable thread`，串口无任何错误。根因：initramfs 从 8 个 ELF 增至 9 个（新增 widgets-demo），而内核 `initramfs::Archive` 的 `MAX_FILES` 硬上限为 8 → `Archive::parse` 返回 `Err("initramfs-file-quota")`，而 `main.rs` 把该错误吞掉，init 根本未被启动 → 零可运行线程 → 永久 idle 黑屏。**修复**：`MAX_FILES` 提升至 16；`main.rs` 在 parse 失败时打印 `initramfs: parse failed: {reason}`（与 spawn 失败同级的 ERROR，不再静默）。

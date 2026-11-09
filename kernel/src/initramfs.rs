@@ -24,6 +24,12 @@ pub struct Archive {
 }
 
 impl Archive {
+    /// Walk the entries in archive order, for diagnostics and for the
+    /// boot-seeded inventory file.
+    pub fn iter(&self) -> impl Iterator<Item = Entry> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+
     pub fn parse(bytes: &'static [u8]) -> Result<Self, &'static str> {
         if bytes.len() < HEADER_SIZE || &bytes[..8] != MAGIC {
             return Err("bad-initramfs-magic");

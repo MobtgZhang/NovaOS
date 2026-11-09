@@ -153,6 +153,7 @@ impl ScreenConsole {
         match byte {
             b'\n' => self.newline(),
             b'\r' => self.cursor_x = MARGIN_X,
+            b'\x08' => self.backspace(),
             b'\t' => {
                 // Tabs advance to the next multiple of four cells.
                 let cell = self.cell_advance().max(1);
@@ -165,6 +166,36 @@ impl ScreenConsole {
             // the bytes of a multi-byte UTF-8 sequence — is skipped.
             _ => {}
         }
+    }
+
+    /// Erase the cell to the pen's left and step back over it.
+    ///
+    /// A terminal's backspace is two things — move the pen left, and make
+    /// the cell that pen left empty. The space byte the shell used to emit
+    /// bought the *move* but never the *empty*: a space has no outline, so
+    /// nothing was drawn and the deleted glyph stayed on the screen. The
+    /// cell is repainted in the background colour instead, which is the
+    /// same whole-line repaint the newline path uses when scrolling.
+    fn backspace(&mut self) {
+        if self.cursor_x <= MARGIN_X {
+            return;
+        }
+        let cell = self.cell_advance().max(1);
+        self.cursor_x = self.cursor_x.saturating_sub(cell);
+        let Some(font) = self.font.as_ref() else {
+            return;
+        };
+        let metrics = font.line_metrics(FONT_SIZE_PX);
+        let top = self.baseline_y.saturating_sub(metrics.ascent);
+        let _ = display::fill_rect(
+            u64::from(self.cursor_x),
+            u64::from(top),
+            u64::from(cell),
+            u64::from(metrics.height().max(metrics.ascent)),
+            BACKGROUND.0,
+            BACKGROUND.1,
+            BACKGROUND.2,
+        );
     }
 
     /// Move to the next line, scrolling the screen up one line when the

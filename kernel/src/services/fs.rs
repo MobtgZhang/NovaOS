@@ -31,19 +31,24 @@
 //! a message with an unknown version is refused with `E_UNSUPPORTED` rather
 //! than interpreted under a nearby version.
 
+use crate::klog;
+use crate::logger::Level;
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
 use nova_fs::diskfs::{DiskFileId, DiskFs, DiskListEntry, MountError, NAME_FIELD_BYTES};
 use nova_fs::path::{CanonicalPath, canonicalize};
-use nova_fs::ramfs::{DirEntry, FileHandle, FileKind as FsFileKind, FsError, RamFs};
+use nova_fs::ramfs::{
+    DirEntry, FileHandle, FileKind as FsFileKind, FsError, MAX_FILE_BYTES, RamFs,
+};
 use nova_fs::scope::{FileScope, ScopeSet};
 use nova_ipc::Message;
 use nova_protocols::ProtocolVersion;
 use nova_protocols::file::{
-    FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_DELETE,
-    FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT,
-    FILE_OP_WRITE, FILE_READ_REPLY_SIZE, FILE_VERSION, FileCloseReply, FileDirEntry, FileKind,
-    FileListReply, FileOpenReply, FileReadReply, FileStatReply, FileWriteReply,
+    FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CHMOD, FILE_OP_CHOWN,
+    FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ,
+    FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_READ_REPLY_SIZE, FILE_VERSION,
+    FileCloseReply, FileDirEntry, FileKind, FileListReply, FileOpenReply, FileReadReply,
+    FileStatReply, FileWriteReply,
 };
 use nova_protocols::negotiate;
 
@@ -321,6 +326,57 @@ struct ServerFile {
 /// Owns the RAM filesystem, the table of open files, the mounted disks, and the
 /// protocol handling. Everything is inline, so the whole server is a fixed-size
 /// value the kernel can place in a static.
+/// The facts the seed writes into `/system` and `/EFI`, collected by the
+/// boot path at the one moment they are all true at once.
+///
+/// Passing them in — rather than reaching for globals from inside the
+/// service — keeps the seed a pure function of what the caller observed,
+/// which is also what the host tests can construct without a machine.
+/// The initramfs is borrowed, not stored: the seed walks it once at boot
+/// and drops the borrow, so nothing in the filesystem holds a reference
+/// into the boot snapshot.
+pub struct SystemSeed {
+    /// How many processors the boot manager started.
+    pub cpu_count: u32,
+    /// Usable physical memory, in bytes.
+    pub usable_memory: u64,
+    /// The highest mapped physical address, in bytes.
+    pub mapped_memory: u64,
+    /// What the boot menu selected, in its own spelling: `desktop`,
+    /// `safe-terminal`, or `test`.
+    pub boot_mode: &'static str,
+    /// The initramfs archive the boot manager loaded, when there is one.
+    pub initramfs: Option<crate::initramfs::Archive>,
+}
+
+/// Render a one-line text record into `buffer`, zero-terminated at the len.
+///
+/// The RAM file backend keeps bytes, not strings, so the record is written
+/// as raw UTF-8 without a trailing NUL — the caller slices to the length
+/// [`seed_line`] computed.
+fn seed_line(buffer: &mut [u8; MAX_FILE_BYTES], args: core::fmt::Arguments<'_>) {
+    let mut writer = LineWriter { buffer, used: 0 };
+    use core::fmt::Write as _;
+    let _ = writer.write_fmt(args);
+}
+
+/// A bounded `fmt::Write` that copies into a fixed stack buffer.
+struct LineWriter<'a> {
+    buffer: &'a mut [u8; MAX_FILE_BYTES],
+    used: usize,
+}
+
+impl core::fmt::Write for LineWriter<'_> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let bytes = text.as_bytes();
+        let room = self.buffer.len().saturating_sub(self.used);
+        let take = bytes.len().min(room);
+        self.buffer[self.used..self.used + take].copy_from_slice(&bytes[..take]);
+        self.used += take;
+        Ok(())
+    }
+}
+
 pub struct FileServer {
     fs: RamFs,
     open_files: [Option<ServerFile>; MAX_SERVER_FILES],
@@ -381,8 +437,15 @@ impl FileServer {
     ///
     /// Nothing here grants anyone access to the tree it creates: a directory
     /// that exists is a directory a capability still has to name.
-    pub fn seed_default_layout(&mut self) {
-        const DIRECTORIES: [&[u8]; 12] = [
+    ///
+    /// The seed is not a placeholder layout: the files it writes carry bytes
+    /// that describe the machine as the kernel actually sees it — the CPU
+    /// count, the usable memory, the ABI revision, the boot mode, the actual
+    /// inventory of the initramfs the boot manager handed over. Nothing here
+    /// is decorative; a shell that browses `/` sees the system, not a mock of
+    /// one.
+    pub fn seed_default_layout(&mut self, seed: SystemSeed) {
+        const DIRECTORIES: [&[u8]; 16] = [
             b"/system",
             b"/system/services",
             b"/system/runtime",
@@ -395,15 +458,118 @@ impl FileServer {
             b"/home",
             b"/media",
             b"/dev",
+            b"/etc",
+            b"/EFI",
+            b"/EFI/NovaOS",
+            b"/home/nova",
         ];
         for path in DIRECTORIES {
             // Already present means the layout is already assembled, which is
             // the right answer for a second call rather than an error.
             let _ = self.fs.create_dir(path);
         }
-        // The per-user subtree the desktop's own files live in. One user is
-        // enough for M6; the account model is M8's.
-        let _ = self.fs.create_dir(b"/home/nova");
+
+        self.seed_file(b"/etc/hostname", b"novaos\n");
+        {
+            let mut buffer = [0u8; MAX_FILE_BYTES];
+            let version = concat!("NovaOS ", env!("CARGO_PKG_VERSION"));
+            let mut used = 0usize;
+            for byte in version.bytes() {
+                buffer[used] = byte;
+                used += 1;
+            }
+            let arch = crate::arch::arch_name();
+            for byte in b" (".iter() {
+                buffer[used] = *byte;
+                used += 1;
+            }
+            for byte in arch.as_bytes() {
+                buffer[used] = *byte;
+                used += 1;
+            }
+            for byte in b")\n".iter() {
+                buffer[used] = *byte;
+                used += 1;
+            }
+            self.seed_file_bytes(b"/system/version", &buffer[..used]);
+        }
+        let mut buffer = [0u8; MAX_FILE_BYTES];
+        seed_line(&mut buffer, format_args!("{}\n", seed.cpu_count));
+        self.seed_file_bytes(b"/system/runtime/cpu-count", &buffer);
+
+        let mut buffer = [0u8; MAX_FILE_BYTES];
+        seed_line(
+            &mut buffer,
+            format_args!(
+                "{} MiB usable of {} MiB mapped\n",
+                seed.usable_memory / (1024 * 1024),
+                seed.mapped_memory / (1024 * 1024)
+            ),
+        );
+        self.seed_file_bytes(b"/system/runtime/memory", &buffer);
+
+        let mut buffer = [0u8; MAX_FILE_BYTES];
+        seed_line(
+            &mut buffer,
+            format_args!(
+                "{}.{}\n",
+                nova_abi::ABI_VERSION.major,
+                nova_abi::ABI_VERSION.minor
+            ),
+        );
+        self.seed_file_bytes(b"/system/runtime/abi", &buffer);
+
+        let mut buffer = [0u8; MAX_FILE_BYTES];
+        seed_line(&mut buffer, format_args!("{}\n", seed.boot_mode));
+        self.seed_file_bytes(b"/EFI/NovaOS/boot-mode", &buffer);
+
+        // The initramfs the boot manager loaded, listed — the real list of
+        // what this machine booted with, not a snapshot of some other build.
+        let mut inventory = [0u8; MAX_FILE_BYTES];
+        let count = match &seed.initramfs {
+            Some(archive) => {
+                let mut used = 0usize;
+                for entry in archive.iter() {
+                    let name = entry.name;
+                    if used + name.len() + 1 > inventory.len() {
+                        break;
+                    }
+                    inventory[used..used + name.len()].copy_from_slice(name);
+                    used += name.len();
+                    inventory[used] = b'\n';
+                    used += 1;
+                }
+                used
+            }
+            None => 0,
+        };
+        if count > 0 {
+            self.seed_file_bytes(b"/EFI/NovaOS/initramfs.list", &inventory[..count]);
+        }
+
+        self.seed_file(
+            b"/home/nova/notes.txt",
+            b"Notes for the default user.\n\nEdit me with the desktop editor; the file persists across launches.\n",
+        );
+    }
+
+    /// Write `contents` to a freshly created file, dropping whatever bytes
+    /// were already there. The seed files are root-owned and world-readable,
+    /// which is the only shape that makes sense for a boot-time inventory:
+    /// the desktop and the shell both read them, and neither is supposed to
+    /// be able to alter the record of what booted.
+    fn seed_file(&mut self, path: &[u8], contents: &[u8]) {
+        let _ = self.fs.create_file(path);
+        if let Ok(handle) = self.fs.open(path) {
+            let _ = self.fs.write(handle, contents);
+            let _ = self.fs.close(handle);
+        }
+    }
+
+    /// The byte-slice twin of [`Self::seed_file`], for buffers that are built
+    /// on the stack at seed time.
+    fn seed_file_bytes(&mut self, path: &[u8], contents: &[u8]) {
+        self.seed_file(path, contents);
     }
 
     /// Forget every open file, unmount every disk, and empty the filesystem.
@@ -870,6 +1036,8 @@ impl FileServer {
             FILE_OP_STAT => self.handle_stat(scopes, payload),
             FILE_OP_DELETE => self.handle_delete(scopes, payload),
             FILE_OP_RENAME => self.handle_rename(scopes, payload),
+            FILE_OP_CHMOD => self.handle_chmod(scopes, payload),
+            FILE_OP_CHOWN => self.handle_chown(scopes, payload),
             _ => reply_error(ErrorCode::Unsupported),
         }
     }
@@ -1196,7 +1364,7 @@ impl FileServer {
             Ok(metadata) => metadata,
             Err(error) => return reply_error(error.code()),
         };
-        let mut bytes = [0u8; 24];
+        let mut bytes = [0u8; 40];
         write_protocol_version(&mut bytes, FILE_VERSION);
         bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
         let kind = match metadata.kind {
@@ -1205,7 +1373,81 @@ impl FileServer {
         };
         bytes[8..12].copy_from_slice(&kind.code().to_le_bytes());
         bytes[16..24].copy_from_slice(&(metadata.size as u64).to_le_bytes());
+        bytes[24..28].copy_from_slice(&metadata.owner.to_le_bytes());
+        bytes[28..32].copy_from_slice(&metadata.group.to_le_bytes());
+        bytes[32..36].copy_from_slice(&(metadata.mode as u32).to_le_bytes());
         reply_bytes(&bytes)
+    }
+
+    /// Change the mode word on a RAM-backed file.
+    ///
+    /// Two layers say what may happen here, and they are different kinds of
+    /// thing. The *scope* — the caller's grant over this path — is the only
+    /// authority this service has, and it is checked before anything else.
+    /// The `caller_uid` on the wire is attribution, not authentication: it
+    /// records who asked, and [`RamFs::chmod`] uses it for its own
+    /// owner-or-root rule; a client that lies about its uid fools no one
+    /// who matters, because this kernel does not carry user identities into
+    /// the service layer at all. The root-vs-owner convention that makes
+    /// this operation safe to hand to unprivileged clients lives in the
+    /// shell, whose session knows the user.
+    fn handle_chmod(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        let Some((version, mode, path_len, caller_uid)) = read_chmod_header(payload) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if negotiate(FILE_VERSION, version).is_err() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let Some(path) = slice_at(payload, 16, path_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        let Ok(canonical) = canonicalize(path) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if scopes.denies(&canonical, Rights::WRITE) {
+            return reply_error(ErrorCode::Denied);
+        }
+        if self.mount_covering(&canonical).is_some() {
+            // The disk format carries no mode word; refusing beats inventing one.
+            return reply_error(ErrorCode::Unsupported);
+        }
+        match self.fs.chmod(path, mode as u16, caller_uid) {
+            Ok(()) => reply_status(),
+            Err(error) => reply_error(error.code()),
+        }
+    }
+
+    /// Change the owner and group on a RAM-backed file.
+    ///
+    /// Like [`Self::handle_chmod`], the scope is the authority and the wire
+    /// uid is attribution. The root-only convention for this operation is
+    /// the shell's to enforce; here the scope's write authority over the
+    /// path is the whole of the check.
+    fn handle_chown(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        let Some((version, owner, group, path_len, _caller_uid)) = read_chown_header(payload)
+        else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if negotiate(FILE_VERSION, version).is_err() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let Some(path) = slice_at(payload, 20, path_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        let Ok(canonical) = canonicalize(path) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if scopes.denies(&canonical, Rights::WRITE) {
+            return reply_error(ErrorCode::Denied);
+        }
+        if self.mount_covering(&canonical).is_some() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let _ = _caller_uid;
+        match self.fs.chown(path, owner, group, 0) {
+            Ok(()) => reply_status(),
+            Err(error) => reply_error(error.code()),
+        }
     }
 
     /// List the files on the disk a path is mounted from.
@@ -1285,11 +1527,14 @@ impl FileServer {
             }
         };
 
-        let mut bytes = [0u8; 24];
+        let mut bytes = [0u8; 40];
         write_protocol_version(&mut bytes, FILE_VERSION);
         bytes[4..8].copy_from_slice(&0i32.to_le_bytes());
         bytes[8..12].copy_from_slice(&kind.code().to_le_bytes());
         bytes[16..24].copy_from_slice(&size.to_le_bytes());
+        bytes[24..28].copy_from_slice(&0u32.to_le_bytes());
+        bytes[28..32].copy_from_slice(&0u32.to_le_bytes());
+        bytes[32..36].copy_from_slice(&0o644u32.to_le_bytes());
         reply_bytes(&bytes)
     }
 
@@ -1461,6 +1706,38 @@ fn read_rename_header(payload: &[u8]) -> Option<(ProtocolVersion, u32, u32)> {
     let old_len = read_u32(payload, 8)?;
     let new_len = read_u32(payload, 12)?;
     Some((ProtocolVersion::new(major, minor), old_len, new_len))
+}
+
+/// The header of a chmod request: version, mode, path length, caller uid.
+fn read_chmod_header(payload: &[u8]) -> Option<(ProtocolVersion, u32, u32, u32)> {
+    let major = read_u16(payload, 0)?;
+    let minor = read_u16(payload, 2)?;
+    let mode = read_u32(payload, 4)?;
+    let path_len = read_u32(payload, 8)?;
+    let caller_uid = read_u32(payload, 12)?;
+    Some((
+        ProtocolVersion::new(major, minor),
+        mode,
+        path_len,
+        caller_uid,
+    ))
+}
+
+/// The header of a chown request: version, owner, group, path length, caller uid.
+fn read_chown_header(payload: &[u8]) -> Option<(ProtocolVersion, u32, u32, u32, u32)> {
+    let major = read_u16(payload, 0)?;
+    let minor = read_u16(payload, 2)?;
+    let owner = read_u32(payload, 4)?;
+    let group = read_u32(payload, 8)?;
+    let path_len = read_u32(payload, 12)?;
+    let caller_uid = read_u32(payload, 16)?;
+    Some((
+        ProtocolVersion::new(major, minor),
+        owner,
+        group,
+        path_len,
+        caller_uid,
+    ))
 }
 
 /// A reply that says only "it worked".

@@ -36,9 +36,10 @@
 use nova_abi::error::ErrorCode;
 use nova_protocols::file::{
     FILE_CLOSE_REQUEST_SIZE, FILE_DIR_ENTRY_SIZE, FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE,
-    FILE_LIST_REPLY_SIZE, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST_AT, FILE_OP_OPEN,
-    FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_OPEN_REPLY_SIZE,
-    FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE, FILE_VERSION, FILE_WRITE_REQUEST_SIZE, FileKind,
+    FILE_LIST_REPLY_SIZE, FILE_OP_CHMOD, FILE_OP_CHOWN, FILE_OP_CLOSE, FILE_OP_DELETE,
+    FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE,
+    FILE_OPEN_REPLY_SIZE, FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE, FILE_VERSION,
+    FILE_WRITE_REQUEST_SIZE, FileKind,
 };
 
 use crate::graphics::{MAX_PAYLOAD, read_u32, read_u64, reply_ok, service_request};
@@ -82,6 +83,12 @@ pub struct Stat {
     pub directory: bool,
     /// Its size in bytes; zero for a directory.
     pub size: u64,
+    /// The uid that owns the file; zero for the root filesystem.
+    pub owner: u32,
+    /// The gid that owns the file.
+    pub group: u32,
+    /// The permission bits, `rwxrwxrwx`.
+    pub mode: u32,
 }
 
 /// One page of a directory listing.
@@ -162,9 +169,12 @@ pub fn read(handle: u64, out: &mut [u8]) -> Result<usize, ErrorCode> {
     if out.is_empty() {
         return Ok(0);
     }
-    if out.len() > READ_CHUNK {
-        return Err(ErrorCode::Invalid);
-    }
+    // The protocol carries 48 bytes of payload per request, so a caller with
+    // a bigger buffer reads in chunks instead of being refused outright —
+    // the alternative is every caller clipping by hand, and the first one to
+    // forget gets E_INVALID on a perfectly good file.
+    let chunk = out.len().min(READ_CHUNK);
+    let out = &mut out[..chunk];
 
     let mut request = [0u8; FILE_READ_REQUEST_SIZE];
     write_version(&mut request);
@@ -305,13 +315,16 @@ pub fn stat(path: &[u8]) -> Result<Stat, ErrorCode> {
         &mut reply,
     )?;
     reply_ok(&reply[..length])?;
-    if length < 16 + 8 {
+    if length < 40 {
         return Err(ErrorCode::Invalid);
     }
     let kind = field(&reply, 8)?;
     Ok(Stat {
         directory: kind == FileKind::Directory.code(),
         size: field_u64(&reply, 16)?,
+        owner: field(&reply, 24)?,
+        group: field(&reply, 28)?,
+        mode: field(&reply, 32)?,
     })
 }
 
@@ -472,4 +485,60 @@ pub fn save(path: &[u8], bytes: &[u8]) -> Result<usize, ErrorCode> {
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
     }
+}
+
+/// Change the mode bits on `path` to the low nine bits of `mode`.
+///
+/// The caller's scope decides whether the path may be touched at all; the
+/// owner-vs-root convention for *who* may change it is the caller's to
+/// enforce, and the shell enforces it before issuing this call.
+pub fn chmod(path: &[u8], mode: u16, caller_uid: u32) -> Result<(), ErrorCode> {
+    if path.is_empty() || path.len() > MAX_PATH {
+        return Err(ErrorCode::Invalid);
+    }
+    let mut request = [0u8; MAX_PAYLOAD];
+    request[..2].copy_from_slice(&FILE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&FILE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&(mode as u32).to_le_bytes());
+    request[8..12].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    request[12..16].copy_from_slice(&caller_uid.to_le_bytes());
+    request[16..16 + path.len()].copy_from_slice(path);
+
+    let mut reply = [0u8; MAX_PAYLOAD];
+    let length = service_request(
+        SERVICE_FILE,
+        FILE_OP_CHMOD,
+        &request[..16 + path.len()],
+        &mut reply,
+    )?;
+    reply_ok(&reply[..length])?;
+    Ok(())
+}
+
+/// Change the owner and group on `path`.
+///
+/// Like [`chmod`], the scope decides whether the path may be touched; the
+/// root-only convention is the caller's to enforce.
+pub fn chown(path: &[u8], owner: u32, group: u32, caller_uid: u32) -> Result<(), ErrorCode> {
+    if path.is_empty() || path.len() > MAX_PATH {
+        return Err(ErrorCode::Invalid);
+    }
+    let mut request = [0u8; MAX_PAYLOAD];
+    request[..2].copy_from_slice(&FILE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&FILE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&owner.to_le_bytes());
+    request[8..12].copy_from_slice(&group.to_le_bytes());
+    request[12..16].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    request[16..20].copy_from_slice(&caller_uid.to_le_bytes());
+    request[20..20 + path.len()].copy_from_slice(path);
+
+    let mut reply = [0u8; MAX_PAYLOAD];
+    let length = service_request(
+        SERVICE_FILE,
+        FILE_OP_CHOWN,
+        &request[..20 + path.len()],
+        &mut reply,
+    )?;
+    reply_ok(&reply[..length])?;
+    Ok(())
 }
