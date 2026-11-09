@@ -475,6 +475,16 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **内核 compositor 改用差分路径**：`present()` 现在计算本帧 paint plan——任何 surface `full` damage → 全屏重绘（保留 attach/move/resize 的正确语义）；否则 **区域重绘**：把所有 damaged 输出区域 + 旧箭头 cell + 新箭头 cell 合成为一个 tight 区域 → `fill_rect` 背景 → z 序按区域裁剪 blit 各 surface（新增 `display::blit_window` 支持源偏移的 sub-rect 拷贝）→ 最后画箭头。指针移动**零整屏重绘**。
 - **验收**：1024×768 QEMU 下鼠标做 8 步小幅扫动并前后截图，差异区域恰为 `(512,384)-(551,444)`——仅箭头的新旧位置，窗口内容像素级不变；`widgets-demo` 窗口不再闪烁、文件管理器列表完整可读。
 - **额外修复**：`blit_window` 长度校验（`stride*(sy+h)`，曾多出一行导致底边相交时 `E_INVALID` 让多个 app 报 `present failed E_INVALID`——已消除，串口干净）。
+
+### 13.7 NovaOS EDE Desktop 移植（2026-11-09）〔已完成〕**Medium**
+
+- **crates 结构**（一个组件一个 crate，严格 Rust):`nova-edelib`(edelib 的 Rust 移植：`EdeLog` 统一日志、`EdeConfig` INI 配置、`DesktopFile` 解析免费桌面 `.desktop`、`EdeApplication` 应用基座）、`nova-ede-desktop`（桌面图标层模型：解析 .desktop → 图标、命中、选择/取消、`DESKTOP_DIR`)、`nova-ede-panel`（面板 + `start-menu`/`quick-launch`/`taskbar`/`systray` 四个 applet、命中测试、级联放置）、`nova-ede-launch`（启动器模型：过滤、选择环绕、大小写不敏感匹配）、`nova-ede-tip`（悬浮提示 + 延迟）、`nova-ede-notifyd`（通知 daemon：有界队列、按 tick 过期、`app|summary|body` 线格式）、`nova-ede-about`（About 对话框内容）。桌面渲染沿用 NovaOS 的矢量字体/无贴图管线，**零像素图**。
+- **桌面 shell 重写**（`user/apps/src/bin/desktop-shell.rs`):`DesktopLayer`(.desktop 驱动图标列，含选择高亮）、`Panel`（NovaOS 彗星 emblem Start 按钮、快捷启动区、任务栏芯片、右侧 EDE 标记）、Start 菜单（comet 头部 + "NovaOS EDE" + `EDE, reborn in Rust` 标语 + 应用列表 + GPL 页脚）、通知气泡、About 对话框；窗口改为从图标列右侧开始（内核级联原点默认 48——m6.rs 测试钉住该值；桌面启动模式由 main.rs 以 `set_spawn_origin_x(176)` 右移，**不再覆盖图标**，测试模式与 safe terminal 保持 48)；桌面 shell 获得 `/` 的 `READ` scope(.desktop 文件读取修复）；根 filesystem 在启动时播种 4 个 `terminal/files/editor/widgets.desktop` 与 `.ede/panel.conf` / `.ede/desktop.conf`(`/home/nova/Desktop`)。
+- **修复的真实 bug**：`.desktop` 文件解析缓冲用 48 字节页大小截断（`Exec=terminal` 被裁成 `E`)——图标列空白；改为 1024 字节缓冲后解析成功（`scanned 4 icons`)。桌面 shell 无 scope grant 导致 `list_at` 全失败 → 赋予 READ。窗口级联原点导致图标不可点/不可见 → 迁移到 x=176。
+- **启动菜单**："Desktop (EDE)"（`nova-boot-menu`,Boot0001 标签）。
+- **验收（QEMU,VNC/QMP)**:`/` 菜单 EDE、桌面图标列（Terminal/Files/Editor/Widgets)、Start 菜单打开/关闭（comet 头部+NovaOS EDE+应用项+About 入口）、面板（彗星 Start + Nova 字标 + 三栏快捷启动 + 四芯片任务栏 + 右侧 EDE 徽章）、图标单击选择/再次点击启动（→ 新 terminal 窗口）、图标列不被窗口覆盖、`-smp 1/4` 均启动、safe-terminal 回归正常。
+- **Gates**:fmt、clippy `-D warnings`、host 测试（含新 crate 的 17 个单元测试）、`cargo xtask test --timeout 240`、裸机构建 —— 全绿。
+
 ### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
 
 - **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。

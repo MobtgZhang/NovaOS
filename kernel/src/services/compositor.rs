@@ -73,6 +73,12 @@ const BACKGROUND_GREEN: u8 = 24;
 const BACKGROUND_BLUE: u8 = 28;
 
 /// The first surface's default position.
+///
+/// Test mode and the safe terminal cascade applications from here; the
+/// desktop shell asks for a different origin (see
+/// [`CompositorService::set_spawn_origin_x`]), because it reserves the
+/// leftmost 176 pixels for the icon column and cascaded windows must never
+/// cover the icons a user is trying to click.
 const DEFAULT_X: i64 = 48;
 const DEFAULT_Y: i64 = 48;
 /// The cascade step for a newly created surface.
@@ -158,6 +164,9 @@ pub struct CompositorService {
     /// The arrow cell drawn last time, in output pixels — the region that
     /// must be repainted to erase the old arrow when it moves.
     last_cursor: Option<DamageRect>,
+    /// The x origin the next cascaded surface is placed at. 48 by default;
+    /// the desktop boot mode moves it right of the icon column.
+    spawn_origin_x: i64,
 }
 
 impl CompositorService {
@@ -171,6 +180,7 @@ impl CompositorService {
             frame_count: 0,
             pointer_moved: false,
             last_cursor: None,
+            spawn_origin_x: DEFAULT_X,
         }
     }
 
@@ -183,6 +193,15 @@ impl CompositorService {
         self.frame_count = 0;
         self.pointer_moved = false;
         self.last_cursor = None;
+        self.spawn_origin_x = DEFAULT_X;
+    }
+
+    /// Ask future surfaces to cascade from a different x origin.
+    ///
+    /// The desktop shell calls this during boot to push the cascade past
+    /// the icon column; tests and the safe terminal keep the default.
+    pub fn set_spawn_origin_x(&mut self, x: i64) {
+        self.spawn_origin_x = x;
     }
 
     /// The surface with `id`.
@@ -255,7 +274,9 @@ impl CompositorService {
             width,
             height,
             stride: width.checked_mul(4).unwrap_or(0),
-            x: DEFAULT_X.saturating_add(index.saturating_mul(DEFAULT_X_STEP)),
+            x: self
+                .spawn_origin_x
+                .saturating_add(index.saturating_mul(DEFAULT_X_STEP)),
             y: DEFAULT_Y.saturating_add(index.saturating_mul(DEFAULT_Y_STEP)),
             z: self.next_z,
             serial: 0,

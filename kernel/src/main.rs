@@ -227,6 +227,15 @@ pub unsafe fn boot_after_stack_switch() -> ! {
         Some(nova_boot::BootMode::Tests) => "test",
         _ => "unknown",
     };
+    if matches!(boot_info.boot_mode(), Some(nova_boot::BootMode::Desktop)) {
+        // The EDE desktop reserves the leftmost 176 pixels for the icon
+        // column; cascade application windows to the right of it.
+        // SAFETY: `services::init` published the state; nothing has taken a
+        // borrow yet, and this is the single-threaded boot path.
+        unsafe {
+            services::state().compositor.set_spawn_origin_x(176);
+        }
+    }
     let seed = services::fs::SystemSeed {
         cpu_count: boot_info.processor_count() as u32,
         usable_memory: boot_info.usable_bytes(),

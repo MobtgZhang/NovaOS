@@ -85,6 +85,13 @@ nova-ui = { workspace = true }
 nova-user = { workspace = true }
 nova-graphic = { workspace = true }
 nova-desktop = { workspace = true }
+nova-edelib = { workspace = true }
+nova-ede-about = { workspace = true }
+nova-ede-desktop = { workspace = true }
+nova-ede-launch = { workspace = true }
+nova-ede-notifyd = { workspace = true }
+nova-ede-panel = { workspace = true }
+nova-ede-tip = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

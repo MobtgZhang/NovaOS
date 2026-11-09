@@ -36,6 +36,13 @@ version = "0.1.0"
 dependencies = [
  "nova-abi",
  "nova-desktop",
+ "nova-ede-about",
+ "nova-ede-desktop",
+ "nova-ede-launch",
+ "nova-ede-notifyd",
+ "nova-ede-panel",
+ "nova-ede-tip",
+ "nova-edelib",
  "nova-fs",
  "nova-graphic",
  "nova-ipc",
@@ -81,6 +88,43 @@ dependencies = [
 
 [[package]]
 name = "nova-desktop-server"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-about"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-desktop"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-launch"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-notifyd"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-panel"
+version = "0.1.0"
+dependencies = [
+ "nova-ui",
+]
+
+[[package]]
+name = "nova-ede-tip"
+version = "0.1.0"
+
+[[package]]
+name = "nova-edelib"
 version = "0.1.0"
 
 [[package]]

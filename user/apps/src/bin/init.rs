@@ -21,7 +21,7 @@ const HOME: Rights = Rights::READ.union(Rights::WRITE);
 /// services: the widgets demo takes its slot, and the thread pool is sized for
 /// exactly the services in this list.
 const DESKTOP_SERVICES: &[Service] = &[
-    ("desktop-shell", None),
+    ("desktop-shell", Some(("/", Rights::READ))),
     ("file-server", None),
     ("console-server", None),
     ("shell", Some(("/", HOME))),

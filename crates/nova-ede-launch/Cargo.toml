@@ -1,0 +1,20 @@
+[package]
+name = "nova-ede-launch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Rust port of EDE's ede-launch: keyboard-driven application launcher model (no_std, host-testable)"
+
+[lib]
+bench = false
+
+[dependencies]
+nova-edelib = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"

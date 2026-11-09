@@ -120,7 +120,7 @@ struct MenuItem {
 const MENU_ITEMS: &[MenuItem] = &[
     MenuItem {
         key: '1',
-        label: "Desktop",
+        label: "Desktop (EDE)",
         desc: "Enter the desktop (default)",
         boot_mode: BootMode::Desktop.code(),
     },

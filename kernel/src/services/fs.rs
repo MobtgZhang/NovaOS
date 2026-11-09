@@ -445,7 +445,7 @@ impl FileServer {
     /// is decorative; a shell that browses `/` sees the system, not a mock of
     /// one.
     pub fn seed_default_layout(&mut self, seed: SystemSeed) {
-        const DIRECTORIES: [&[u8]; 16] = [
+        const DIRECTORIES: [&[u8]; 20] = [
             b"/system",
             b"/system/services",
             b"/system/runtime",
@@ -455,6 +455,8 @@ impl FileServer {
             b"/tmp",
             b"/var",
             b"/var/log",
+            b"/var/run",
+            b"/var/run/notify",
             b"/home",
             b"/media",
             b"/dev",
@@ -462,6 +464,8 @@ impl FileServer {
             b"/EFI",
             b"/EFI/NovaOS",
             b"/home/nova",
+            b"/home/nova/Desktop",
+            b"/home/nova/.ede",
         ];
         for path in DIRECTORIES {
             // Already present means the layout is already assembled, which is
@@ -550,6 +554,36 @@ impl FileServer {
         self.seed_file(
             b"/home/nova/notes.txt",
             b"Notes for the default user.\n\nEdit me with the desktop editor; the file persists across launches.\n",
+        );
+
+        // The desktop icons: EDE drives its desktop from `.desktop` files,
+        // so the shell reads them from here rather than hardcoding positions
+        // or commands. The contents are fixed at build time; a user whose
+        // desktop shows different icons is editing these files, or adding
+        // more of them, exactly as EDE would have them do.
+        self.seed_file(
+            b"/home/nova/Desktop/terminal.desktop",
+            b"[Desktop Entry]\nType=Application\nName=Terminal\nExec=terminal\nIcon=utilities-terminal\nComment=NovaOS terminal\n",
+        );
+        self.seed_file(
+            b"/home/nova/Desktop/files.desktop",
+            b"[Desktop Entry]\nType=Application\nName=Files\nExec=file-manager\nIcon=system-file-manager\nComment=Browse and manage files\n",
+        );
+        self.seed_file(
+            b"/home/nova/Desktop/editor.desktop",
+            b"[Desktop Entry]\nType=Application\nName=Editor\nExec=editor\nIcon=accessories-text-editor\nComment=Edit a file\n",
+        );
+        self.seed_file(
+            b"/home/nova/Desktop/widgets.desktop",
+            b"[Desktop Entry]\nType=Application\nName=Widgets\nExec=widgets-demo\nIcon=preferences-desktop\nComment=novagraph widget showcase\n",
+        );
+        self.seed_file(
+            b"/home/nova/.ede/panel.conf",
+            b"[Panel]\napplets=start-menu,quick-launch,taskbar,systray\nheight=32\n",
+        );
+        self.seed_file(
+            b"/home/nova/.ede/desktop.conf",
+            b"[Desktop]\nwallpaper=nova-deep-sea\nicons=terminal,files,editor,widgets\n",
         );
     }
 

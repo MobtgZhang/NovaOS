@@ -22,6 +22,13 @@ members = [
     "crates/nova-graphic",
     "crates/nova-desktop-server",
     "crates/nova-desktop",
+    "crates/nova-edelib",
+    "crates/nova-ede-desktop",
+    "crates/nova-ede-launch",
+    "crates/nova-ede-panel",
+    "crates/nova-ede-about",
+    "crates/nova-ede-notifyd",
+    "crates/nova-ede-tip",
     "crates/nova-desktop-server",
     "tools/xtask",
     "user/nova-rt",
@@ -82,6 +89,13 @@ nova-ui = { path = "crates/nova-ui" }
 nova-graphic = { path = "crates/nova-graphic" }
 nova-desktop-server = { path = "crates/nova-desktop-server" }
 nova-desktop = { path = "crates/nova-desktop" }
+nova-edelib = { path = "crates/nova-edelib" }
+nova-ede-desktop = { path = "crates/nova-ede-desktop" }
+nova-ede-launch = { path = "crates/nova-ede-launch" }
+nova-ede-panel = { path = "crates/nova-ede-panel" }
+nova-ede-about = { path = "crates/nova-ede-about" }
+nova-ede-notifyd = { path = "crates/nova-ede-notifyd" }
+nova-ede-tip = { path = "crates/nova-ede-tip" }
 nova-user = { path = "crates/nova-user" }
 
 # Bare-metal kernel profile.
