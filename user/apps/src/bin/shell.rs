@@ -10,10 +10,11 @@ use nova_user;
 const HELP: &str = "commands: help ls cat echo ps pwd cd whoami id su chmod chown exit clear";
 
 const ASCII_LOGO: &[&str] = &[
-    r"  _   _  ____   __  ___  __  ____",
-    r" | \ | |/ __ \ /  \/ _ \|  \/  _ \",
-    r" |  \| |  ___ | | | | | | .  . | | | | | | (_) |",
-    r" |_|\\  | |_| ||_| |_| |_||_||_/ ||_|",
+    r"#   #   ###   #   #   ###    ###    ####",
+    r"##  #  #   #  #   #  #   #  #   #  #",
+    r"# # #  #   #  #   #  #####  #   #   ###",
+    r"#  ##  #   #   # #   #   #  #   #      #",
+    r"#   #   ###     #    #   #   ###   ####",
     "",
 ];
 
