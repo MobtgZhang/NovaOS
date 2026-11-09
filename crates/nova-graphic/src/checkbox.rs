@@ -45,7 +45,31 @@ impl Widget for QCheckBox {
         canvas.fill_rect(br, Colour::PANEL.0);
         canvas.stroke_rect(br, Colour::BORDER.0);
         if self.checked {
-            canvas.draw_text(br.x + 2, br.y, "✓", Colour::HIGHLIGHT.0, None);
+            // A checkmark cannot rely on the font: the embedded GUI faces
+            // carry ASCII and GB2312, not U+2713. Plotted as 1-px cells
+            // along the two diagonals of the box.
+            const PATTERN: [(u32, u32); 8] = [
+                (2, 5),
+                (3, 6),
+                (4, 7),
+                (5, 6),
+                (6, 5),
+                (7, 4),
+                (8, 3),
+                (9, 2),
+            ];
+            let ox = br.x as u32;
+            let oy = br.y as u32;
+            for &(dx, dy) in &PATTERN {
+                let px = ox + dx;
+                let py = oy + dy;
+                if px < ox + br.width && py < oy + br.height {
+                    canvas.fill_rect(
+                        nova_ui::Rect::new(px as i32, py as i32, 1, 1),
+                        Colour::HIGHLIGHT.0,
+                    );
+                }
+            }
         }
         canvas.draw_text(
             br.x + br.width as i32 + 6,

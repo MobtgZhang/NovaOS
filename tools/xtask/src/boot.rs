@@ -59,13 +59,14 @@ pub const APP_NAMES: &[&str] = &[
     "terminal",
     "editor",
     "file-manager",
+    "widgets-demo",
 ];
 
 /// Build a bounded `NOVAFS1` archive from named ELF files.
 pub fn build_initramfs(directory: &Path) -> Result<Vec<u8>, String> {
     const HEADER_SIZE: usize = 64;
     const NAME_LIMIT: usize = 31;
-    const MAX_FILES: usize = 8;
+    const MAX_FILES: usize = 16;
 
     if APP_NAMES.len() > MAX_FILES {
         return Err(format!("too many initramfs entries: {}", APP_NAMES.len()));

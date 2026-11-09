@@ -263,9 +263,17 @@ pub unsafe fn boot_after_stack_switch() -> ! {
     unsafe { drivers::init() };
 
     if let Some(archive) = crate::boot::initramfs() {
-        if crate::initramfs::Archive::parse(archive).is_ok() {
-            if let Err(error) = crate::services::process::start_init_image(b"init") {
-                klog!(Level::Error, "init: failed with error {}", error as i64);
+        match crate::initramfs::Archive::parse(archive) {
+            Ok(_) => {
+                if let Err(error) = crate::services::process::start_init_image(b"init") {
+                    klog!(Level::Error, "init: failed with error {}", error as i64);
+                }
+            }
+            Err(reason) => {
+                // Without init there is no userland at all; a silent skip
+                // presents as a black QEMU that never fails, so the reason is
+                // reported with the same weight as a spawn failure.
+                klog!(Level::Error, "initramfs: parse failed: {}", reason);
             }
         }
     }

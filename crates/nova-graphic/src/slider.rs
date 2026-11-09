@@ -62,8 +62,11 @@ impl Widget for QSlider {
         } = e.kind
             && self.rect.contains(x, y)
         {
-            let rel = (x - self.rect.x).max(0) as u32;
-            self.value = rel.saturating_mul(100).min(self.rect.w) / self.rect.w.max(1);
+            let rel = (x - self.rect.x).max(0) as u64;
+            // rel * 100 can overflow a u32 for a very wide track, so the
+            // product is formed in u64 before the division.
+            let pct = rel.saturating_mul(100) / u64::from(self.rect.w.max(1));
+            self.value = u32::try_from(pct.min(100)).unwrap_or(100);
             return true;
         }
         false

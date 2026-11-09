@@ -272,6 +272,22 @@ pub unsafe fn init() {
                 "input: PS/2 controller command was not accepted"
             );
         }
+
+        // Turn on mouse *data reporting* as well: 0xA8 only makes the aux
+        // port visible, it does not make the device stream. The controller
+        // command 0xD4 routes the next data byte to the mouse, and 0xF4 is
+        // the mouse's "enable data reporting" command. Without this the
+        // PS/2 mouse never sends a packet, and the cursor is dead while
+        // every keyboard key works. The mouse ACKs with 0xFA; a controller
+        // that does not answer is logged, not treated as a boot failure.
+        if write_command(0xD4) && input_buffer_clear() {
+            // SAFETY: the aux data port is the mouse command channel and
+            // the input buffer was just confirmed clear.
+            unsafe { outb(DATA_PORT, 0xF4) };
+            klog!(Level::Info, "input: PS/2 mouse data reporting enabled");
+        } else {
+            klog!(Level::Warn, "input: PS/2 mouse did not accept 0xF4");
+        }
     }
 }
 
@@ -305,7 +321,20 @@ pub unsafe fn poll() -> usize {
         // focused window's pointer.
         if port_byte.from_mouse {
             let packet = unsafe { MOUSE_PACKET.get() };
+            // The only command ever sent to the aux device is 0xF4 (enable
+            // data reporting), whose ACK is 0xFA. An 0xFA that arrives at a
+            // packet boundary is always that ACK and can never start a
+            // packet; consuming it here keeps the three-byte framing
+            // intact for every byte after it. A mid-packet 0xFA is left
+            // alone — framing resyncs on the next three-byte boundary.
+            if port_byte.byte == 0xFA && packet.index == 0 {
+                klog!(Level::Debug, "mouse: dropping stray 0xFA (0xF4 ACK)");
+                continue;
+            }
             if let Some(decoded) = packet.feed(port_byte.byte) {
+                // Update the absolute position first, then route it: the
+                // compositor's hit test and the on-screen arrow both read
+                // the same cell.
                 mouse_move(decoded.dx, decoded.dy);
                 let _btn = decoded.buttons;
                 // Route pointer through service; let GUI apps react to clicks.
@@ -314,6 +343,9 @@ pub unsafe fn poll() -> usize {
                     parts
                         .input
                         .route_pointer(i64::from(mx), i64::from(my), _btn, parts.compositor);
+                // Pointer motion is a frame with something to show: paint it.
+                parts.compositor.note_pointer_moved();
+                routed += 1;
             }
             continue;
         }

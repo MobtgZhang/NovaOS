@@ -63,6 +63,7 @@ fn write_cwd_prompt(session: &Session) {
     let _ = console::write_str(user);
     let _ = console::write_str("@");
     let _ = console::write_str(nova_user::HOSTNAME);
+    let _ = console::write_str(":");
     let _ = console::write_bytes(session.cwd());
     let _ = console::write_str("> ");
 }

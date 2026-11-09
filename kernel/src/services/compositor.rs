@@ -149,6 +149,11 @@ pub struct CompositorService {
     next_id: u32,
     next_z: u32,
     frame_count: u64,
+    /// Whether the pointer moved since the last presented frame. A cursor
+    /// has no backing surface, so its motion cannot ride the damage path:
+    /// the only way to show the arrow at its new cell (and not leave one at
+    /// the old cell) is to repaint the frame.
+    pointer_moved: bool,
 }
 
 impl CompositorService {
@@ -160,6 +165,7 @@ impl CompositorService {
             next_id: 1,
             next_z: 1,
             frame_count: 0,
+            pointer_moved: false,
         }
     }
 
@@ -170,6 +176,7 @@ impl CompositorService {
         self.next_id = 1;
         self.next_z = 1;
         self.frame_count = 0;
+        self.pointer_moved = false;
     }
 
     /// The surface with `id`.
@@ -203,9 +210,18 @@ impl CompositorService {
         self.frame_count
     }
 
-    /// Whether any surface has pending content.
+    /// Whether any surface has pending content, or the pointer moved.
     pub fn frame_pending(&self) -> bool {
-        self.surfaces.iter().flatten().any(|surface| surface.dirty)
+        self.pointer_moved || self.surfaces.iter().flatten().any(|surface| surface.dirty)
+    }
+
+    /// Mark that the pointer moved since the last frame.
+    ///
+    /// Called by the input path on every completed mouse packet. The next
+    /// `present()` repaints the desktop so the arrow lands at its new cell
+    /// and erases its old one.
+    pub fn note_pointer_moved(&mut self) {
+        self.pointer_moved = true;
     }
 
     /// Create a surface.
@@ -550,11 +566,12 @@ impl CompositorService {
         };
         let _ = mode;
 
-        let full = self
-            .surfaces
-            .iter()
-            .flatten()
-            .any(|surface| surface.full && surface.has_buffer());
+        let full = self.pointer_moved
+            || self
+                .surfaces
+                .iter()
+                .flatten()
+                .any(|surface| surface.full && surface.has_buffer());
 
         if full {
             display::clear(BACKGROUND_RED, BACKGROUND_GREEN, BACKGROUND_BLUE)?;
@@ -563,6 +580,7 @@ impl CompositorService {
             self.draw_damage()?;
         }
 
+        self.pointer_moved = false;
         for surface in self.surfaces.iter_mut().flatten() {
             surface.dirty = false;
             surface.full = false;

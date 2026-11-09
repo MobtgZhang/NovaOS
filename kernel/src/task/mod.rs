@@ -92,7 +92,7 @@ pub const KERNEL_STACK_SIZE: usize = 16 * 1024;
 ///
 /// Bounded because the pool is static. A thread that cannot be created fails
 /// loudly rather than silently overwriting a live thread's stack.
-pub const MAX_THREADS: usize = 8;
+pub const MAX_THREADS: usize = 12;
 
 /// The number of general-purpose registers in a resume block.
 pub const GPR_COUNT: usize = 15;

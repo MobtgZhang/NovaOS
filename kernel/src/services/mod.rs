@@ -97,7 +97,7 @@ pub const SERVICE_NET: u32 = 5;
 /// A task is a process: it owns one capability table and one scope set. The
 /// bound is a compile-time constant because the tables are inline, and every
 /// task's table costs the kernel about sixty kilobytes of static memory.
-pub const MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = 12;
 
 /// Maximum number of threads the kernel tracks for the per-thread slots.
 ///

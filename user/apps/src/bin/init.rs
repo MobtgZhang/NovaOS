@@ -17,8 +17,9 @@ const HOME: Rights = Rights::READ.union(Rights::WRITE);
 
 /// The desktop boot mode: every boot service starts.
 ///
-/// `echo-server` is packaged for the M3 IPC suites but is not one of the six
-/// boot services, because a seventh child would hit the quota.
+/// `echo-server` is packaged for the M3 IPC suites but is not one of the boot
+/// services: the widgets demo takes its slot, and the thread pool is sized for
+/// exactly the services in this list.
 const DESKTOP_SERVICES: &[Service] = &[
     ("file-server", None),
     ("console-server", None),
@@ -28,6 +29,7 @@ const DESKTOP_SERVICES: &[Service] = &[
     ("editor", Some(("/home", HOME))),
     // The file manager browses; it never writes.
     ("file-manager", Some(("/", Rights::READ))),
+    ("widgets-demo", None),
 ];
 
 /// The safe-terminal boot mode: only the services a terminal session needs.

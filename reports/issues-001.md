@@ -367,32 +367,6 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 
 ---
 
-## 13. 用户系统 / Safe Terminal / 桌面 — 当前状态（2026-11-09）
-
-### 13.1 Safe Terminal（boot mode 2）〔部分修复（2026-11-09）〕**Medium**
-
-- **现状**：从 Desktop 菜单或 ESP marker（`desktop` / `safe` / `test`）选择 Safe Terminal 时，内核先把屏幕清成黑底，静默所有 kernel log（dispatch `drivers::screen::set_quiet(true)`），仅用户态输出走屏幕——显示的就是 NovaOS ASCII logo + `novaos login:` 提示符。ASCII 以矢量字体在 Iosevka 中 antialias 写黑屏上，**像素字体已完全移除**（§5.6）。
-- **登录/账户**：shell 启动后要求输入用户名与密码（不回显）。当前签名了两个账户：
-  - `root` / 密码 `root`（uid 0、gid 0）
-  - `zhang` / 密码 `zhang`（uid 1000、gid 1000）
-  密码使用 FNV-1a/64 哈希校验（不是加密强度哈希，但对 VNC 会话的威胁模型够用）。`crates/nova-user` 是新 crate，host 可测。
-- **文件系统权限**：`nova-fs` 的每个 inode 增加了 `owner`/`group`/`mode`（9 位 `rwx`），owner 位默认 `0`，dir 0o755、file 0o644；`stat` 输出 `rwx` 串；`ls -l` 显示 owner/group/size + 权限字串。`chmod`/`chown` 命令通过 shell 路由：`chmod` 要 root 或文件 owner，`chown` 要 root。
-- **交互**：cwd 追踪到 `user@novaos<x>` 格式，`cd`、`pwd`、`ls`、`ls -l`、`cat`、`echo`、`ps`、`whoami`、`id`、`su` 全部实现并实测通过。
-- **Safe Terminal 实测（QEMU + vncdotool 注入键盘事件）**：以 `root` 身份登录、运行 `cd /docs`、`pwd`、`cat readme.txt`、`cd ..`、`pwd`、`chmod 600 /hello.txt`、`chown 1000 /docs/readme.txt`、`ls -l /`、`ls -l /docs`、`su zhang`、切回密码 `zhang` 登录并执行命令，全部正常工作（密码不回显、权限检查正确、`id`、`whoami` 依次输出 root@uid=0 zhang@uid=1000）。
-- **当前不足**：PS/2 键盘映射登记在 `kernel/src/drivers/input.rs`（framebuffer ASCII 渲染路径缺失），目前只在 kernel console 中为 `read()` 写入缓冲；Safe Terminal 的输入走键盘映射到 stdin ring `kernel/src/stdin.rs`，支持 US 键盘布局（shift 跟踪）、退格、回车、Tab。中文输入未做。
-
-### 13.2 桌面、鼠标指针、nova-graphic（2026-11-09）〔进度中〕
-
-- **PS/2 鼠标**：`drivers/input.rs` 同时识别 0x60 端口的 KB/MS 数据字节（状态端口 bit 5 区分），汇编 3 字节 mouse packet（flags/dx/dy），用 `i8 as i16` 符号扩展。绝对坐标保存在静态 `MOUSE_POS`，以 `(0,0)` 初始、每次 poll 更新基于鼠标增量（dy 在屏幕坐标系为反向）。
-- **鼠标指针**：`services/compositor.rs::present()` 末端画一个简单箭头（黑色 + 白色填充）。每帧呈现后光标出现在桌面上。
-- **nova-graphic crate**（`crates/nova-graphic`）：以 Qt6 为参照的 widget 库：
-  - `Widget` trait：`rect()` / `set_rect()` / `draw(&Canvas)` / `on_event(&Event) -> bool`；rect 是公共 `Rect{x,y,w,h}`，所有 widget 是 value、可复制、不需要 alloc；
-  - 当前实现：`QPushButton`、`QCheckBox`、`QRadioButton`、`QLineEdit`（含 Normal/Password echo）、`QSlider`、`QProgressBar`、`QListWidget`、`QLabel`、`VBox`（占位容器）、`Colour`、`Event`/`MouseButton`/`MouseState`。
-  - 每个 widget 都是 host 可测的（`nova-graphic` 在 HOST_PACKAGES 中）。
-- **当前不足**：`nova-graphic` 仅提供原语；没有把它接到 `init` 的桌面启动序列——也就是说用户不会看到 QPushButton/QCheckBox 渲染出来的窗口。widget 的键盘处理没接入，只处理鼠标点击；窗口的标题/关闭按钮没有做。VNC 注入验证了鼠标指针在 Desktop 模式确实出现。
-
----
-
 ## 10. "运行于现代硬件"差距清单（按优先级）
 
 **P0 —— 不做就在真机第一分钟内失败**
@@ -435,3 +409,49 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 按子系统计，**能力/IPC/策略层是真实资产**（宿主可测、原子转移、撤销级联），**内存/SMP/中断/驱动是四根必须重做的柱子**，文件系统和网络是"可用但脆弱"的原型。四根柱子的共同主题是同一件事：*这个内核的所有正确性论证都建立在"单 CPU + 中断屏蔽 + 一切有界"上，而现代硬件恰好逐条否定这三个前提*。修复顺序建议严格按 §10 P0 的 1→5 推进，因为它们互为前提（内存上限不解，堆无从谈起；ACPI 不解，SMP 无从谈起；per-CPU 不解，中断驱动无从谈起）。
 
 **进度（2026-11-08）**：四根柱子中内存（P0-1）已完全重建，SMP（P0-3/4 的唤醒链）与巨页（P0-2 的引导侧/HHDM）已打通验证——三者互相咬合（ACPI 枚举喂给 SMP，巨页喂给引导，位图喂给一切），修复过程中发现"看似无关的 5 个测试失败"实为帧位图两处计数/扫描 bug。剩余关键路径：per-CPU 抽象（P0-4 收尾）→ 中断模型（P0-5）→ 驱动现代化（P1）。经验教训值得留下：**宿主可测的子系统和真机行为之间的鸿沟，只能靠"宿主复现→定位→内核修复"的循环来闭合**——本次帧位图 bug 在宿主上 20 分钟复现，在 QEMU 里消耗了整个调试会话。
+
+## 13. 用户系统 / Safe Terminal / 桌面 — 当前状态（2026-11-09）
+
+### 13.1 Safe Terminal（boot mode 2）〔部分修复（2026-11-09）〕**Medium**
+
+- **现状**：从 Desktop 菜单或 ESP marker（`desktop` / `safe` / `test`）选择 Safe Terminal 时，内核先把屏幕清成黑底，静默所有 kernel log（dispatch `drivers::screen::set_quiet(true)`），仅用户态输出走屏幕——显示的就是 NovaOS ASCII logo + `novaos login:` 提示符。ASCII 以矢量字体在 Iosevka 中 antialias 写黑屏上，**像素字体已完全移除**（§5.6）。
+- **登录/账户**：shell 启动后要求输入用户名与密码（不回显）。当前签名了两个账户：
+  - `root` / 密码 `root`（uid 0、gid 0）
+  - `zhang` / 密码 `zhang`（uid 1000、gid 1000）
+  密码使用 FNV-1a/64 哈希校验（不是加密强度哈希，但对 VNC 会话的威胁模型够用）。`crates/nova-user` 是新 crate，host 可测。
+- **文件系统权限**：`nova-fs` 的每个 inode 增加了 `owner`/`group`/`mode`（9 位 `rwx`），owner 位默认 `0`，dir 0o755、file 0o644；`stat` 输出 `rwx` 串；`ls -l` 显示 owner/group/size + 权限字串。`chmod`/`chown` 命令通过 shell 路由：`chmod` 要 root 或文件 owner，`chown` 要 root。
+- **交互**：cwd 追踪到 `user@novaos:<path>` 格式（2026-11-09 起含冒号，`root@novaos:/docs>`），`cd`、`pwd`、`ls`、`ls -l`、`cat`、`echo`、`ps`、`whoami`、`id`、`su` 全部实现并实测通过。
+- **Safe Terminal 实测（QEMU + vncdotool 注入键盘事件）**：以 `root` 身份登录、运行 `cd /docs`、`pwd`、`cat readme.txt`、`cd ..`、`pwd`、`chmod 600 /hello.txt`、`chown 1000 /docs/readme.txt`、`ls -l /`、`ls -l /docs`、`su zhang`、切回密码 `zhang` 登录并执行命令，全部正常工作（密码不回显、权限检查正确、`id`、`whoami` 依次输出 root@uid=0 zhang@uid=1000）。
+- **当前不足**：PS/2 键盘映射登记在 `kernel/src/drivers/input.rs`（framebuffer ASCII 渲染路径缺失），目前只在 kernel console 中为 `read()` 写入缓冲；Safe Terminal 的输入走键盘映射到 stdin ring `kernel/src/stdin.rs`，支持 US 键盘布局（shift 跟踪）、退格、回车、Tab。中文输入未做。
+
+### 13.2 桌面、鼠标指针、nova-graphic（2026-11-09）〔进度中〕
+
+- **PS/2 鼠标**：`drivers/input.rs` 同时识别 0x60 端口的 KB/MS 数据字节（状态端口 bit 5 区分），汇编 3 字节 mouse packet（flags/dx/dy），用 `i8 as i16` 符号扩展。绝对坐标保存在静态 `MOUSE_POS`，以 `(0,0)` 初始、每次 poll 更新基于鼠标增量（dy 在屏幕坐标系为反向）。
+- **鼠标指针**：`services/compositor.rs::present()` 末端画一个简单箭头（黑色 + 白色填充）。每帧呈现后光标出现在桌面上。
+- **nova-graphic crate**（`crates/nova-graphic`）：以 Qt6 为参照的 widget 库：
+  - `Widget` trait：`rect()` / `set_rect()` / `draw(&Canvas)` / `on_event(&Event) -> bool`；rect 是公共 `Rect{x,y,w,h}`，所有 widget 是 value、可复制、不需要 alloc；
+  - 当前实现：`QPushButton`、`QCheckBox`、`QRadioButton`、`QLineEdit`（含 Normal/Password echo）、`QSlider`、`QProgressBar`、`QListWidget`、`QLabel`、`VBox`（占位容器）、`Colour`、`Event`/`MouseButton`/`MouseState`。
+  - 每个 widget 都是 host 可测的（`nova-graphic` 在 HOST_PACKAGES 中）。
+- **当前不足**：`nova-graphic` 仅提供原语；没有把它接到 `init` 的桌面启动序列——也就是说用户不会看到 QPushButton/QCheckBox 渲染出来的窗口。widget 的键盘处理没接入，只处理鼠标点击；窗口的标题/关闭按钮没有做。VNC 注入验证了鼠标指针在 Desktop 模式确实出现。
+
+### 13.3 Safe Terminal / 桌面交互修复与 widgets-demo 验收（2026-11-09）〔已修复〕**Medium**
+
+- **桌面黑屏死锁（已 root-cause 修复）**：Qt/GUI 代码合入后桌面 boot 静默停在 `sched: cpu 0 idle, no runnable thread`，串口无任何错误。根因：initramfs 从 8 个 ELF 增至 9 个（新增 widgets-demo），而内核 `initramfs::Archive` 的 `MAX_FILES` 硬上限为 8 → `Archive::parse` 返回 `Err("initramfs-file-quota")`，而 `main.rs` 把该错误吞掉，init 根本未被启动 → 零可运行线程 → 永久 idle 黑屏。**修复**：`MAX_FILES` 提升至 16；`main.rs` 在 parse 失败时打印 `initramfs: parse failed: {reason}`（与 spawn 失败同级的 ERROR，不再静默）。
+- **spawn 配额**：widgets-demo 作为第 8 个服务启动时撞上 `services::MAX_TASKS = 8`（capability table 64 KiB/个 + thread pool `MAX_THREADS = 8`）→ `process: no task slot`。**修复**：`MAX_TASKS` 8→12、`MAX_THREADS` 8→12（每 CPU 12 个线程槽）。
+- **PS/2 鼠标从未上报**：init 只发了控制器级 `0xA8`（aux enable），**没有**给鼠标发 `0xD4 + 0xF4`（data reporting enable + ACK）→ 鼠标一辈子不发 packet（键盘正常）。另：鼠标 ACK 字节 `0xFA` 被当成 packet 第 0 字节 → 三字节 packet 框架永久错位。**修复**：init 序列补 `0xD4/0xF4`；poll 路径在 packet index=0 时丢弃裸 `0xFA`（本系统唯一发送的 aux 命令是 `0xF4`，0xFA 永远是它的 ACK）；packet 组装后**真正调用 `mouse_move()`**（之前重构时丢失 → MOUSE_POS 永远为初始值 (512,384)）。
+- **指针不重绘**：纯鼠标移动不 dirty 任何 surface → `present()` 早退 → 箭头永远停在出厂坐标。**修复**：CompositorService 增加 `pointer_moved` 标记（`note_pointer_moved()`，input 路径在 packet 完成时置位），`frame_pending()` 纳入该标志 → 下一帧**强制 full repaint**（背景+全部 surface+箭头）→ 箭头位置实时更新、无残影。
+- **VNC 鼠标绝对坐标不可达**：QEMU VNC 送绝对指针事件，PS/2 鼠标仅能收相对增量 → `vncdotool move` 对 guest 无效（光标原地不动，这是此前"鼠标可活动"结论的真实来源：从未真正移动，只是静态可见）。正确做法：QMP `input-send-event` 以 `rel` 轴发送相对增量；点击 = `btn left` 按下/释放。验证脚本据此重写，并对所有交互做了逐步截图比对。
+- **nova-graphic 修复**：
+  - `QSlider`：原式 `(rel * 100).min(w) / w` 先把 `rel*100` 钳到 `w` 再除 → 任何点击只能得到 `1%`。改为宽端 `u64` 乘法后除、钳到 100。
+  - `VBox`：从占位静态数组 `[Option<&'static mut dyn Widget>; 8]` 重写为**真实垂直布局引擎**（`layout(rect, heights, out)`、`child_rect`、`natural_height`），host 可测 + 5 个单元测试（进入 HOST_PACKAGES）。
+  - `QLineEdit`：新增 `draw_with_text()`（caller 持有 buffer，widget 不持有字符串）；Password echo 用 `*` 逐字符掩码（依赖 face 里有 `*`，无需 `•`）；caret 跟随可见文本宽度。
+  - `QCheckBox`：原 `✓`（U+2713）不在嵌入字体子集内 → 勾选后无任何视觉反馈。改为**矢量折线打勾**（8 个 1-px cell 的折线）。
+  - `QRadioButton` 组合互斥修复：原 `enforce_radio_exclusivity` 永远优先 light → 点击 Dark 后 dark 立刻被清零、永远切换不了主题。改为**上升沿检测**（哪个按钮刚被按下就清掉另一个），符合 Qt 互斥语义；键盘路径同步修复。
+- **widgets-demo**（`user/apps/src/bin/widgets-demo.rs`）：桌面新增 Qt6 风格 showcase 窗口，**8 个控件全部实装且实测可用**（VNC/QMP 注入事件逐项验收）：名字 `QLineEdit`（字符输入+密码掩码/明文切换+caret）、`QCheckBox`（Show password as text）、`QRadioButton` 组（Light/Dark theme，互斥，整窗换肤）、`QSlider`（Volume，拖动/点击置位）、`QProgressBar`（跟随 slider 填充）、`QListWidget`（Apple/Banana/Cherry/Durian，点选高亮）、`QPushButton` OK/Cancel（OK 累计 submits 并刷新状态栏）、`QLabel` 标题、`VBox` 布局全部行（row）按布局引擎定位。状态栏实时显示 `volume=…% item=… light|dark submits=…`。焦点：点击任意控件即聚焦（Tab 循环焦点，LineEdit 中 Enter 提交、Backspace 删除）。
+- **验收（1024×768 QEMU，-smp 4）**：窗口启动后位于整窗最前；`"nova"` 输入进 QLineEdit（密码掩码 `****`），点 checkbox 切换为明文可见；点 Dark theme 整窗换深色并互斥取消 Light；list 点 Cherry → `item=Cherry`；slider 点 86% 处 → `volume=86% ` + 进度条同步；OK → `submits=1`；全程鼠标箭头位置实时跟随 rel 事件且不留残影。
+- **Safe Terminal 回归**：同一镜像 safe-terminal 模式正常（ASCII logo、login、root@novaos:/> 提示符、pwd）。
+- **Gates**：`fmt`、`clippy --workspace --exclude nova-kernel nova-rt nova-apps nova-boot-menu --all-targets -D warnings`、host tests（70 suits / 251 cases）、`nova-graphic` host 单元测试、`cargo xtask test --timeout 240`、裸机构建 —— 全部绿。
+
+---
+
+---

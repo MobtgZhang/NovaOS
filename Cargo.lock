@@ -36,6 +36,7 @@ version = "0.1.0"
 dependencies = [
  "nova-abi",
  "nova-fs",
+ "nova-graphic",
  "nova-ipc",
  "nova-protocols",
  "nova-ui",

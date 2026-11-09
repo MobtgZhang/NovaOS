@@ -5,7 +5,12 @@ use crate::logger::Level;
 
 pub const MAGIC: &[u8; 8] = b"NOVAFS1\0";
 pub const HEADER_SIZE: usize = 64;
-pub const MAX_FILES: usize = 8;
+/// The maximum number of ELFs the archive may hold.
+///
+/// Each slot is a parsed pointer pair into the loaded initramfs; the boot
+/// services plus future desktop apps fit in sixteen, and the nightly kernel
+/// test suite asserts the archive it builds stays well under it.
+pub const MAX_FILES: usize = 16;
 
 #[derive(Clone, Copy)]
 pub struct Entry {
