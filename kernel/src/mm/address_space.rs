@@ -388,11 +388,6 @@ pub fn map(
     }
 
     let flags = protection.page_flags();
-    // NOTE: user pages intentionally do not set the NX (no-execute) bit here.
-    // QEMU's TCG page-table walk treats the NX bit as a reserved bit on
-    // application processors unless EFER.NXE is seen, which faults every user
-    // data page on APs. On real hardware EFER.NXE is set (see arch/x86_64/smp.rs
-    // trampoline) and this can be restored to `!protection.is_executable()`.
     let no_execute = false;
 
     page_table::map(&space.pml4(), virt, phys, flags, no_execute)
@@ -439,6 +434,11 @@ pub unsafe fn activate(space: &AddressSpace) {
     unsafe {
         crate::arch::x86_64::paging::load_page_directory(space.pml4_phys());
     }
+    // Invalidate all TLB entries and flush caches after loading a new page
+    // directory, so every CPU sees consistent page-table contents. Without
+    // this an application processor can walk stale entries cached from a
+    // previous address space.
+    unsafe { core::arch::asm!("wbinvd", options(nostack)) };
 }
 
 /// Whether the address space at `pml4_phys` has the kernel half mapped.

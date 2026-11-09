@@ -84,6 +84,18 @@ pub fn write(fd: u64, buffer: &[u8]) -> Result<u64, SyscallError> {
     Ok(result as u64)
 }
 
+/// Read bytes from standard input (the serial console, fd 0).
+///
+/// Never blocks: returns as soon as the UART receive buffer is empty, with
+/// the count of bytes actually read (possibly zero).
+pub fn read(fd: u64, buffer: &mut [u8]) -> Result<u64, SyscallError> {
+    let result = call(
+        Syscall(nova_abi::nr::READ.number()).raw(),
+        [fd, buffer.as_ptr() as u64, buffer.len() as u64, 0, 0, 0],
+    )?;
+    Ok(result as u64)
+}
+
 /// Exit the calling thread with `status`.
 ///
 /// Never returns: the kernel does not schedule the thread again, so there is

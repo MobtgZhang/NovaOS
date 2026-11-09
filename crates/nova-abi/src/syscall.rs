@@ -199,6 +199,15 @@ pub mod nr {
     /// carries no authority, and `init` needs the answer before it decides
     /// which services to start.
     pub const GET_BOOT_MODE: Syscall = Syscall(23);
+
+    /// Read bytes from standard input (the serial console).
+    ///
+    /// Arguments: `fd`, `buffer`, `length`. `fd` must be `0` (stdin). The
+    /// kernel copies bytes from the UART receive buffer into `buffer` and
+    /// returns the number of bytes read (possibly zero if none are pending;
+    /// the call never blocks). This is the only user input path in v0.1.0.
+    pub const READ: Syscall = Syscall(24);
+
     /// Every number currently assigned.
     pub const ALL: &[Syscall] = &[
         GET_VERSION,
@@ -217,6 +226,7 @@ pub mod nr {
         THREAD_EXIT,
         CANCEL_WAIT,
         WRITE,
+        READ,
         PROCESS_EXEC,
         ENDPOINT_CREATE,
         ENDPOINT_PEER_CREATE,
@@ -254,6 +264,7 @@ pub mod nr {
             PROCESS_STATUS => "process_status",
             SERVICE_REQUEST => "service_request",
             GET_BOOT_MODE => "get_boot_mode",
+            READ => "read",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

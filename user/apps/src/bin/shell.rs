@@ -101,11 +101,55 @@ pub extern "C" fn main() -> i64 {
     let _ = console::write_str(HELP);
     let _ = console::write_str("\r\n");
 
-    for command in ["help", "ls", "cat /hello.txt", "echo NovaOS", "ps"] {
-        run(command);
-    }
-
+    // Interactive command loop: print a prompt, read a line from the serial
+    // console, and run it. The `nova:>` prompt is shown so the user always
+    // knows the shell is waiting for input. Input is read one byte at a time
+    // with the non-blocking READ syscall; the shell yields between polls so
+    // other threads keep running.
+    let mut line = [0u8; 64];
     loop {
-        nova_apps::yield_now();
+        let _ = console::write_str("nova:> ");
+        let mut len = 0usize;
+        loop {
+            if len >= line.len() {
+                let _ = console::write_str("\r\n");
+                break;
+            }
+            let mut chunk = [0u8; 1];
+            match nova_apps::syscall::read(0, &mut chunk) {
+                Ok(n) if n > 0 => {
+                    let byte = chunk[0];
+                    match byte {
+                        b'\r' | b'\n' => {
+                            let _ = console::write_str("\r\n");
+                            break;
+                        }
+                        b'\x08' | b'\x7f' => {
+                            // Backspace: erase the last character.
+                            if len > 0 {
+                                len -= 1;
+                                let _ = console::write_str("\x08 \x08");
+                            }
+                        }
+                        byte if byte >= 0x20 && byte < 0x7f => {
+                            line[len] = byte;
+                            len += 1;
+                            let _ = console::write_bytes(&[byte]);
+                        }
+                        _ => {}
+                    }
+                }
+                // No input pending: yield and poll again.
+                _ => {
+                    nova_apps::yield_now();
+                }
+            }
+        }
+
+        if len == 0 {
+            continue;
+        }
+
+        run(core::str::from_utf8(&line[..len]).unwrap_or(""));
     }
 }

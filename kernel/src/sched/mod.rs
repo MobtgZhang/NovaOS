@@ -595,11 +595,39 @@ pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
     unsafe { reap_exited_threads_for_cpu(cpu) };
     let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
     let Some(next_id) = next_id else {
-        klog!(Level::Error, "sched: cpu {cpu} no runnable thread");
-        // In the single-user test configuration every service has been started
-        // and the test harness's suites have all run, so "no runnable thread"
-        // means the run is over rather than a kernel panic.
-        unsafe { crate::arch::exit(crate::EXIT_SUCCESS) }
+        // No runnable thread: every user thread is blocked (on IPC, a timer,
+        // or similar). As a last resort, scan every thread record for one
+        // that is not exited and make it runnable — this covers the case
+        // where the policy state machine and the thread pool disagree about
+        // who is runnable. Failing that, halt and wait for an interrupt.
+        let fallback = unsafe { state_for_cpu(cpu).scheduler.any_non_exited() };
+        if let Some(id) = fallback {
+            // The policy queue is empty but a live thread exists (the
+            // scheduler's `current` slot was cleared by a earlier block and
+            // never restored). Put it back on the runnable queue and let the
+            // scheduler pick it normally.
+            let _ = unsafe { state_for_cpu(cpu).scheduler.unblock(id) };
+            let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
+            if let Some(next_id) = next_id {
+                unsafe { resume_thread_for_cpu(cpu, next_id) };
+            } else {
+                klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
+                loop {
+                    unsafe { core::arch::asm!("hlt", options(nostack)) };
+                    if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
+                        unsafe { resume_thread_for_cpu(cpu, id) };
+                    }
+                }
+            }
+        } else {
+            klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nostack)) };
+                if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
+                    unsafe { resume_thread_for_cpu(cpu, id) };
+                }
+            }
+        }
     };
 
     unsafe { resume_thread_for_cpu(cpu, next_id) }
@@ -636,6 +664,11 @@ unsafe fn resume_thread_for_cpu(cpu: usize, next_id: u32) -> ! {
         task::update_thread_for_cpu(cpu, slot, next);
 
         address_space::activate(&next.space);
+        // Flush and invalidate all caches after loading a new page table so
+        // every CPU sees the same page-table contents. Without this an
+        // application processor can walk stale page-table entries cached from
+        // a previous address space, faulting on perfectly valid user pages.
+        unsafe { core::arch::asm!("wbinvd", options(nostack)) };
         crate::arch::x86_64::gdt::set_privilege_stack_for_cpu(cpu, task::kernel_stack_top(&next));
         // The syscall stub switches stacks through this CPU's per-CPU cell,
         // not through a global TSS: two processors must be able to enter
@@ -712,7 +745,6 @@ pub unsafe fn yield_current_and_switch_for_cpu(cpu: usize) -> ! {
     // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
     unsafe {
         let next_id = state_for_cpu(cpu).scheduler.yield_current();
-        klog!(Level::Info, "debug: cpu {cpu} yield next={next_id:?}");
 
         if next_id.is_none() && state_for_cpu(cpu).scheduler.current().is_none() {
             klog!(

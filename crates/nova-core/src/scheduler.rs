@@ -226,6 +226,18 @@ impl Scheduler {
         }
     }
 
+    /// Any thread identifier that is not exited, for use as a last-resort
+    /// resume target when the policy queue and the thread pool disagree.
+    pub fn any_non_exited(&self) -> Option<u32> {
+        self.threads.iter().flatten().find_map(|record| {
+            if record.state != ThreadState::Exited {
+                Some(record.id)
+            } else {
+                None
+            }
+        })
+    }
+
     /// The current thread followed by the runnable queue, in order.
     pub fn runnable_order(&self) -> impl Iterator<Item = u32> + '_ {
         core::iter::once(self.current)
@@ -383,19 +395,24 @@ impl Scheduler {
 
     /// Mark `id` as runnable again, putting it at the back of the queue.
     pub fn unblock(&mut self, id: u32) -> Result<(), SchedError> {
-        let record = self.thread_mut(id).ok_or(SchedError::UnknownThread)?;
-
-        if record.state == ThreadState::Exited {
+        // Check the state and queue membership while borrows are disjoint, then
+        // take the mutable borrow to mutate.
+        let (is_exited, state, in_queue) = {
+            let record = self.thread(id).ok_or(SchedError::UnknownThread)?;
+            (
+                record.state == ThreadState::Exited,
+                record.state,
+                self.queue_contains(id),
+            )
+        };
+        if is_exited {
             return Err(SchedError::InvalidState);
         }
-
-        if record.state == ThreadState::Runnable {
-            // Already queued. Enqueueing it again would put the same thread in
-            // the queue twice, and it would then run twice per round — which
-            // looks exactly like a scheduler that loses track of its threads.
-            return Ok(());
+        if state == ThreadState::Runnable && in_queue {
+            return Ok(()); // Already queued: no need to enqueue twice.
         }
 
+        let record = self.thread_mut(id).ok_or(SchedError::UnknownThread)?;
         record.state = ThreadState::Runnable;
         self.enqueue(id)?;
 

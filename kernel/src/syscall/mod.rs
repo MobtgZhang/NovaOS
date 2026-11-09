@@ -440,6 +440,10 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         return boot_mode();
     }
 
+    if number == nova_abi::nr::READ.number() as u64 {
+        return read_from_console(args);
+    }
+
     stage_outgoing_payload(number, args);
 
     let context = crate::task::current_syscall_context();
@@ -659,7 +663,11 @@ fn process_exec(args: [u64; 6]) -> Outcome {
     match crate::services::process::exec_image(&name[..args[1] as usize], grant) {
         Ok(handle) => Outcome {
             result: nova_core::syscall::SyscallResult::Value(handle.raw() as i64),
-            effect: nova_core::syscall::ThreadEffect::Continue,
+            // Yield immediately: the new child is now runnable, and the caller
+            // goes to the back of the queue. Without this the caller could
+            // keep the CPU while every child blocks on IPC, leaving the
+            // scheduler with no runnable thread.
+            effect: nova_core::syscall::ThreadEffect::Yield,
         },
         Err(code) => failed(code),
     }
@@ -871,6 +879,82 @@ fn write_to_console(args: [u64; 6]) -> Outcome {
         }
 
         copied += chunk;
+    }
+
+    Outcome {
+        result: nova_core::syscall::SyscallResult::Value(copied as i64),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    }
+}
+
+/// Read bytes from the serial console (stdin, file descriptor 0).
+///
+/// Never blocks: returns as soon as the UART receive buffer is empty, with
+/// the count of bytes actually read (possibly zero).
+fn read_from_console(args: [u64; 6]) -> Outcome {
+    const MAX_READ: u64 = 4096;
+
+    let fd = args[0];
+    let pointer = args[1];
+    let length = args[2];
+
+    if fd != 0 {
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Failed(nova_abi::ErrorCode::Denied),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
+    let length = length.min(MAX_READ);
+    if length == 0 {
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Value(0),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
+    // Even a short console read must resolve only pages the caller owns.
+    if user_range(pointer, length).is_err() {
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Failed(nova_abi::ErrorCode::Invalid),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
+    let space = crate::task::current_thread_space();
+    let Some(space) = space else {
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Failed(nova_abi::ErrorCode::BadHandle),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    };
+
+    let page_size = crate::arch::ADDRESS_SPACE.page_size;
+    let console = crate::arch::console();
+    let mut copied: u64 = 0;
+
+    while copied < length {
+        let Some(byte) = console.try_recv() else {
+            break; // No more input pending.
+        };
+
+        let address = pointer + copied;
+        let offset = address & (page_size - 1);
+        let Some(phys) =
+            crate::mm::address_space::translate_user(&space, address & !(page_size - 1))
+        else {
+            break; // Buffer runs past mapped memory: return what we have.
+        };
+
+        // SAFETY: the frame backs `address` in this space; the direct map
+        // covers it and the write is a single byte.
+        unsafe {
+            crate::mm::direct_map::phys_to_virt(phys + offset)
+                .cast::<u8>()
+                .write(byte);
+        }
+
+        copied += 1;
     }
 
     Outcome {

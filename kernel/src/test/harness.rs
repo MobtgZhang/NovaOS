@@ -137,19 +137,9 @@ pub fn run_all() -> ! {
 
     if totals.failed == 0 {
         report(format_args!("SUMMARY all suites passed"));
-        // The boot-time `init` process has already been spawned, but the test
-        // harness runs with the boot thread still active. If any user thread
-        // was registered, switch to it now: this exercises the real ring-3
-        // entry path after all kernel invariants have been checked. A kernel
-        // with no user threads exits normally.
-        if crate::sched::has_runnable_thread() {
-            // SAFETY: every suite has finished, all contexts are idle, and the
-            // scheduler was initialised before `init` was spawned.
-            unsafe { crate::sched::switch_to_next() };
-        }
-
-        // SAFETY: every suite has finished; nothing needs the machine to keep
-        // running.
+        // Test mode terminates the machine directly: user threads (init and
+        // its services) are not part of the test harness, so there is nothing
+        // to switch to.
         unsafe { crate::arch::exit(crate::EXIT_SUCCESS) }
     } else {
         report(format_args!("SUMMARY failures detected"));

@@ -173,7 +173,7 @@ cp "$OVMF_VARS_TEMPLATE" "$VARS_COPY"
 set -- \
     -machine q35,accel=tcg \
     -cpu qemu64 \
-    -smp 1 \
+    -smp 4 \
     -m "${MEMORY_MIB}M" \
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE" \
     -drive "if=pflash,format=raw,unit=1,file=$VARS_COPY" \
