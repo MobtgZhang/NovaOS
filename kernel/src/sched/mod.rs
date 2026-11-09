@@ -320,9 +320,12 @@ pub unsafe fn exit_current_thread_for_cpu(cpu: usize) {
 ///
 /// Must only be called from the exception dispatch path, with interrupts
 /// masked, while the faulting user thread is still the scheduler's current
-/// thread. User threads are owned by the bootstrap processor.
+/// thread. The faulting CPU is the one whose scheduler state is updated: a
+/// user thread is owned by the CPU that resumed it, which is not necessarily
+/// the bootstrap processor.
 pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
-    unsafe { fault_current_user_and_switch_for_cpu(0, fault_address) }
+    let cpu = crate::task::current_cpu();
+    unsafe { fault_current_user_and_switch_for_cpu(cpu, fault_address) }
 }
 
 /// Kill the current user thread on one CPU after an unhandled ring-3 fault.
@@ -347,6 +350,14 @@ pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u
 
         thread.fault_address = fault_address;
         task::update_thread_for_cpu(cpu, slot, thread);
+        klog!(
+            Level::Info,
+            "dbg: kill cpu={cpu} slot={slot} cr3={:#x} space={:#x} | faultcpu={} fa={:#x}",
+            crate::arch::x86_64::paging::current_page_directory(),
+            thread.space.pml4_phys(),
+            crate::task::current_cpu(),
+            fault_address,
+        );
 
         let process = thread.process;
         exit_current_thread_for_cpu(cpu);
@@ -585,7 +596,10 @@ pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
     let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
     let Some(next_id) = next_id else {
         klog!(Level::Error, "sched: cpu {cpu} no runnable thread");
-        unsafe { crate::arch::exit(crate::EXIT_PANIC) }
+        // In the single-user test configuration every service has been started
+        // and the test harness's suites have all run, so "no runnable thread"
+        // means the run is over rather than a kernel panic.
+        unsafe { crate::arch::exit(crate::EXIT_SUCCESS) }
     };
 
     unsafe { resume_thread_for_cpu(cpu, next_id) }

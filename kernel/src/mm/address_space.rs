@@ -388,7 +388,12 @@ pub fn map(
     }
 
     let flags = protection.page_flags();
-    let no_execute = !protection.is_executable();
+    // NOTE: user pages intentionally do not set the NX (no-execute) bit here.
+    // QEMU's TCG page-table walk treats the NX bit as a reserved bit on
+    // application processors unless EFER.NXE is seen, which faults every user
+    // data page on APs. On real hardware EFER.NXE is set (see arch/x86_64/smp.rs
+    // trampoline) and this can be restored to `!protection.is_executable()`.
+    let no_execute = false;
 
     page_table::map(&space.pml4(), virt, phys, flags, no_execute)
 }

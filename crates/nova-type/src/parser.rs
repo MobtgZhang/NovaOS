@@ -60,6 +60,21 @@ pub struct Outline {
     pub contour_ends: [u16; MAX_CONTOURS],
     /// How many contours are populated.
     pub contours: usize,
+    /// Decode scratch: per-point flags, carried between the flag and the
+    /// coordinate passes of one `simple_outline` call.
+    ///
+    /// The scratch lives *here* rather than on the parser's stack on
+    /// purpose: the arrays total ~4.6 KiB, and the kernel renders glyphs
+    /// from deep call chains (a log line inside a syscall path) on 16 KiB
+    /// kernel stacks. Stack scratch there overflowed the stack into
+    /// whatever frame lay below it — a user page, once a page table.
+    pub flags: [u8; MAX_OUTLINE_POINTS],
+    /// Decode scratch: the x pass's accumulated coordinates.
+    pub xs: [i32; MAX_OUTLINE_POINTS],
+    /// Decode scratch: the y pass's accumulated coordinates.
+    pub ys: [i32; MAX_OUTLINE_POINTS],
+    /// Decode scratch: the contour-end list, re-based at commit time.
+    pub ends: [u16; MAX_CONTOURS],
 }
 
 impl Outline {
@@ -72,6 +87,10 @@ impl Outline {
             count: 0,
             contour_ends: [0; MAX_CONTOURS],
             contours: 0,
+            flags: [0; MAX_OUTLINE_POINTS],
+            xs: [0; MAX_OUTLINE_POINTS],
+            ys: [0; MAX_OUTLINE_POINTS],
+            ends: [0; MAX_CONTOURS],
         }
     }
 }
@@ -480,9 +499,8 @@ impl<'a> Font<'a> {
         const ENDS_BASE: usize = 10;
 
         // Contour ends first: they name the byte layout that follows.
-        let mut ends = [0u16; MAX_CONTOURS];
         let mut last_end = 0usize;
-        for (contour, slot) in ends.iter_mut().enumerate().take(num_contours) {
+        for (contour, slot) in out.ends.iter_mut().enumerate().take(num_contours) {
             let end =
                 read_u16(slice, ENDS_BASE + contour * 2).ok_or(FontError::Truncated)? as usize;
             if end < last_end {
@@ -504,14 +522,13 @@ impl<'a> Font<'a> {
         let flags_base = ENDS_BASE + num_contours * 2 + 2 + instructions;
 
         // Flags: one byte per point, with a repeat-count compression the
-        // format defines. Decode into a small scratch of flags first.
-        let mut flags = [0u8; MAX_OUTLINE_POINTS];
+        // format defines. Decode into the outline's scratch first.
         let mut produced = 0usize;
         let mut cursor = flags_base;
         while produced < point_count {
             let flag = *slice.get(cursor).ok_or(FontError::Truncated)?;
             cursor += 1;
-            flags[produced] = flag;
+            out.flags[produced] = flag;
             produced += 1;
             if flag & 0x08 != 0 {
                 // Repeat: the next byte counts how many more get this flag.
@@ -519,7 +536,7 @@ impl<'a> Font<'a> {
                 cursor += 1;
                 for _ in 0..repeat {
                     if produced < point_count {
-                        flags[produced] = flag;
+                        out.flags[produced] = flag;
                         produced += 1;
                     }
                 }
@@ -530,10 +547,9 @@ impl<'a> Font<'a> {
         // either 0 (same as the previous point), one *unsigned* byte whose
         // sign the flag carries (bit set = positive), or two bytes signed —
         // chosen per point by flag bits 1/4 and 2/5.
-        let mut xs = [0i32; MAX_OUTLINE_POINTS];
         let mut x = 0i32;
         for point in 0..point_count {
-            let flag = flags[point];
+            let flag = out.flags[point];
             x += match (flag & 0x02, flag & 0x10) {
                 (0x02, 0x10) => {
                     let byte = *slice.get(cursor).ok_or(FontError::Truncated)?;
@@ -551,12 +567,11 @@ impl<'a> Font<'a> {
                     i32::from(read_i16(slice, cursor - 2).ok_or(FontError::Truncated)?)
                 }
             };
-            xs[point] = x;
+            out.xs[point] = x;
         }
-        let mut ys = [0i32; MAX_OUTLINE_POINTS];
         let mut y = 0i32;
         for point in 0..point_count {
-            let flag = flags[point];
+            let flag = out.flags[point];
             y += match (flag & 0x04, flag & 0x20) {
                 (0x04, 0x20) => {
                     let byte = *slice.get(cursor).ok_or(FontError::Truncated)?;
@@ -574,7 +589,7 @@ impl<'a> Font<'a> {
                     i32::from(read_i16(slice, cursor - 2).ok_or(FontError::Truncated)?)
                 }
             };
-            ys[point] = y;
+            out.ys[point] = y;
         }
 
         // Commit: the component's points append after whatever the
@@ -586,13 +601,13 @@ impl<'a> Font<'a> {
         }
         let base = out.count;
         for point in 0..point_count {
-            let (x, y) = placed.place(xs[point], ys[point]);
+            let (x, y) = placed.place(out.xs[point], out.ys[point]);
             out.x[base + point] = x;
             out.y[base + point] = y;
-            out.on_curve[base + point] = flags[point] & 0x01 != 0;
+            out.on_curve[base + point] = out.flags[point] & 0x01 != 0;
         }
         for contour in 0..num_contours {
-            out.contour_ends[out.contours + contour] = base as u16 + ends[contour];
+            out.contour_ends[out.contours + contour] = base as u16 + out.ends[contour];
         }
         out.count = base + point_count;
         out.contours += num_contours;
