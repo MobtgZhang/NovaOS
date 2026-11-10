@@ -1,0 +1,17 @@
+[package]
+name = "nova-ede-screensaver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+description = "Rust port of EDE's ede-screensaver-conf: the saver's timeout, lock policy and idle state machine"
+
+[dependencies]
+nova-edelib = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"

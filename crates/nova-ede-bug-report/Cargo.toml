@@ -1,0 +1,15 @@
+[package]
+name = "nova-ede-bug-report"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+description = "Rust port of EDE's ede-bug-report: the bug report form and its serialization, with no network and no embedded credentials"
+
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"

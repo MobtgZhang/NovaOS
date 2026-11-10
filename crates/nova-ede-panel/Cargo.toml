@@ -11,6 +11,7 @@ bench = false
 
 [dependencies]
 nova-ui = { workspace = true }
+nova-edelib = { workspace = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -34,7 +34,7 @@ pub mod log;
 
 pub use app::EdeApplication;
 pub use config::EdeConfig;
-pub use desktop_file::DesktopFile;
+pub use desktop_file::{DesktopFile, ExecArgs};
 pub use log::{EdeLog, Level};
 
 /// The conventional directory holding a user's EDE configuration, relative

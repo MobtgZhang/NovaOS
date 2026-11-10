@@ -88,6 +88,7 @@ nova-desktop = { workspace = true }
 nova-edelib = { workspace = true }
 nova-ede-about = { workspace = true }
 nova-ede-desktop = { workspace = true }
+nova-ede-desktop-conf = { workspace = true }
 nova-ede-launch = { workspace = true }
 nova-ede-notifyd = { workspace = true }
 nova-ede-panel = { workspace = true }

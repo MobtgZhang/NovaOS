@@ -40,11 +40,15 @@ use nova_protocols::input::{
 use nova_protocols::surface::{
     COMPOSITOR_OP_CONFIGURE, COMPOSITOR_OP_FRAME_DONE, COMPOSITOR_OP_MOVE, COMPOSITOR_OP_RAISE,
     CompositorConfigureRequest, CompositorFrameDoneRequest, CompositorMoveRequest,
-    CompositorRaiseRequest, PIXEL_FORMAT_XRGB8888, PixelFormat, SURFACE_CREATE_REPLY_SIZE,
-    SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE, SURFACE_OP_ATTACH, SURFACE_OP_COMMIT,
-    SURFACE_OP_CREATE, SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_RECT_SIZE,
-    SURFACE_REPLY_SIZE, SURFACE_VERSION, SurfaceAttachRequest, SurfaceCommitRequest,
-    SurfaceCreateRequest, SurfaceDamageRequest, SurfaceDestroyRequest, SurfaceRect,
+    CompositorRaiseRequest, PIXEL_FORMAT_XRGB8888, PixelFormat, SURFACE_ACTIVATE_REQUEST_SIZE,
+    SURFACE_CREATE_REPLY_SIZE, SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE,
+    SURFACE_LIST_REPLY_SIZE, SURFACE_LIST_REQUEST_SIZE, SURFACE_MINIMIZE_REQUEST_SIZE,
+    SURFACE_NAME_REPLY_SIZE, SURFACE_NAME_REQUEST_SIZE, SURFACE_OP_ACTIVATE, SURFACE_OP_ATTACH,
+    SURFACE_OP_COMMIT, SURFACE_OP_CREATE, SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_OP_LIST,
+    SURFACE_OP_MINIMIZE, SURFACE_OP_NAME, SURFACE_RECT_SIZE, SURFACE_REPLY_SIZE, SURFACE_VERSION,
+    SurfaceAttachRequest, SurfaceCommitRequest, SurfaceCreateRequest, SurfaceDamageRequest,
+    SurfaceDestroyRequest, SurfaceRect, WINDOW_FLAG_FOCUSED, WINDOW_FLAG_MINIMIZED,
+    WINDOW_LIST_PAGE, WINDOW_NAME_MAX,
 };
 
 use crate::syscall::{self, SyscallError};
@@ -348,6 +352,151 @@ pub fn compositor_raise(surface: u32) -> Result<(), ErrorCode> {
     reply_ok(&reply)
 }
 
+/// One window in the compositor's window list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WindowInfo {
+    /// The surface id — the window's identity.
+    pub id: u32,
+    /// The z-order rank; larger is nearer the front.
+    pub z: u32,
+    /// `WINDOW_FLAG_FOCUSED` / `WINDOW_FLAG_MINIMIZED` bits.
+    pub flags: u32,
+}
+
+impl WindowInfo {
+    /// Whether the window has keyboard focus.
+    pub const fn focused(self) -> bool {
+        self.flags & WINDOW_FLAG_FOCUSED != 0
+    }
+
+    /// Whether the window is minimized.
+    pub const fn minimized(self) -> bool {
+        self.flags & WINDOW_FLAG_MINIMIZED != 0
+    }
+}
+
+/// One page of the compositor's window list.
+#[derive(Clone, Copy, Debug)]
+pub struct WindowListPage {
+    /// How many entries this page carries (≤ [`WINDOW_LIST_PAGE`]).
+    pub count: usize,
+    /// How many windows exist in total — the caller pages until it
+    /// has seen this many.
+    pub total: usize,
+    /// The entries, in ascending z-order.
+    pub entries: [WindowInfo; WINDOW_LIST_PAGE],
+}
+
+/// Fetch one page of the window list, starting at `offset`.
+///
+/// This is the taskbar's inventory: every surface that has been on
+/// screen, with its focus and minimize state. Errors come back as the
+/// protocol's status reply, the same shape every other compositor
+/// operation uses.
+pub fn compositor_list(offset: u32) -> Result<WindowListPage, ErrorCode> {
+    let mut request = [0u8; SURFACE_LIST_REQUEST_SIZE];
+    request[0..2].copy_from_slice(&SURFACE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&SURFACE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&offset.to_le_bytes());
+    let mut reply = [0u8; SURFACE_LIST_REPLY_SIZE];
+    let length = service_request(SERVICE_COMPOSITOR, SURFACE_OP_LIST, &request, &mut reply)?;
+    reply_ok(&reply[..length])?;
+    if length < 16 {
+        return Err(ErrorCode::Invalid);
+    }
+    let count = read_u32(&reply, 8).ok_or(ErrorCode::Invalid)? as usize;
+    let total = read_u32(&reply, 12).ok_or(ErrorCode::Invalid)? as usize;
+    let mut entries = [WindowInfo {
+        id: 0,
+        z: 0,
+        flags: 0,
+    }; WINDOW_LIST_PAGE];
+    for (index, entry) in entries
+        .iter_mut()
+        .enumerate()
+        .take(count.min(WINDOW_LIST_PAGE))
+    {
+        let base = 16 + index * 12;
+        let (Some(id), Some(z), Some(flags)) = (
+            read_u32(&reply, base),
+            read_u32(&reply, base + 4),
+            read_u32(&reply, base + 8),
+        ) else {
+            return Err(ErrorCode::Invalid);
+        };
+        *entry = WindowInfo { id, z, flags };
+    }
+    Ok(WindowListPage {
+        count: count.min(WINDOW_LIST_PAGE),
+        total,
+        entries,
+    })
+}
+
+/// Read a window's title: the initramfs image name its owner task was
+/// started from. Writes it into `out` and returns the length; an
+/// unknown window is `BadHandle`.
+pub fn compositor_name(surface: u32, out: &mut [u8]) -> Result<usize, ErrorCode> {
+    let mut request = [0u8; SURFACE_NAME_REQUEST_SIZE];
+    request[0..2].copy_from_slice(&SURFACE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&SURFACE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&surface.to_le_bytes());
+    let mut reply = [0u8; SURFACE_NAME_REPLY_SIZE];
+    let length = service_request(SERVICE_COMPOSITOR, SURFACE_OP_NAME, &request, &mut reply)?;
+    reply_ok(&reply[..length])?;
+    if length < 12 {
+        return Err(ErrorCode::Invalid);
+    }
+    let name_len = read_u32(&reply, 8).ok_or(ErrorCode::Invalid)? as usize;
+    let take = name_len.min(WINDOW_NAME_MAX).min(out.len());
+    if 12 + take > length {
+        return Err(ErrorCode::Invalid);
+    }
+    out[..take].copy_from_slice(&reply[12..12 + take]);
+    Ok(take)
+}
+
+/// Activate a window: raise it, focus it, and un-minimize it — the
+/// taskbar's click on a background window.
+pub fn compositor_activate(surface: u32) -> Result<(), ErrorCode> {
+    let mut request = [0u8; SURFACE_ACTIVATE_REQUEST_SIZE];
+    request[0..2].copy_from_slice(&SURFACE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&SURFACE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&surface.to_le_bytes());
+    let mut reply = [0u8; SURFACE_REPLY_SIZE];
+    let length = service_request(
+        SERVICE_COMPOSITOR,
+        SURFACE_OP_ACTIVATE,
+        &request,
+        &mut reply,
+    )?;
+    if length != SURFACE_REPLY_SIZE {
+        return Err(ErrorCode::Invalid);
+    }
+    reply_ok(&reply)
+}
+
+/// Minimize or restore a window — the taskbar's click on the focused
+/// window.
+pub fn compositor_minimize(surface: u32, minimized: bool) -> Result<(), ErrorCode> {
+    let mut request = [0u8; SURFACE_MINIMIZE_REQUEST_SIZE];
+    request[0..2].copy_from_slice(&SURFACE_VERSION.major.to_le_bytes());
+    request[2..4].copy_from_slice(&SURFACE_VERSION.minor.to_le_bytes());
+    request[4..8].copy_from_slice(&surface.to_le_bytes());
+    request[8..12].copy_from_slice(&(minimized as u32).to_le_bytes());
+    let mut reply = [0u8; SURFACE_REPLY_SIZE];
+    let length = service_request(
+        SERVICE_COMPOSITOR,
+        SURFACE_OP_MINIMIZE,
+        &request,
+        &mut reply,
+    )?;
+    if length != SURFACE_REPLY_SIZE {
+        return Err(ErrorCode::Invalid);
+    }
+    reply_ok(&reply)
+}
+
 /// Reconfigure a surface's size and scale.
 pub fn compositor_configure(
     surface: u32,
@@ -614,42 +763,6 @@ pub fn map_memory(buffer: CapHandle, size: u64) -> Result<*mut u8, ErrorCode> {
 pub fn destroy_object(buffer: CapHandle) -> Result<(), ErrorCode> {
     syscall::call(nr::OBJECT_DESTROY.raw(), [buffer.raw(), 0, 0, 0, 0, 0]).map_err(error_code)?;
     Ok(())
-}
-
-/// Fill a mapped XRGB8888 buffer with one colour word.
-pub fn fill_word(buffer: *mut u8, pixels: usize, word: u32) {
-    for index in 0..pixels {
-        let offset = index * 4;
-        // SAFETY: the caller mapped at least `pixels * 4` bytes of this buffer
-        // into its own address space, and the write stays inside that region.
-        unsafe {
-            let target = buffer.add(offset) as *mut u32;
-            *target = word;
-        }
-    }
-}
-
-/// Draw one rect of `word` pixels into a mapped buffer with a stride.
-pub fn fill_rect(
-    buffer: *mut u8,
-    stride: usize,
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
-    word: u32,
-) {
-    for row in y..y + height {
-        for column in x..x + width {
-            let offset = row * stride + column * 4;
-            // SAFETY: the surface was created with this stride and these
-            // dimensions, and the mapped buffer is large enough for both.
-            unsafe {
-                let target = buffer.add(offset) as *mut u32;
-                *target = word;
-            }
-        }
-    }
 }
 
 /// The XRGB8888 word for a colour.

@@ -19,13 +19,23 @@
 use core::cmp;
 
 /// The maximum number of sections a file may hold.
-pub const MAX_SECTIONS: usize = 16;
+///
+/// Sized for the config files that exist — `panel.conf` has one section,
+/// `desktop.conf` two, `ede-conf.conf` seven — and for the stack: this
+/// store is a value type that callers parse *on the stack*, so every
+/// section is frame pressure in a `no_std` program with a bounded user
+/// stack. Eight is generous; sixteen cost 320 KiB of frame.
+pub const MAX_SECTIONS: usize = 8;
 /// The maximum number of keys per section.
-pub const MAX_KEYS: usize = 64;
+pub const MAX_KEYS: usize = 16;
 /// The longest section name this parser keeps.
 pub const MAX_NAME: usize = 48;
 /// The longest value this parser keeps.
-pub const MAX_VALUE: usize = 256;
+///
+/// 128 bytes covers every value the EDE config files carry — an
+/// `applets=` list, an `Exec=` line, a wallpaper path — with room to
+/// spare; a longer value is clipped rather than trusted.
+pub const MAX_VALUE: usize = 128;
 
 /// One stored key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +62,16 @@ impl Key {
 
     fn value(&self) -> &[u8] {
         &self.value[..self.value_len]
+    }
+
+    /// The key name as text.
+    fn name_str(&self) -> &str {
+        core::str::from_utf8(self.name()).unwrap_or("")
+    }
+
+    /// The value as text.
+    fn value_str(&self) -> &str {
+        core::str::from_utf8(self.value()).unwrap_or("")
     }
 }
 
@@ -224,8 +244,14 @@ impl EdeConfig {
     }
 
     /// The value at `section`/`key` parsed as an unsigned integer.
+    ///
+    /// An empty or non-numeric value is `None`, never `Some(0)` — a blank
+    /// config line must not silently mean zero.
     pub fn get_u32(&self, section: &str, key: &str) -> Option<u32> {
         let value = self.get(section, key)?;
+        if value.is_empty() {
+            return None;
+        }
         let mut result: u32 = 0;
         for byte in value.bytes() {
             if !byte.is_ascii_digit() {
@@ -234,6 +260,68 @@ impl EdeConfig {
             result = result.checked_mul(10)?.checked_add((byte - b'0') as u32)?;
         }
         Some(result)
+    }
+
+    /// The value at `section`/`key` parsed as a signed integer.
+    /// Empty, non-numeric, or overflowing values are `None`.
+    pub fn get_i32(&self, section: &str, key: &str) -> Option<i32> {
+        let value = self.get(section, key)?;
+        if value.is_empty() {
+            return None;
+        }
+        let (negative, digits) = match value.as_bytes().first() {
+            Some(b'-') => (true, &value[1..]),
+            Some(b'+') => (false, &value[1..]),
+            Some(_) => (false, value),
+            None => return None,
+        };
+        if digits.is_empty() {
+            return None;
+        }
+        let mut result: i64 = 0;
+        for byte in digits.bytes() {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            result = result.checked_mul(10)?.checked_add((byte - b'0') as i64)?;
+        }
+        let signed = if negative { -result } else { result };
+        i32::try_from(signed).ok()
+    }
+
+    /// Whether the section is present at all.
+    pub fn has_section(&self, section: &str) -> bool {
+        let bytes = section.as_bytes();
+        self.sections
+            .iter()
+            .take(self.section_count)
+            .any(|candidate| candidate.name() == bytes)
+    }
+
+    /// Every section name, in file order.
+    pub fn section_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.sections
+            .iter()
+            .take(self.section_count)
+            .map(|section| core::str::from_utf8(section.name()).unwrap_or(""))
+    }
+
+    /// Iterate the `(key, value)` pairs of one section, in file order.
+    pub fn iter_keys(&self, section: &str) -> impl Iterator<Item = (&str, &str)> + '_ {
+        let bytes = section.as_bytes();
+        let index = self
+            .sections
+            .iter()
+            .take(self.section_count)
+            .position(|candidate| candidate.name() == bytes);
+        let found = index.and_then(|index| self.sections.get(index));
+        found.into_iter().flat_map(|section| {
+            section
+                .keys
+                .iter()
+                .take(section.key_count)
+                .map(|key| (key.name_str(), key.value_str()))
+        })
     }
 
     /// Write the configuration back out as an INI document.
@@ -339,5 +427,45 @@ broken line\n";
     fn keys_are_overridden_not_duplicated() {
         let config = EdeConfig::parse(b"[A]\nk=1\nk=2\n");
         assert_eq!(config.get("A", "k"), Some("2"));
+    }
+
+    #[test]
+    fn an_empty_value_is_not_zero() {
+        let config = EdeConfig::parse(b"[A]\nk=\n");
+        assert_eq!(config.get("A", "k"), Some(""));
+        assert_eq!(config.get_u32("A", "k"), None);
+    }
+
+    #[test]
+    fn signed_numbers_parse_with_their_sign() {
+        let config = EdeConfig::parse(b"[A]\nplus = +8\nminus = -300\njunk = 1x\nempty =\n");
+        assert_eq!(config.get_i32("A", "plus"), Some(8));
+        assert_eq!(config.get_i32("A", "minus"), Some(-300));
+        assert_eq!(config.get_i32("A", "junk"), None);
+        assert_eq!(config.get_i32("A", "empty"), None);
+    }
+
+    #[test]
+    fn an_overflowing_number_is_none() {
+        let config = EdeConfig::parse(b"[A]\nk=99999999999\n");
+        assert_eq!(config.get_u32("A", "k"), None);
+    }
+
+    #[test]
+    fn iter_keys_walks_a_section_in_order() {
+        let config = EdeConfig::parse(b"[Panel]\napplets=start-menu,clock\nheight=32\n");
+        assert!(config.has_section("Panel"));
+        assert!(!config.has_section("Nope"));
+        let pairs: [(&str, &str); 2] = {
+            let mut buffer = [("", ""); 2];
+            for (index, (key, value)) in config.iter_keys("Panel").enumerate() {
+                if index < 2 {
+                    buffer[index] = (key, value);
+                }
+            }
+            buffer
+        };
+        assert_eq!(pairs[0], ("applets", "start-menu,clock"));
+        assert_eq!(pairs[1], ("height", "32"));
     }
 }

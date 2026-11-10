@@ -583,7 +583,7 @@ impl FileServer {
         );
         self.seed_file(
             b"/home/nova/.ede/desktop.conf",
-            b"[Desktop]\nwallpaper=nova-deep-sea\nicons=terminal,files,editor,widgets\n",
+            b"[Desktop]\nwallpaper_use=true\nwallpaper=nova-deep-sea\nicons=terminal,files,editor,widgets\n",
         );
     }
 

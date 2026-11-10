@@ -29,6 +29,23 @@ members = [
     "crates/nova-ede-about",
     "crates/nova-ede-notifyd",
     "crates/nova-ede-tip",
+    "crates/nova-ede-session",
+    "crates/nova-ede-autostart",
+    "crates/nova-ede-bell",
+    "crates/nova-ede-keyboard",
+    "crates/nova-ede-preferred",
+    "crates/nova-ede-screensaver",
+    "crates/nova-ede-screen-lock",
+    "crates/nova-ede-timedate",
+    "crates/nova-ede-calc",
+    "crates/nova-ede-image-view",
+    "crates/nova-ede-help",
+    "crates/nova-ede-dialog",
+    "crates/nova-ede-conf",
+    "crates/nova-ede-desktop-conf",
+    "crates/nova-ede-tip-compiler",
+    "crates/nova-ede-crash",
+    "crates/nova-ede-bug-report",
     "crates/nova-desktop-server",
     "tools/xtask",
     "user/nova-rt",
@@ -96,6 +113,23 @@ nova-ede-panel = { path = "crates/nova-ede-panel" }
 nova-ede-about = { path = "crates/nova-ede-about" }
 nova-ede-notifyd = { path = "crates/nova-ede-notifyd" }
 nova-ede-tip = { path = "crates/nova-ede-tip" }
+nova-ede-session = { path = "crates/nova-ede-session" }
+nova-ede-autostart = { path = "crates/nova-ede-autostart" }
+nova-ede-bell = { path = "crates/nova-ede-bell" }
+nova-ede-keyboard = { path = "crates/nova-ede-keyboard" }
+nova-ede-preferred = { path = "crates/nova-ede-preferred" }
+nova-ede-screensaver = { path = "crates/nova-ede-screensaver" }
+nova-ede-screen-lock = { path = "crates/nova-ede-screen-lock" }
+nova-ede-timedate = { path = "crates/nova-ede-timedate" }
+nova-ede-calc = { path = "crates/nova-ede-calc" }
+nova-ede-image-view = { path = "crates/nova-ede-image-view" }
+nova-ede-help = { path = "crates/nova-ede-help" }
+nova-ede-dialog = { path = "crates/nova-ede-dialog" }
+nova-ede-conf = { path = "crates/nova-ede-conf" }
+nova-ede-desktop-conf = { path = "crates/nova-ede-desktop-conf" }
+nova-ede-tip-compiler = { path = "crates/nova-ede-tip-compiler" }
+nova-ede-crash = { path = "crates/nova-ede-crash" }
+nova-ede-bug-report = { path = "crates/nova-ede-bug-report" }
 nova-user = { path = "crates/nova-user" }
 
 # Bare-metal kernel profile.

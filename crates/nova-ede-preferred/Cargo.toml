@@ -1,0 +1,17 @@
+[package]
+name = "nova-ede-preferred"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-or-later"
+description = "Rust port of EDE's ede-preferred-applications: the default-application categories and their persistence"
+
+[dependencies]
+nova-edelib = { workspace = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "deny"

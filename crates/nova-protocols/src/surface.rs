@@ -49,6 +49,18 @@ pub const COMPOSITOR_OP_FRAME_DONE: u64 = 7;
 pub const COMPOSITOR_OP_MOVE: u64 = 8;
 pub const COMPOSITOR_OP_RAISE: u64 = 9;
 
+/// The desktop shell's window-management operations.
+///
+/// A panel needs to see the window list, activate a window, minimize it,
+/// and read its title — EWMH's `_NET_CLIENT_LIST` / `_NET_ACTIVE_WINDOW`
+/// / `_NET_WM_NAME` in miniature. These are stacking *requests*: they
+/// confer no capability over the target's buffer or input, and the
+/// compositor remains free to ignore them.
+pub const SURFACE_OP_LIST: u64 = 10;
+pub const SURFACE_OP_NAME: u64 = 11;
+pub const SURFACE_OP_ACTIVATE: u64 = 12;
+pub const SURFACE_OP_MINIMIZE: u64 = 13;
+
 /// Size of a surface-create request, in bytes.
 pub const SURFACE_CREATE_REQUEST_SIZE: usize = 20;
 
@@ -88,6 +100,43 @@ pub const COMPOSITOR_MOVE_REQUEST_SIZE: usize = 16;
 
 /// Size of a compositor-raise request, in bytes.
 pub const COMPOSITOR_RAISE_REQUEST_SIZE: usize = 8;
+
+/// Size of a window-list request (`version`, `offset`), in bytes.
+pub const SURFACE_LIST_REQUEST_SIZE: usize = 8;
+
+/// Size of a window-list reply, in bytes.
+///
+/// The inline payload is 64 bytes: a 16-byte header (`version`,
+/// `status`, `count`, `total`) plus four 12-byte entries (`id`, `z`,
+/// `flags`). A longer list pages through repeated requests, the same
+/// way the file service pages a directory.
+pub const SURFACE_LIST_REPLY_SIZE: usize = 64;
+
+/// How many window entries one list reply carries.
+pub const WINDOW_LIST_PAGE: usize = 4;
+
+/// Size of a window-name request (`version`, `surface`), in bytes.
+pub const SURFACE_NAME_REQUEST_SIZE: usize = 8;
+
+/// Size of a window-name reply, in bytes.
+///
+/// Header (`version`, `status`, `length`) plus up to 40 name bytes.
+pub const SURFACE_NAME_REPLY_SIZE: usize = 52;
+
+/// The longest window name a reply carries.
+pub const WINDOW_NAME_MAX: usize = 40;
+
+/// Size of a window-activate request (`version`, `surface`), in bytes.
+pub const SURFACE_ACTIVATE_REQUEST_SIZE: usize = 8;
+
+/// Size of a window-minimize request (`version`, `surface`, `flag`),
+/// in bytes.
+pub const SURFACE_MINIMIZE_REQUEST_SIZE: usize = 12;
+
+/// Flag bit: the surface has keyboard focus.
+pub const WINDOW_FLAG_FOCUSED: u32 = 0x1;
+/// Flag bit: the surface is minimized.
+pub const WINDOW_FLAG_MINIMIZED: u32 = 0x2;
 
 /// Size of a reply that carries only a status, in bytes.
 pub const SURFACE_REPLY_SIZE: usize = 12;
@@ -147,6 +196,10 @@ pub enum SurfaceOpcode {
     FrameDone,
     Move,
     Raise,
+    List,
+    Name,
+    Activate,
+    Minimize,
 }
 
 impl SurfaceOpcode {
@@ -162,6 +215,10 @@ impl SurfaceOpcode {
             SurfaceOpcode::FrameDone => COMPOSITOR_OP_FRAME_DONE,
             SurfaceOpcode::Move => COMPOSITOR_OP_MOVE,
             SurfaceOpcode::Raise => COMPOSITOR_OP_RAISE,
+            SurfaceOpcode::List => SURFACE_OP_LIST,
+            SurfaceOpcode::Name => SURFACE_OP_NAME,
+            SurfaceOpcode::Activate => SURFACE_OP_ACTIVATE,
+            SurfaceOpcode::Minimize => SURFACE_OP_MINIMIZE,
         }
     }
 
@@ -177,6 +234,10 @@ impl SurfaceOpcode {
             COMPOSITOR_OP_FRAME_DONE => Some(SurfaceOpcode::FrameDone),
             COMPOSITOR_OP_MOVE => Some(SurfaceOpcode::Move),
             COMPOSITOR_OP_RAISE => Some(SurfaceOpcode::Raise),
+            SURFACE_OP_LIST => Some(SurfaceOpcode::List),
+            SURFACE_OP_NAME => Some(SurfaceOpcode::Name),
+            SURFACE_OP_ACTIVATE => Some(SurfaceOpcode::Activate),
+            SURFACE_OP_MINIMIZE => Some(SurfaceOpcode::Minimize),
             _ => None,
         }
     }

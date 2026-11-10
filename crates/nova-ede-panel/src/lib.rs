@@ -38,6 +38,12 @@
 
 use nova_ui::{Canvas, Rect};
 
+pub mod settings;
+pub mod taskbar;
+
+pub use settings::{PanelSettings, Position};
+pub use taskbar::{TaskClick, TaskEntry, TaskbarModel};
+
 /// The panel's height in pixels.
 pub const PANEL_HEIGHT: u32 = 32;
 
@@ -70,6 +76,12 @@ pub enum Action {
     OpenStartMenu,
     /// Launch an application by name.
     Launch(&'static str),
+    /// Activate the window with this surface id.
+    Activate(u32),
+    /// Minimize the active window with this surface id.
+    Minimize(u32),
+    /// Show the panel after it was hidden by the hider.
+    ShowPanel,
 }
 
 /// A launchable chip in the panel.
@@ -141,6 +153,8 @@ pub enum Hit {
     QuickLaunch(usize),
     /// A taskbar chip at this index.
     Taskbar(usize),
+    /// The hider's grip.
+    Hider,
     /// Nothing was hit.
     Nothing,
 }
@@ -149,11 +163,26 @@ pub enum Hit {
 #[derive(Clone, Copy)]
 pub struct Panel {
     width: u32,
+    /// The panel's height in pixels — `panel.conf`'s `height` key.
+    height: u32,
     quick_launch: [Chip; 3],
     taskbar: [Chip; 6],
     start_bounds: Rect,
     tray_bounds: Rect,
     chips_placed: bool,
+    /// The compositor's window list, when the shell has published one.
+    windows: TaskbarModel,
+    /// Whether the panel is expanded (true) or collapsed to its grip.
+    hider_open: bool,
+    /// Where the dynamic taskbar chips sit once laid out.
+    window_chips: [Rect; taskbar::MAX_WINDOWS],
+    window_chip_width: i32,
+    /// Which applets `panel.conf` asked for. All four default on; an
+    /// empty applet list means "whatever the config did not say".
+    show_start: bool,
+    show_quick: bool,
+    show_taskbar: bool,
+    show_tray: bool,
 }
 
 impl Panel {
@@ -166,12 +195,60 @@ impl Panel {
         };
         Self {
             width,
+            height: PANEL_HEIGHT,
             quick_launch: [EMPTY; 3],
             taskbar: [EMPTY; 6],
             start_bounds: Rect::new(0, 0, START_WIDTH as u32, PANEL_HEIGHT),
             tray_bounds: Rect::new(0, 0, TRAY_WIDTH as u32, PANEL_HEIGHT),
             chips_placed: false,
+            windows: TaskbarModel::new(),
+            hider_open: true,
+            window_chips: [Rect::new(0, 0, 0, 0); taskbar::MAX_WINDOWS],
+            window_chip_width: 0,
+            show_start: true,
+            show_quick: true,
+            show_taskbar: true,
+            show_tray: true,
         }
+    }
+
+    /// The panel's height in pixels — what the shell subtracts from
+    /// the surface height to find the top of the bar.
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Apply `panel.conf`: the bar's height and which applets it
+    /// carries. An empty applet list keeps every applet — a config
+    /// that says nothing must not blank the panel.
+    pub fn apply_settings(&mut self, settings: &PanelSettings) {
+        self.height = settings.height.clamp(16, 64);
+        if settings.applet_count() > 0 {
+            self.show_start = settings.has_applet("start-menu");
+            self.show_quick = settings.has_applet("quick-launch");
+            self.show_taskbar = settings.has_applet("taskbar");
+            self.show_tray = settings.has_applet("systray");
+        }
+        self.chips_placed = false;
+    }
+
+    /// Publish the compositor's window list. An empty list falls the
+    /// taskbar back to its pinned launcher chips.
+    pub fn set_windows(&mut self, windows: &TaskbarModel) {
+        self.windows = *windows;
+        self.chips_placed = false;
+    }
+
+    /// Expand or collapse the panel. Collapsed, only the hider's grip
+    /// remains; clicking it expands the panel again.
+    pub fn set_hider_open(&mut self, open: bool) {
+        self.hider_open = open;
+        self.chips_placed = false;
+    }
+
+    /// Whether the panel is expanded.
+    pub const fn hider_open(&self) -> bool {
+        self.hider_open
     }
 
     /// Lay the chips out for the current width. Called once per draw.
@@ -183,114 +260,197 @@ impl Panel {
         // Quick launch: icon-only chips, 40 px wide.
         for (index, source) in QUICK_LAUNCH.iter().enumerate() {
             let mut chip = *source;
-            chip.bounds = Rect::new(x, 0, 40, PANEL_HEIGHT);
+            chip.bounds = Rect::new(x, 0, 40, self.height);
             x += 46;
             self.quick_launch[index] = chip;
         }
-        // Taskbar: text chips, ~96 px wide, after a gap.
-        x += 12;
-        for (index, source) in TASKBAR.iter().enumerate() {
-            let mut chip = *source;
-            chip.bounds = Rect::new(x, 0, 96, PANEL_HEIGHT);
-            x += 104;
-            self.taskbar[index] = chip;
-        }
-        // Tray: pinned to the right edge.
+        // The taskbar region starts after a gap; the tray pins the right
+        // edge. Dynamic window chips and the pinned fallback share it.
+        let taskbar_x = x + 12;
         self.tray_bounds = Rect::new(
             self.width as i32 - TRAY_WIDTH,
             0,
             TRAY_WIDTH as u32,
-            PANEL_HEIGHT,
+            self.height,
         );
+        let region_width = self.tray_bounds.x - 8 - taskbar_x;
+        let count = self.windows.count();
+        if count > 0 && region_width > 0 {
+            // One chip per window, squeezed into the region, capped so a
+            // long title cannot push neighbours off the panel.
+            let width = (region_width / count as i32).clamp(24, 120);
+            self.window_chip_width = width;
+            for index in 0..count {
+                self.window_chips[index] = Rect::new(
+                    taskbar_x + index as i32 * width,
+                    0,
+                    width as u32 - 2,
+                    self.height,
+                );
+            }
+        } else {
+            self.window_chip_width = 0;
+            let mut x = taskbar_x;
+            for (index, source) in TASKBAR.iter().enumerate() {
+                let mut chip = *source;
+                chip.bounds = Rect::new(x, 0, 96, self.height);
+                x += 104;
+                self.taskbar[index] = chip;
+            }
+        }
         self.chips_placed = true;
     }
 
     /// Draw the panel into the canvas at `top`.
     pub fn draw(&mut self, canvas: &mut Canvas, top: i32, tray_dot: bool) {
         self.place();
+        let height = self.height;
         // Bar background + separator.
-        canvas.fill_rect(Rect::new(0, top, self.width, PANEL_HEIGHT), BAR_BG);
+        canvas.fill_rect(Rect::new(0, top, self.width, height), BAR_BG);
         canvas.fill_rect(Rect::new(0, top, self.width, 1), BAR_LINE);
 
         // Start button: a comet emblem and the "Nova" wordmark.
-        canvas.fill_rect(
-            Rect::new(2, top + 2, (START_WIDTH - 4) as u32, PANEL_HEIGHT - 4),
-            CHIP_BG,
-        );
-        canvas.stroke_rect(
-            Rect::new(2, top + 2, (START_WIDTH - 4) as u32, PANEL_HEIGHT - 4),
-            CHIP_EDGE,
-        );
-        draw_comet(canvas, 8, top + 6, ACCENT);
-        canvas.draw_text(28, top + 8, "Nova", TEXT, Some(CHIP_BG));
-
-        // Quick launch: square chips with glyphs.
-        for chip in self.quick_launch.iter() {
+        if self.show_start {
             canvas.fill_rect(
-                Rect::new(chip.bounds.x + 2, top + 4, 36, PANEL_HEIGHT - 8),
-                CHIP_BG,
-            );
-            glyph(canvas, chip.command, chip.bounds.x + 20, top + 16);
-        }
-
-        // Taskbar: chips with an accent dot and label.
-        for chip in self.taskbar.iter() {
-            if chip.command.is_empty() {
-                continue;
-            }
-            canvas.fill_rect(
-                Rect::new(chip.bounds.x + 2, top + 4, 92, PANEL_HEIGHT - 8),
+                Rect::new(2, top + 2, (START_WIDTH - 4) as u32, height - 4),
                 CHIP_BG,
             );
             canvas.stroke_rect(
-                Rect::new(chip.bounds.x + 2, top + 4, 92, PANEL_HEIGHT - 8),
+                Rect::new(2, top + 2, (START_WIDTH - 4) as u32, height - 4),
                 CHIP_EDGE,
             );
-            canvas.fill_rect(Rect::new(chip.bounds.x + 8, top + 12, 4, 8), ACCENT);
-            canvas.draw_text(chip.bounds.x + 16, top + 9, chip.label, TEXT, Some(CHIP_BG));
+            draw_comet(canvas, 8, top + 6, ACCENT);
+            canvas.draw_text(28, top + 8, "Nova", TEXT, Some(CHIP_BG));
+        }
+
+        // Collapsed: only the hider's grip shows.
+        if !self.hider_open {
+            canvas.fill_rect(Rect::new(0, top + 8, 12, height - 16), CHIP_BG);
+            canvas.stroke_rect(Rect::new(0, top + 8, 12, height - 16), CHIP_EDGE);
+            canvas.fill_rect(Rect::new(4, top + height as i32 / 2 - 2, 4, 4), ACCENT);
+            return;
+        }
+
+        // Quick launch: square chips with glyphs.
+        if self.show_quick {
+            for chip in self.quick_launch.iter() {
+                canvas.fill_rect(
+                    Rect::new(chip.bounds.x + 2, top + 4, 36, height - 8),
+                    CHIP_BG,
+                );
+                glyph(canvas, chip.command, chip.bounds.x + 20, top + 16);
+            }
+        }
+
+        // Taskbar: dynamic window chips when the compositor has a list,
+        // the pinned launcher otherwise.
+        if self.show_taskbar {
+            if self.window_chip_width > 0 {
+                for (index, bounds) in self
+                    .window_chips
+                    .iter()
+                    .enumerate()
+                    .take(self.windows.count())
+                {
+                    let Some(entry) = self.windows.entry(index) else {
+                        continue;
+                    };
+                    let bounds = *bounds;
+                    canvas.fill_rect(bounds, CHIP_BG);
+                    canvas.stroke_rect(bounds, if entry.active { ACCENT } else { CHIP_EDGE });
+                    canvas.fill_rect(
+                        Rect::new(bounds.x + 6, top + 12, 4, 8),
+                        if entry.minimized { MUTED } else { ACCENT },
+                    );
+                    canvas.draw_text(bounds.x + 14, top + 9, entry.title(), TEXT, Some(CHIP_BG));
+                }
+            } else {
+                // Pinned fallback: chips with an accent dot and label.
+                for chip in self.taskbar.iter() {
+                    if chip.command.is_empty() {
+                        continue;
+                    }
+                    canvas.fill_rect(
+                        Rect::new(chip.bounds.x + 2, top + 4, 92, height - 8),
+                        CHIP_BG,
+                    );
+                    canvas.stroke_rect(
+                        Rect::new(chip.bounds.x + 2, top + 4, 92, height - 8),
+                        CHIP_EDGE,
+                    );
+                    canvas.fill_rect(Rect::new(chip.bounds.x + 8, top + 12, 4, 8), ACCENT);
+                    canvas.draw_text(chip.bounds.x + 16, top + 9, chip.label, TEXT, Some(CHIP_BG));
+                }
+            }
         }
 
         // Right segment: a comet mark + the edition tag.
-        canvas.fill_rect(
-            Rect::new(
-                self.tray_bounds.x + 6,
-                top + 4,
-                (TRAY_WIDTH - 12) as u32,
-                PANEL_HEIGHT - 8,
-            ),
-            CHIP_BG,
-        );
-        draw_comet(canvas, self.tray_bounds.x + 10, top + 9, AMBER);
-        canvas.draw_text(
-            self.tray_bounds.x + 28,
-            top + 9,
-            "EDE",
-            AMBER,
-            Some(CHIP_BG),
-        );
-        if tray_dot {
+        if self.show_tray {
             canvas.fill_rect(
-                Rect::new(self.tray_bounds.x + TRAY_WIDTH - 14, top + 4, 8, 8),
-                AMBER,
+                Rect::new(
+                    self.tray_bounds.x + 6,
+                    top + 4,
+                    (TRAY_WIDTH - 12) as u32,
+                    height - 8,
+                ),
+                CHIP_BG,
             );
+            draw_comet(canvas, self.tray_bounds.x + 10, top + 9, AMBER);
+            canvas.draw_text(
+                self.tray_bounds.x + 28,
+                top + 9,
+                "EDE",
+                AMBER,
+                Some(CHIP_BG),
+            );
+            if tray_dot {
+                canvas.fill_rect(
+                    Rect::new(self.tray_bounds.x + TRAY_WIDTH - 14, top + 4, 8, 8),
+                    AMBER,
+                );
+            }
         }
     }
 
     /// Hit-test a panel-local point.
     pub fn hit(&mut self, x: i32, y: i32) -> Hit {
         self.place();
-        if !(0..PANEL_HEIGHT_I32).contains(&y) {
+        let height = self.height as i32;
+        if !(0..height).contains(&y) {
             return Hit::Nothing;
         }
+        // Collapsed: only the grip answers.
+        if !self.hider_open {
+            return if x < 14 { Hit::Hider } else { Hit::Nothing };
+        }
         let start_right = self.start_bounds.x + self.start_bounds.width as i32;
-        if x >= self.start_bounds.x && x < start_right {
+        if self.show_start && x >= self.start_bounds.x && x < start_right {
             return Hit::StartMenu;
         }
-        for (index, chip) in self.quick_launch.iter().enumerate() {
-            let right = chip.bounds.x + chip.bounds.width as i32;
-            if chip.bounds.width > 0 && x >= chip.bounds.x && x < right {
-                return Hit::QuickLaunch(index);
+        if self.show_quick {
+            for (index, chip) in self.quick_launch.iter().enumerate() {
+                let right = chip.bounds.x + chip.bounds.width as i32;
+                if chip.bounds.width > 0 && x >= chip.bounds.x && x < right {
+                    return Hit::QuickLaunch(index);
+                }
             }
+        }
+        if !self.show_taskbar {
+            return Hit::Nothing;
+        }
+        if self.window_chip_width > 0 {
+            for (index, bounds) in self
+                .window_chips
+                .iter()
+                .enumerate()
+                .take(self.windows.count())
+            {
+                let right = bounds.x + bounds.width as i32;
+                if x >= bounds.x && x < right {
+                    return Hit::Taskbar(index);
+                }
+            }
+            return Hit::Nothing;
         }
         for (index, chip) in self.taskbar.iter().enumerate() {
             let right = chip.bounds.x + chip.bounds.width as i32;
@@ -309,10 +469,23 @@ impl Panel {
                 .quick_launch
                 .get(index)
                 .map(|chip| Action::Launch(chip.command)),
-            Hit::Taskbar(index) => self
-                .taskbar
-                .get(index)
-                .map(|chip| Action::Launch(chip.command)),
+            Hit::Taskbar(index) => {
+                if self.window_chip_width > 0 {
+                    // A window chip: active windows minimize on click,
+                    // everything else activates — upstream's taskbar.
+                    let entry = self.windows.entry(index)?;
+                    if entry.active && !entry.minimized {
+                        Some(Action::Minimize(entry.id))
+                    } else {
+                        Some(Action::Activate(entry.id))
+                    }
+                } else {
+                    self.taskbar
+                        .get(index)
+                        .map(|chip| Action::Launch(chip.command))
+                }
+            }
+            Hit::Hider => Some(Action::ShowPanel),
             Hit::Nothing => None,
         }
     }
@@ -362,5 +535,150 @@ pub fn glyph(canvas: &mut Canvas, command: &str, x: i32, y: i32) {
         _ => {
             canvas.fill_rect(Rect::new(x - 4, y - 4, 8, 8), TEXT);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn panel() -> Panel {
+        Panel::new(1024)
+    }
+
+    fn windows() -> TaskbarModel {
+        let mut model = TaskbarModel::new();
+        model.sync(&[
+            TaskEntry::new(11, "Terminal", false, false),
+            TaskEntry::new(12, "Editor", true, false),
+        ]);
+        model
+    }
+
+    #[test]
+    fn the_start_button_hits_where_it_draws() {
+        let mut panel = panel();
+        let hit = panel.hit(40, 16);
+        assert_eq!(hit, Hit::StartMenu);
+        assert_eq!(panel.action_for(hit), Some(Action::OpenStartMenu));
+    }
+
+    #[test]
+    fn quick_launch_chips_launch_their_commands() {
+        let mut panel = panel();
+        let hit = panel.hit(START_WIDTH + 20, 16);
+        match panel.action_for(hit) {
+            Some(Action::Launch(command)) => assert!(!command.is_empty()),
+            other => panic!("expected a launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinned_chips_fall_out_when_windows_arrive() {
+        let mut panel = panel();
+        panel.set_windows(&windows());
+        panel.place(); // lay the dynamic chips out
+        // The first dynamic chip lands in the taskbar region.
+        let hit = panel.hit(panel.window_chips[0].x + 4, 16);
+        assert_eq!(
+            panel.action_for(hit),
+            Some(Action::Activate(11)),
+            "a non-active window chip activates"
+        );
+    }
+
+    #[test]
+    fn clicking_the_active_window_minimizes() {
+        let mut panel = panel();
+        panel.set_windows(&windows());
+        panel.place();
+        let hit = panel.hit(panel.window_chips[1].x + 4, 16);
+        assert_eq!(panel.action_for(hit), Some(Action::Minimize(12)));
+    }
+
+    #[test]
+    fn an_empty_window_list_falls_back_to_pinned_chips() {
+        let mut panel = panel();
+        panel.set_windows(&TaskbarModel::new());
+        panel.place();
+        let hit = panel.hit(panel.taskbar[0].bounds.x + 4, 16);
+        assert!(matches!(panel.action_for(hit), Some(Action::Launch(_))));
+    }
+
+    #[test]
+    fn the_hider_collapses_the_panel_to_its_grip() {
+        let mut panel = panel();
+        panel.set_hider_open(false);
+        assert_eq!(panel.hit(6, 16), Hit::Hider);
+        assert_eq!(panel.action_for(Hit::Hider), Some(Action::ShowPanel));
+        assert_eq!(panel.hit(200, 16), Hit::Nothing, "nothing else answers");
+        panel.set_hider_open(true);
+        assert_eq!(panel.hit(40, 16), Hit::StartMenu, "expanded again");
+    }
+
+    #[test]
+    fn chips_stay_inside_the_panel() {
+        let mut panel = panel();
+        panel.set_windows(&windows());
+        panel.place();
+        for index in 0..windows().count() {
+            let bounds = panel.window_chips[index];
+            assert!(bounds.x >= 0);
+            assert!(
+                bounds.x + bounds.width as i32 <= panel.width as i32,
+                "chip {index} runs off the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn panel_settings_flow_through() {
+        let config = nova_edelib::EdeConfig::parse(
+            b"[Panel]\nposition = 1\nheight = 36\napplets = start-menu,clock\n",
+        );
+        let settings = PanelSettings::from_config(&config);
+        assert_eq!(settings.height, 36);
+        assert_eq!(settings.position, Position::Bottom);
+        assert!(settings.has_applet("start-menu"));
+        assert!(settings.has_applet("clock"));
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+
+    #[test]
+    fn apply_settings_sets_the_height() {
+        let mut panel = Panel::new(1024);
+        assert_eq!(panel.height(), 32);
+        let config = nova_edelib::EdeConfig::parse(b"[Panel]\nheight = 48\n");
+        panel.apply_settings(&PanelSettings::from_config(&config));
+        assert_eq!(panel.height(), 48);
+        // The height bounds the hit test too: below the bar answers.
+        assert_eq!(panel.hit(40, 47), Hit::StartMenu);
+        assert_eq!(panel.hit(40, 48), Hit::Nothing, "above the bar");
+    }
+
+    #[test]
+    fn apply_settings_gates_the_applets() {
+        let mut panel = Panel::new(1024);
+        let config = nova_edelib::EdeConfig::parse(b"[Panel]\napplets = start-menu,taskbar\n");
+        panel.apply_settings(&PanelSettings::from_config(&config));
+        // The start button still answers…
+        assert_eq!(panel.hit(40, 16), Hit::StartMenu);
+        // …the quick-launch chips do not.
+        let quick_x = START_WIDTH + 20;
+        assert_eq!(panel.hit(quick_x, 16), Hit::Nothing);
+    }
+
+    #[test]
+    fn an_empty_applet_list_keeps_everything() {
+        let mut panel = Panel::new(1024);
+        panel.apply_settings(&PanelSettings::from_config(&nova_edelib::EdeConfig::parse(
+            b"[Panel]\n",
+        )));
+        assert_eq!(panel.hit(40, 16), Hit::StartMenu);
+        assert_eq!(panel.hit(START_WIDTH + 20, 16), Hit::QuickLaunch(0));
     }
 }

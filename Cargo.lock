@@ -38,6 +38,7 @@ dependencies = [
  "nova-desktop",
  "nova-ede-about",
  "nova-ede-desktop",
+ "nova-ede-desktop-conf",
  "nova-ede-launch",
  "nova-ede-notifyd",
  "nova-ede-panel",
@@ -95,7 +96,66 @@ name = "nova-ede-about"
 version = "0.1.0"
 
 [[package]]
+name = "nova-ede-autostart"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-bell"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-bug-report"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-calc"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-conf"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-crash"
+version = "0.1.0"
+
+[[package]]
 name = "nova-ede-desktop"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-desktop-conf"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-dialog"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-help"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-image-view"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-keyboard"
 version = "0.1.0"
 dependencies = [
  "nova-edelib",
@@ -116,11 +176,48 @@ version = "0.1.0"
 name = "nova-ede-panel"
 version = "0.1.0"
 dependencies = [
+ "nova-edelib",
  "nova-ui",
 ]
 
 [[package]]
+name = "nova-ede-preferred"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-screen-lock"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-screensaver"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-session"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
+name = "nova-ede-timedate"
+version = "0.1.0"
+dependencies = [
+ "nova-edelib",
+]
+
+[[package]]
 name = "nova-ede-tip"
+version = "0.1.0"
+
+[[package]]
+name = "nova-ede-tip-compiler"
 version = "0.1.0"
 
 [[package]]

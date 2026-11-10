@@ -400,9 +400,13 @@ impl<'a> Records<'a> {
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, cursor: 0 }
     }
+}
+
+impl<'a> Iterator for Records<'a> {
+    type Item = Record<'a>;
 
     /// The next entry, or `None` when the page is spent.
-    pub fn next(&mut self) -> Option<Record<'a>> {
+    fn next(&mut self) -> Option<Record<'a>> {
         let rest = self.bytes.get(self.cursor..)?;
         if rest.len() < FILE_DIR_ENTRY_SIZE {
             // Fewer bytes than one record header: nothing complete is left.

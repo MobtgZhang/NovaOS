@@ -895,6 +895,7 @@ pub fn service_request(
     // capability table and the object registry in order to validate an
     // attached buffer; the display service needs only its own mode.
     let KernelStateParts {
+        tasks,
         caps,
         objects,
         display,
@@ -911,7 +912,7 @@ pub fn service_request(
             let Some(table) = caps.get(context.task_slot) else {
                 return Err(ErrorCode::BadHandle);
             };
-            compositor.handle_message(&request, context.task_slot, table, objects)
+            compositor.handle_message(&request, context.task_slot, table, objects, tasks)
         }
         // Ring 3 reads the input queue and may not inject into it: the
         // trusted `handle_message` path is the driver's, not a client's.

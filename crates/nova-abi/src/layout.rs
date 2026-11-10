@@ -42,10 +42,18 @@ pub const USER_STACK_TOP: u64 = 0x0000_0000_7FFF_F000;
 
 /// The size of the user stack, in bytes.
 ///
-/// Sixteen pages. The stack is mapped by the kernel, not by the linker, so
-/// this is the size of the mapping the kernel creates — and the size the
-/// guard page is placed below.
-pub const USER_STACK_SIZE: u64 = 64 * 1024;
+/// Thirty-two pages. The stack is mapped by the kernel, not by the
+/// linker, so this is the size of the mapping the kernel creates — and
+/// the size the guard page is placed below.
+///
+/// The desktop shell is the reason for the headroom: it keeps the whole
+/// desktop state — icon layer, launcher, panel, and the config store it
+/// parses at boot — as stack-resident values, and the optimizer's
+/// inlining of its event loop puts all of it in a single frame. Sixty
+/// four KiB was enough for the shell *before* it read `panel.conf`; the
+/// parse is what pushed it over, and a guard-page fault is how that
+/// showed up.
+pub const USER_STACK_SIZE: u64 = 128 * 1024;
 
 /// The base of the reserved user heap region.
 ///

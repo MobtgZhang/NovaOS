@@ -7,8 +7,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// How many credit lines the dialog shows.
-pub const MAX_CREDITS: usize = 6;
+/// How many credit lines the dialog shows at most; the shell paginates
+/// beyond this.
+pub const MAX_CREDITS: usize = 7;
 
 /// The credit lines shown in the dialog.
 pub const CREDITS: &[&str] = &[
@@ -59,5 +60,11 @@ mod tests {
         assert!(about.product.contains("NovaOS"));
         assert_eq!(about.version, "0.1.0");
         assert!(!about.credits.is_empty());
+        assert!(!about.build.is_empty());
+        assert!(
+            about.credits.len() <= MAX_CREDITS,
+            "the dialog paginates past MAX_CREDITS"
+        );
+        assert!(about.credits.iter().any(|line| line.contains("EDE")));
     }
 }
