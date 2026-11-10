@@ -26,11 +26,12 @@
 //! written into — so a keystroke can never end up in the wrong place by
 //! accident, because there is exactly one place for it to go.
 
+use nova_apps::graphics;
 use nova_apps::graphics::{InputEvent, Window};
 use nova_apps::{console, fsclient, process, yield_now};
 use nova_protocols::input::{INPUT_BUTTON_PRIMARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER};
 use nova_ui::keyboard::{Decoder, Key};
-use nova_ui::{Button, Canvas, Rect, TextBox, palette};
+use nova_ui::{Button, Canvas, Rect, TextBox, TitlebarHit, draw_titlebar, palette, titlebar_hit};
 
 /// The terminal face embedded in this program: Sarasa Gothic Mono SC,
 /// subset to ASCII, CJK punctuation, and the GB2312 level-1 hanzi — the
@@ -87,6 +88,13 @@ struct Terminal {
     clear: Button,
     /// What the status line says.
     status: &'static str,
+    /// The primary button's state on the previous event — the edge
+    /// the title-bar buttons fire on.
+    title_down: bool,
+    /// The surface this window owns, for the iconify button.
+    surface: u32,
+    /// Set by the close button; the main loop exits on it.
+    quit: bool,
 }
 
 impl Terminal {
@@ -100,6 +108,9 @@ impl Terminal {
             input_box: TextBox::new(Rect::new(26, 270, 322, 24)),
             clear: Button::new(Rect::new(356, 270, 76, 24), "Clear"),
             status: "ready",
+            title_down: false,
+            surface: 0,
+            quit: false,
         };
         // The command line takes keys from the moment the window opens: a
         // terminal the user has to click into first feels broken.
@@ -349,6 +360,26 @@ impl Terminal {
     /// redrawn.
     fn on_pointer(&mut self, event: &InputEvent) -> bool {
         let primary = event.buttons & INPUT_BUTTON_PRIMARY != 0;
+        let pressed = primary && !self.title_down;
+        self.title_down = primary;
+
+        // The title bar's buttons fire on the press edge: close quits,
+        // iconify minimizes to the taskbar (the taskbar's chip brings
+        // the window back through ACTIVATE).
+        if pressed {
+            match titlebar_hit(event.x, event.y, WIDTH as i32) {
+                TitlebarHit::Close => {
+                    self.quit = true;
+                    return true;
+                }
+                TitlebarHit::Iconify => {
+                    let _ = graphics::compositor_minimize(self.surface, true);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let was_down = self.clear.is_down();
         let fired = self.clear.on_pointer(event.x, event.y, primary);
         if fired {
@@ -365,14 +396,7 @@ impl Terminal {
     fn draw(&self, canvas: &mut Canvas) {
         canvas.clear(palette::SURFACE);
 
-        canvas.fill_rect(Rect::new(0, 0, WIDTH, 22), palette::CHROME);
-        canvas.draw_text(
-            8,
-            3,
-            "Terminal",
-            palette::TEXT_ON_CHROME,
-            Some(palette::CHROME),
-        );
+        draw_titlebar(canvas, WIDTH as i32, "Terminal", true);
 
         self.log_box.draw(canvas, &self.log);
 
@@ -381,13 +405,7 @@ impl Terminal {
         self.clear.draw(canvas);
 
         canvas.fill_rect(Rect::new(0, 296, WIDTH, HEIGHT - 296), palette::STATUS);
-        canvas.draw_text(
-            8,
-            300,
-            self.status,
-            palette::TEXT_ON_CHROME,
-            Some(palette::STATUS),
-        );
+        canvas.draw_text(8, 300, self.status, palette::TEXT, Some(palette::STATUS));
     }
 }
 
@@ -420,6 +438,7 @@ pub extern "C" fn main() -> i64 {
     let mut canvas = Canvas::new(window.buffer, WIDTH, HEIGHT);
 
     let mut terminal = Terminal::new();
+    terminal.surface = window.surface;
     let mut decoder = Decoder::new();
     let mut events = [InputEvent::EMPTY; MAX_EVENTS];
 
@@ -465,6 +484,12 @@ pub extern "C" fn main() -> i64 {
         // Yield rather than spin: the desktop's idle CPU is one of the
         // milestone's acceptance suites, and a window that polls in a tight
         // loop is exactly what it is there to catch.
+        if terminal.quit {
+            break;
+        }
+
         yield_now();
     }
+
+    0
 }

@@ -36,6 +36,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+use nova_ui::palette;
 use nova_ui::{Canvas, Rect};
 
 pub mod settings;
@@ -50,24 +51,28 @@ pub const PANEL_HEIGHT: u32 = 32;
 /// The panel's canvas coordinates as an i32.
 pub const PANEL_HEIGHT_I32: i32 = PANEL_HEIGHT as i32;
 
-/// The bar's background.
-pub const BAR_BG: u32 = 0x00131C28;
+/// The bar's background: EDE's warm window gray.
+pub const BAR_BG: u32 = palette::SURFACE;
 /// The bar's separator line.
-pub const BAR_LINE: u32 = 0x001F3142;
+pub const BAR_LINE: u32 = palette::BORDER;
 /// Chip resting fill.
-pub const CHIP_BG: u32 = 0x001B2836;
+pub const CHIP_BG: u32 = palette::SURFACE;
 /// Chip outline.
-pub const CHIP_EDGE: u32 = 0x00243442;
-/// NovaOS accent colour.
-pub const ACCENT: u32 = 0x0068AAC4;
-/// Amber accent for attention-getting elements.
+pub const CHIP_EDGE: u32 = palette::BORDER;
+/// Accent colour: EDE's title-bar blue.
+pub const ACCENT: u32 = palette::CHROME;
+/// Amber accent for attention-getting elements (the tray dot).
 pub const AMBER: u32 = 0x00D8A24A;
 /// Dim accent for the comet tail.
-pub const ACCENT_DIM: u32 = 0x00406077;
+pub const ACCENT_DIM: u32 = palette::FACE_DARK;
 /// Text colour on the bar.
-pub const TEXT: u32 = 0x00E6ECF2;
+pub const TEXT: u32 = palette::TEXT;
 /// Muted text colour on the bar.
-pub const MUTED: u32 = 0x007E8896;
+pub const MUTED: u32 = palette::TEXT_DIM;
+/// The bevel's light edge.
+pub const FACE_LIGHT: u32 = palette::FACE_LIGHT;
+/// The bevel's dark edge.
+pub const FACE_DARK: u32 = palette::FACE_DARK;
 
 /// The action a click on the panel can produce.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,10 +182,13 @@ pub struct Panel {
     /// Where the dynamic taskbar chips sit once laid out.
     window_chips: [Rect; taskbar::MAX_WINDOWS],
     window_chip_width: i32,
-    /// Which applets `panel.conf` asked for. All four default on; an
-    /// empty applet list means "whatever the config did not say".
+    /// Where the clock sits, between quick launch and the taskbar.
+    clock_bounds: Rect,
+    /// Which applets `panel.conf` asked for. Every applet defaults on;
+    /// an empty list means "whatever the config did not say".
     show_start: bool,
     show_quick: bool,
+    show_clock: bool,
     show_taskbar: bool,
     show_tray: bool,
 }
@@ -205,8 +213,10 @@ impl Panel {
             hider_open: true,
             window_chips: [Rect::new(0, 0, 0, 0); taskbar::MAX_WINDOWS],
             window_chip_width: 0,
+            clock_bounds: Rect::new(0, 0, 0, 0),
             show_start: true,
             show_quick: true,
+            show_clock: true,
             show_taskbar: true,
             show_tray: true,
         }
@@ -226,6 +236,7 @@ impl Panel {
         if settings.applet_count() > 0 {
             self.show_start = settings.has_applet("start-menu");
             self.show_quick = settings.has_applet("quick-launch");
+            self.show_clock = settings.has_applet("clock");
             self.show_taskbar = settings.has_applet("taskbar");
             self.show_tray = settings.has_applet("systray");
         }
@@ -263,6 +274,14 @@ impl Panel {
             chip.bounds = Rect::new(x, 0, 40, self.height);
             x += 46;
             self.quick_launch[index] = chip;
+        }
+        // The clock sits after quick launch, in EDE's applet order
+        // (start_menu, quick_launch, ..., clock, taskbar, ...).
+        if self.show_clock {
+            self.clock_bounds = Rect::new(x + 8, 0, 52, self.height);
+            x += 68;
+        } else {
+            self.clock_bounds = Rect::new(0, 0, 0, 0);
         }
         // The taskbar region starts after a gap; the tray pins the right
         // edge. Dynamic window chips and the pinned fallback share it.
@@ -302,31 +321,35 @@ impl Panel {
     }
 
     /// Draw the panel into the canvas at `top`.
-    pub fn draw(&mut self, canvas: &mut Canvas, top: i32, tray_dot: bool) {
+    ///
+    /// `clock` is the time string the shell read from the wall clock
+    /// (`HH:MM`, empty when the RTC could not be read) — the panel
+    /// draws it but never reads hardware itself.
+    pub fn draw(&mut self, canvas: &mut Canvas, top: i32, tray_dot: bool, clock: &str) {
         self.place();
         let height = self.height;
         // Bar background + separator.
         canvas.fill_rect(Rect::new(0, top, self.width, height), BAR_BG);
         canvas.fill_rect(Rect::new(0, top, self.width, 1), BAR_LINE);
 
-        // Start button: a comet emblem and the "Nova" wordmark.
+        // The EDE button: the menu's entry point, as upstream labels it.
         if self.show_start {
-            canvas.fill_rect(
+            bevel(
+                canvas,
                 Rect::new(2, top + 2, (START_WIDTH - 4) as u32, height - 4),
-                CHIP_BG,
             );
-            canvas.stroke_rect(
-                Rect::new(2, top + 2, (START_WIDTH - 4) as u32, height - 4),
-                CHIP_EDGE,
+            canvas.draw_text(
+                START_WIDTH / 2 - 10,
+                top + (height as i32 - 16) / 2,
+                "EDE",
+                TEXT,
+                Some(CHIP_BG),
             );
-            draw_comet(canvas, 8, top + 6, ACCENT);
-            canvas.draw_text(28, top + 8, "Nova", TEXT, Some(CHIP_BG));
         }
 
         // Collapsed: only the hider's grip shows.
         if !self.hider_open {
-            canvas.fill_rect(Rect::new(0, top + 8, 12, height - 16), CHIP_BG);
-            canvas.stroke_rect(Rect::new(0, top + 8, 12, height - 16), CHIP_EDGE);
+            bevel(canvas, Rect::new(0, top + 8, 12, height - 16));
             canvas.fill_rect(Rect::new(4, top + height as i32 / 2 - 2, 4, 4), ACCENT);
             return;
         }
@@ -334,16 +357,30 @@ impl Panel {
         // Quick launch: square chips with glyphs.
         if self.show_quick {
             for chip in self.quick_launch.iter() {
-                canvas.fill_rect(
+                bevel(
+                    canvas,
                     Rect::new(chip.bounds.x + 2, top + 4, 36, height - 8),
-                    CHIP_BG,
                 );
                 glyph(canvas, chip.command, chip.bounds.x + 20, top + 16);
             }
         }
 
+        // The clock applet, in EDE's applet order before the taskbar.
+        if self.show_clock && !clock.is_empty() {
+            let width = Canvas::text_width(clock) as i32;
+            let x = self.clock_bounds.x + (self.clock_bounds.width as i32 - width) / 2;
+            canvas.draw_text(
+                x,
+                top + (height as i32 - 16) / 2,
+                clock,
+                TEXT,
+                Some(CHIP_BG),
+            );
+        }
+
         // Taskbar: dynamic window chips when the compositor has a list,
-        // the pinned launcher otherwise.
+        // the pinned launcher otherwise. The active window wears EDE's
+        // title blue; the rest sit on the panel's own gray.
         if self.show_taskbar {
             if self.window_chip_width > 0 {
                 for (index, bounds) in self
@@ -356,13 +393,38 @@ impl Panel {
                         continue;
                     };
                     let bounds = *bounds;
-                    canvas.fill_rect(bounds, CHIP_BG);
-                    canvas.stroke_rect(bounds, if entry.active { ACCENT } else { CHIP_EDGE });
-                    canvas.fill_rect(
-                        Rect::new(bounds.x + 6, top + 12, 4, 8),
-                        if entry.minimized { MUTED } else { ACCENT },
-                    );
-                    canvas.draw_text(bounds.x + 14, top + 9, entry.title(), TEXT, Some(CHIP_BG));
+                    if entry.active {
+                        canvas.fill_rect(bounds, ACCENT);
+                        canvas.fill_rect(Rect::new(bounds.x, top, 1, height), palette::CHROME_SUNK);
+                        canvas.draw_text(
+                            bounds.x + 14,
+                            top + 9,
+                            entry.title(),
+                            palette::TEXT_ON_CHROME,
+                            Some(ACCENT),
+                        );
+                        canvas.fill_rect(
+                            Rect::new(bounds.x + 6, top + 12, 4, 8),
+                            if entry.minimized {
+                                palette::TEXT_DIM
+                            } else {
+                                palette::TEXT_ON_CHROME
+                            },
+                        );
+                    } else {
+                        bevel(canvas, bounds);
+                        canvas.fill_rect(
+                            Rect::new(bounds.x + 6, top + 12, 4, 8),
+                            if entry.minimized { MUTED } else { ACCENT },
+                        );
+                        canvas.draw_text(
+                            bounds.x + 14,
+                            top + 9,
+                            entry.title(),
+                            TEXT,
+                            Some(CHIP_BG),
+                        );
+                    }
                 }
             } else {
                 // Pinned fallback: chips with an accent dot and label.
@@ -370,13 +432,9 @@ impl Panel {
                     if chip.command.is_empty() {
                         continue;
                     }
-                    canvas.fill_rect(
+                    bevel(
+                        canvas,
                         Rect::new(chip.bounds.x + 2, top + 4, 92, height - 8),
-                        CHIP_BG,
-                    );
-                    canvas.stroke_rect(
-                        Rect::new(chip.bounds.x + 2, top + 4, 92, height - 8),
-                        CHIP_EDGE,
                     );
                     canvas.fill_rect(Rect::new(chip.bounds.x + 8, top + 12, 4, 8), ACCENT);
                     canvas.draw_text(chip.bounds.x + 16, top + 9, chip.label, TEXT, Some(CHIP_BG));
@@ -384,25 +442,19 @@ impl Panel {
             }
         }
 
-        // Right segment: a comet mark + the edition tag.
+        // Right segment: the system tray slot.
         if self.show_tray {
-            canvas.fill_rect(
+            bevel(
+                canvas,
                 Rect::new(
                     self.tray_bounds.x + 6,
                     top + 4,
                     (TRAY_WIDTH - 12) as u32,
                     height - 8,
                 ),
-                CHIP_BG,
             );
-            draw_comet(canvas, self.tray_bounds.x + 10, top + 9, AMBER);
-            canvas.draw_text(
-                self.tray_bounds.x + 28,
-                top + 9,
-                "EDE",
-                AMBER,
-                Some(CHIP_BG),
-            );
+            draw_comet(canvas, self.tray_bounds.x + 10, top + 9, ACCENT);
+            canvas.draw_text(self.tray_bounds.x + 28, top + 9, "EDE", TEXT, Some(CHIP_BG));
             if tray_dot {
                 canvas.fill_rect(
                     Rect::new(self.tray_bounds.x + TRAY_WIDTH - 14, top + 4, 8, 8),
@@ -493,6 +545,19 @@ impl Panel {
 
 /// Draw the NovaOS comet emblem — a square head with a trailing tail of
 /// fading pixels to the lower-left.
+/// Draw an FLTK-style up-box bevel inside `rect`: the panel's fill
+/// with a light edge on the top and left and a dark edge on the bottom
+/// and right — the shape every EDE control is drawn with.
+fn bevel(canvas: &mut Canvas, rect: Rect) {
+    canvas.fill_rect(rect, CHIP_BG);
+    let (x, y) = (rect.x, rect.y);
+    let (w, h) = (rect.width, rect.height as i32);
+    canvas.fill_rect(Rect::new(x, y, w, 1), FACE_LIGHT);
+    canvas.fill_rect(Rect::new(x, y, 1, h as u32), FACE_LIGHT);
+    canvas.fill_rect(Rect::new(x, y + h - 1, w, 1), FACE_DARK);
+    canvas.fill_rect(Rect::new(x + w as i32 - 1, y, 1, h as u32), FACE_DARK);
+}
+
 pub fn draw_comet(canvas: &mut Canvas, x: i32, y: i32, color: u32) {
     canvas.fill_rect(Rect::new(x, y, 10, 10), color);
     canvas.fill_rect(Rect::new(x + 2, y + 2, 3, 3), 0x00C8F0FF);

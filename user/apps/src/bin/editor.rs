@@ -27,11 +27,13 @@
 //! can never be written, and a smaller one could not hold a file it can read.
 
 use nova_abi::error::ErrorCode;
-use nova_apps::graphics::{InputEvent, Window};
+use nova_apps::graphics::{self, InputEvent, Window};
 use nova_apps::{console, fsclient, yield_now};
 use nova_protocols::input::{INPUT_BUTTON_PRIMARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER};
 use nova_ui::keyboard::{Decoder, Key};
-use nova_ui::{Button, Canvas, Rect, TextBox, decimal, palette};
+use nova_ui::{
+    Button, Canvas, Rect, TextBox, TitlebarHit, decimal, draw_titlebar, palette, titlebar_hit,
+};
 
 /// Window width in pixels.
 /// The GUI face embedded in this program: Source Han Sans subset to ASCII,
@@ -73,6 +75,13 @@ struct Editor {
     status: &'static str,
     /// A count to print after `status`, when there is one.
     detail: Option<usize>,
+    /// The primary button's state on the previous event — the edge
+    /// the title-bar buttons fire on.
+    title_down: bool,
+    /// The surface this window owns, for the iconify button.
+    surface: u32,
+    /// Set by the close button; the main loop exits on it.
+    quit: bool,
 }
 
 impl Editor {
@@ -85,6 +94,9 @@ impl Editor {
             load: Button::new(Rect::new(92, 284, 76, 24), "Load"),
             status: "ready",
             detail: None,
+            title_down: false,
+            surface: 0,
+            quit: false,
         };
         // One editable control, so it holds the keys from the moment the
         // window opens rather than waiting to be clicked.
@@ -122,6 +134,25 @@ impl Editor {
     /// Handle one pointer event. Returns whether the window must be redrawn.
     fn on_pointer(&mut self, event: &InputEvent) -> bool {
         let primary = event.buttons & INPUT_BUTTON_PRIMARY != 0;
+        let pressed = primary && !self.title_down;
+        self.title_down = primary;
+
+        // The title bar's buttons fire on the press edge: close quits,
+        // iconify minimizes to the taskbar.
+        if pressed {
+            match titlebar_hit(event.x, event.y, WIDTH as i32) {
+                TitlebarHit::Close => {
+                    self.quit = true;
+                    return true;
+                }
+                TitlebarHit::Iconify => {
+                    let _ = graphics::compositor_minimize(self.surface, true);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let before = (self.save.is_down(), self.load.is_down());
 
         let mut fired = false;
@@ -182,27 +213,14 @@ impl Editor {
     fn draw(&self, canvas: &mut Canvas) {
         canvas.clear(palette::SURFACE);
 
-        canvas.fill_rect(Rect::new(0, 0, WIDTH, 22), palette::CHROME);
-        canvas.draw_text(
-            8,
-            3,
-            "Editor  /home/nova/notes.txt",
-            palette::TEXT_ON_CHROME,
-            Some(palette::CHROME),
-        );
+        draw_titlebar(canvas, WIDTH as i32, "Editor  /home/nova/notes.txt", true);
 
         self.field.draw(canvas, &self.text);
         self.save.draw(canvas);
         self.load.draw(canvas);
 
         canvas.fill_rect(Rect::new(0, 312, WIDTH, HEIGHT - 312), palette::STATUS);
-        canvas.draw_text(
-            8,
-            318,
-            self.status,
-            palette::TEXT_ON_CHROME,
-            Some(palette::STATUS),
-        );
+        canvas.draw_text(8, 318, self.status, palette::TEXT, Some(palette::STATUS));
         if let Some(value) = self.detail {
             let mut digits = [0u8; 20];
             let count = decimal(value, &mut digits);
@@ -211,14 +229,14 @@ impl Editor {
                 after_status,
                 318,
                 count,
-                palette::TEXT_ON_CHROME,
+                palette::TEXT,
                 Some(palette::STATUS),
             );
             canvas.draw_text(
                 after_status + Canvas::text_width(count) as i32,
                 318,
                 " bytes",
-                palette::TEXT_ON_CHROME,
+                palette::TEXT,
                 Some(palette::STATUS),
             );
         }
@@ -245,6 +263,7 @@ pub extern "C" fn main() -> i64 {
     let mut canvas = Canvas::new(window.buffer, WIDTH, HEIGHT);
 
     let mut editor = Editor::new();
+    editor.surface = window.surface;
     let mut decoder = Decoder::new();
     let mut events = [InputEvent::EMPTY; MAX_EVENTS];
 
@@ -282,9 +301,15 @@ pub extern "C" fn main() -> i64 {
             }
         }
 
+        if editor.quit {
+            break;
+        }
+
         // Yield rather than spin: the desktop's idle CPU is one of the
         // milestone's acceptance suites, and a window that polls in a tight
         // loop is exactly what it is there to catch.
         yield_now();
     }
+
+    0
 }

@@ -141,27 +141,55 @@ impl Rect {
 }
 
 /// The desktop's palette, so the three windows look like one system.
+/// The EDE 2.x colour scheme.
+///
+/// Every value here is taken from the assets EDE itself ships — the
+/// pekwm `default` theme (a restyle of EDE 1.x's `classic2`) for the
+/// window chrome, and the same theme's menu images for the menu
+/// colours — so the desktop reads as EDE rather than as a dark theme
+/// wearing EDE's layout:
+///
+/// - focused title bar `#4B6983`, unfocused `#EAE8E3` (title.png /
+///   title-unfocus.png),
+/// - window border `#C6C6C6` (border.png),
+/// - title buttons `#E6E6E6` with `#222` glyphs (close.png),
+/// - menu header `#7F9EBC`, menu body `#FBFBFB` (top-menu.png /
+///   bottom-menu.png).
 pub mod palette {
     use crate::colour;
 
-    /// Window background.
-    pub const SURFACE: u32 = colour(24, 26, 32);
-    /// Title bar and button face.
-    pub const CHROME: u32 = colour(48, 62, 84);
-    /// A pressed button, and the border of a focused control.
-    pub const CHROME_SUNK: u32 = colour(32, 42, 58);
-    /// Default text.
-    pub const TEXT: u32 = colour(232, 234, 238);
-    /// Text on a chrome background.
-    pub const TEXT_ON_CHROME: u32 = colour(244, 246, 250);
+    /// Window background: EDE's warm light gray.
+    pub const SURFACE: u32 = colour(234, 232, 227);
+    /// Title bar and pressed-button face: the focused-title blue.
+    pub const CHROME: u32 = colour(75, 105, 131);
+    /// A pressed button, and a darker accent.
+    pub const CHROME_SUNK: u32 = colour(58, 82, 104);
+    /// Default text on a light surface.
+    pub const TEXT: u32 = colour(34, 34, 34);
+    /// Text on a chrome (blue) background.
+    pub const TEXT_ON_CHROME: u32 = colour(255, 255, 255);
     /// A text box's background.
-    pub const FIELD: u32 = colour(14, 15, 18);
+    pub const FIELD: u32 = colour(255, 255, 255);
     /// A control's outline.
-    pub const BORDER: u32 = colour(90, 104, 128);
-    /// A selected list row.
-    pub const SELECTED: u32 = colour(58, 88, 130);
+    pub const BORDER: u32 = colour(198, 198, 198);
+    /// A selected list row: the title blue, with white text.
+    pub const SELECTED: u32 = colour(75, 105, 131);
     /// The status line's background.
-    pub const STATUS: u32 = colour(36, 44, 56);
+    pub const STATUS: u32 = colour(234, 232, 227);
+    /// The bevel's light edge (top/left of an up-box).
+    pub const FACE_LIGHT: u32 = colour(245, 244, 241);
+    /// The bevel's dark edge (bottom/right of an up-box).
+    pub const FACE_DARK: u32 = colour(168, 166, 161);
+    /// A title button's face.
+    pub const BUTTON_FACE: u32 = colour(230, 230, 230);
+    /// An unfocused title bar.
+    pub const TITLE_UNFOCUS: u32 = colour(234, 232, 227);
+    /// Text on an unfocused title bar.
+    pub const TEXT_DIM: u32 = colour(119, 119, 119);
+    /// A menu's body.
+    pub const MENU_FACE: u32 = colour(251, 251, 251);
+    /// A menu's header bar.
+    pub const MENU_HEADER: u32 = colour(127, 158, 188);
 }
 
 /// An XRGB8888 surface a `Canvas` draws into.
@@ -506,26 +534,174 @@ impl Button {
     }
 
     /// Draw the button in its current state.
+    ///
+    /// EDE's buttons are FLTK up-boxes: a light edge along the top and
+    /// left, a dark edge along the bottom and right, and the label
+    /// shifting a pixel down-and-right while held. The bevel is drawn
+    /// with four one-pixel fills because the canvas has no line
+    /// primitive — and because a bevel *is* four rectangles.
     pub fn draw(&self, canvas: &mut Canvas) {
-        let face = if self.down {
-            palette::CHROME_SUNK
-        } else {
-            palette::CHROME
-        };
+        let face = palette::SURFACE;
         canvas.fill_rect(self.rect, face);
-        canvas.stroke_rect(self.rect, palette::BORDER);
-        let offset = if self.down { 1 } else { 0 };
-        let label_rect = Rect::new(
-            self.rect.x + offset,
-            self.rect.y + offset,
-            self.rect.width,
-            self.rect.height,
-        );
-        canvas.draw_label(label_rect, self.label, palette::TEXT_ON_CHROME, Some(face));
+        let (light, dark, offset) = if self.down {
+            (palette::FACE_DARK, palette::FACE_LIGHT, 1)
+        } else {
+            (palette::FACE_LIGHT, palette::FACE_DARK, 0)
+        };
+        let (x, y) = (self.rect.x, self.rect.y);
+        let (w, h) = (self.rect.width, self.rect.height);
+        canvas.fill_rect(Rect::new(x, y, w, 1), light);
+        canvas.fill_rect(Rect::new(x, y, 1, h), light);
+        canvas.fill_rect(Rect::new(x, y.saturating_add(h as i32 - 1), w, 1), dark);
+        canvas.fill_rect(Rect::new(x.saturating_add(w as i32 - 1), y, 1, h), dark);
+        let label_rect = Rect::new(x + offset, y + offset, w, h);
+        canvas.draw_label(label_rect, self.label, palette::TEXT, Some(face));
     }
 }
 
-/// A single-line editable field.
+/// The height of an EDE window's title bar, in pixels.
+///
+/// The apps lay their first content row out below this, so it is part
+/// of their layout contract, not just a drawing constant.
+pub const TITLEBAR_HEIGHT: i32 = 22;
+
+/// The width of one title-bar button.
+const TITLE_BUTTON: i32 = 18;
+/// The gap between title-bar buttons and the bar's right edge.
+const TITLE_BUTTON_MARGIN: i32 = 2;
+
+/// Which title-bar button a click landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TitlebarHit {
+    /// The ✕ button: close the window.
+    Close,
+    /// The □ button: maximize (visual only until the compositor grows
+    /// surfaces on request).
+    Maximize,
+    /// The — button: minimize to the taskbar.
+    Iconify,
+    /// Anywhere else on the bar, or off it entirely.
+    None,
+}
+
+/// Hit-test the title bar of a window `width` pixels wide.
+///
+/// The three buttons hug the right edge in EDE/pekwm order, left to
+/// right: iconify, maximize, close. Geometry only — the caller decides
+/// what each hit means.
+pub fn titlebar_hit(x: i32, y: i32, width: i32) -> TitlebarHit {
+    if !(0..TITLEBAR_HEIGHT).contains(&y) || !(0..width).contains(&x) {
+        return TitlebarHit::None;
+    }
+    // The buttons sit in a 2px-inset strip: vertically 2..20, ending
+    // 2px short of the right edge — exactly where `draw_titlebar`
+    // paints them.
+    let button_top = 2;
+    let button_bottom = TITLEBAR_HEIGHT - 2;
+    let right_edge = width - TITLE_BUTTON_MARGIN;
+    if y < button_top || y >= button_bottom || x >= right_edge {
+        return TitlebarHit::None;
+    }
+    let close_x = right_edge - TITLE_BUTTON;
+    let max_x = close_x - TITLE_BUTTON;
+    let icon_x = max_x - TITLE_BUTTON;
+    if x >= close_x {
+        TitlebarHit::Close
+    } else if x >= max_x {
+        TitlebarHit::Maximize
+    } else if x >= icon_x {
+        TitlebarHit::Iconify
+    } else {
+        TitlebarHit::None
+    }
+}
+
+/// Draw an EDE window title bar across the top of a window.
+///
+/// Focused windows get the steel-blue bar (`#4B6983`, from EDE's
+/// shipped `title.png`) with white text; unfocused windows get the
+/// warm gray (`#EAE8E3`, from `title-unfocus.png`) with dim text and a
+/// border line under the bar. The three buttons on the right are drawn
+/// as their glyphs — □, — and ✕ — in the theme's `#E6E6E6` face.
+pub fn draw_titlebar(canvas: &mut Canvas, width: i32, title: &str, focused: bool) {
+    draw_titlebar_at(canvas, 0, 0, width, title, focused);
+}
+
+/// [`draw_titlebar`] at a non-zero origin — a dialog's title bar
+/// starts at `(x, y)` rather than at the surface's corner.
+pub fn draw_titlebar_at(
+    canvas: &mut Canvas,
+    x: i32,
+    y: i32,
+    width: i32,
+    title: &str,
+    focused: bool,
+) {
+    let (bar, text) = if focused {
+        (palette::CHROME, palette::TEXT_ON_CHROME)
+    } else {
+        (palette::TITLE_UNFOCUS, palette::TEXT_DIM)
+    };
+    let bar_rect = Rect::new(x, y, width as u32, TITLEBAR_HEIGHT as u32);
+    canvas.fill_rect(bar_rect, bar);
+    if !focused {
+        canvas.fill_rect(
+            Rect::new(x, y + TITLEBAR_HEIGHT - 1, width as u32, 1),
+            palette::BORDER,
+        );
+    }
+    canvas.draw_text(x + 8, y + 3, title, text, Some(bar));
+
+    // The three buttons, right-aligned: iconify, maximize, close.
+    let button_y = y + 2;
+    let glyph_y = button_y + 4;
+    for (index, kind) in [
+        TitlebarHit::Iconify,
+        TitlebarHit::Maximize,
+        TitlebarHit::Close,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let left = x + width - TITLE_BUTTON_MARGIN - (index as i32 + 1) * TITLE_BUTTON;
+        canvas.fill_rect(
+            Rect::new(
+                left,
+                button_y,
+                TITLE_BUTTON as u32,
+                (TITLEBAR_HEIGHT - 4) as u32,
+            ),
+            palette::BUTTON_FACE,
+        );
+        canvas.stroke_rect(
+            Rect::new(
+                left,
+                button_y,
+                TITLE_BUTTON as u32,
+                (TITLEBAR_HEIGHT - 4) as u32,
+            ),
+            palette::BORDER,
+        );
+        match kind {
+            // Iconify: a bar sitting on the button's floor.
+            TitlebarHit::Iconify => {
+                canvas.fill_rect(Rect::new(left + 4, glyph_y + 7, 9, 2), palette::TEXT);
+            }
+            // Maximize: an outlined square.
+            TitlebarHit::Maximize => {
+                canvas.stroke_rect(Rect::new(left + 4, glyph_y, 9, 8), palette::TEXT);
+            }
+            // Close: an X, two diagonal runs of pixels.
+            TitlebarHit::Close => {
+                for step in 0..8 {
+                    canvas.set_pixel(left + 4 + step, glyph_y + step, palette::TEXT);
+                    canvas.set_pixel(left + 11 - step, glyph_y + step, palette::TEXT);
+                }
+            }
+            TitlebarHit::None => {}
+        }
+    }
+}
 ///
 /// The text lives in the caller's buffer rather than inside the field, so a
 /// program can hold a megabyte of text without this struct becoming a
@@ -1102,5 +1278,76 @@ mod tests {
             16,
             "a one-pixel caret, sixteen rows tall, on the second row"
         );
+    }
+
+    // --- The EDE title bar ------------------------------------------------
+
+    #[test]
+    fn titlebar_buttons_hit_where_they_are_drawn() {
+        // A 100px-wide bar: buttons are 18px each with a 2px right margin.
+        // close [80,98), maximize [62,80), iconify [44,62), vertically 2..20.
+        use super::{TitlebarHit, titlebar_hit};
+        assert_eq!(titlebar_hit(90, 10, 100), TitlebarHit::Close);
+        assert_eq!(titlebar_hit(70, 10, 100), TitlebarHit::Maximize);
+        assert_eq!(titlebar_hit(50, 10, 100), TitlebarHit::Iconify);
+        assert_eq!(
+            titlebar_hit(30, 10, 100),
+            TitlebarHit::None,
+            "left of the buttons"
+        );
+        assert_eq!(
+            titlebar_hit(99, 10, 100),
+            TitlebarHit::None,
+            "the right margin"
+        );
+        assert_eq!(
+            titlebar_hit(90, 1, 100),
+            TitlebarHit::None,
+            "above the buttons"
+        );
+        assert_eq!(
+            titlebar_hit(90, 21, 100),
+            TitlebarHit::None,
+            "below the buttons"
+        );
+        assert_eq!(titlebar_hit(-1, 10, 100), TitlebarHit::None);
+    }
+
+    #[test]
+    fn the_titlebar_painting_matches_the_theme() {
+        use super::{TITLEBAR_HEIGHT, draw_titlebar};
+        let mut pixels = [0u32; 100 * 24];
+        {
+            let mut canvas = canvas(&mut pixels, 100, 24);
+            draw_titlebar(&mut canvas, 100, "Terminal", true);
+        }
+        // The focused bar is EDE's steel blue, edge to edge.
+        assert_eq!(pixel(&pixels, 100, 4, 10), palette::CHROME);
+        assert_eq!(pixel(&pixels, 100, 40, 10), palette::CHROME);
+        // The three button faces are the theme's light gray.
+        assert_eq!(pixel(&pixels, 100, 90, 10), palette::BUTTON_FACE);
+        assert_eq!(pixel(&pixels, 100, 70, 10), palette::BUTTON_FACE);
+        // Unfocused: the warm gray instead.
+        let mut gray = [0u32; 100 * 24];
+        {
+            let mut canvas = canvas(&mut gray, 100, 24);
+            draw_titlebar(&mut canvas, 100, "Terminal", false);
+        }
+        assert_eq!(pixel(&gray, 100, 40, 10), palette::TITLE_UNFOCUS);
+        // The bar is exactly TITLEBAR_HEIGHT tall: row below is untouched.
+        assert_eq!(pixel(&gray, 100, 40, TITLEBAR_HEIGHT as usize), 0);
+    }
+
+    #[test]
+    fn the_palette_is_edes_own() {
+        // Pinned to the assets EDE ships (pekwm `default` theme), so a
+        // future "cleanup" cannot quietly drift the desktop away from
+        // EDE's colours.
+        assert_eq!(palette::CHROME, colour(75, 105, 131)); // title.png
+        assert_eq!(palette::TITLE_UNFOCUS, colour(234, 232, 227)); // title-unfocus.png
+        assert_eq!(palette::BORDER, colour(198, 198, 198)); // border.png
+        assert_eq!(palette::BUTTON_FACE, colour(230, 230, 230)); // close.png
+        assert_eq!(palette::MENU_HEADER, colour(127, 158, 188)); // top-menu.png
+        assert_eq!(palette::MENU_FACE, colour(251, 251, 251)); // bottom-menu.png
     }
 }

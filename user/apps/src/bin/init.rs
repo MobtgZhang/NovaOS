@@ -21,9 +21,13 @@ const HOME: Rights = Rights::READ.union(Rights::WRITE);
 /// services: the widgets demo takes its slot, and the thread pool is sized for
 /// exactly the services in this list.
 const DESKTOP_SERVICES: &[Service] = &[
-    ("desktop-shell", Some(("/", Rights::READ))),
+    // The file and console services first: the desktop shell scans
+    // `~/.ede` and `~/Desktop` at startup, so it must find the file
+    // server already answering. Starting it first is what keeps the
+    // wallpaper from appearing a second and a half late.
     ("file-server", None),
     ("console-server", None),
+    ("desktop-shell", Some(("/", Rights::READ))),
     ("shell", Some(("/", HOME))),
     ("terminal", Some(("/", HOME))),
     // The editor reads and writes the user's own files, and nothing else.

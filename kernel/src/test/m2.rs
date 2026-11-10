@@ -189,6 +189,10 @@ pub static M2_SUITES: &[TestSuite] = &[
                 "writing_one_space_leaves_the_other_alone",
                 writing_one_space_leaves_the_other_alone,
             ),
+            (
+                "an_offset_address_translates_exactly",
+                an_offset_address_translates_exactly,
+            ),
         ],
     },
     TestSuite {
@@ -1402,6 +1406,51 @@ fn a_space_cannot_see_the_other_frames() -> Result<(), &'static str> {
     // first space's address.
     if address_space::translate(&a, VIRT) == Some(frame_b) {
         return Err("the first space reaches the second space's frame");
+    }
+
+    Ok(())
+}
+
+/// A translation names the byte asked for, not the base of its page.
+///
+/// Every caller used to ask for page-aligned addresses, so a walk that
+/// dropped the offset within the page passed every check — until a caller
+/// asked for the *middle* of a page (a driver's command buffer in `.bss`
+/// did) and the device was handed a physical address pointing at the wrong
+/// bytes. Both walks and the kernel image's own mapping are pinned here.
+fn an_offset_address_translates_exactly() -> Result<(), &'static str> {
+    const VIRT: u64 = 0x0000_0000_0000_4000;
+    const OFFSET: u64 = 0x244;
+
+    let space = new_process_space().map_err(|_| "could not create an address space")?;
+    let frame = alloc_frame()?;
+    address_space::map(&space, VIRT, frame, Protection::UserReadWrite)
+        .map_err(|_| "could not map the page")?;
+
+    let exact = address_space::translate(&space, VIRT + OFFSET)
+        .ok_or("the middle of a mapped page does not translate")?;
+    if exact != frame + OFFSET {
+        return Err("the walk dropped the offset within the page");
+    }
+
+    // The user-pointer walk carries the same contract.
+    let user = address_space::translate_user(&space, VIRT + OFFSET)
+        .ok_or("the middle of a mapped page does not translate for user access")?;
+    if user != frame + OFFSET {
+        return Err("the user walk dropped the offset within the page");
+    }
+
+    // And the kernel image, which is where a driver's statics live: a page
+    // of this function's own code, asked for at an offset from its base.
+    let text = an_offset_address_translates_exactly as *const () as u64;
+    let page = text & !(crate::arch::ADDRESS_SPACE.page_size - 1);
+    let kernel = address_space::kernel_space();
+    let base = address_space::translate(&kernel, page)
+        .ok_or("the kernel's own text page does not translate")?;
+    let middle = address_space::translate(&kernel, page + OFFSET)
+        .ok_or("the middle of a kernel page does not translate")?;
+    if middle != base + OFFSET {
+        return Err("the kernel walk dropped the offset within the page");
     }
 
     Ok(())

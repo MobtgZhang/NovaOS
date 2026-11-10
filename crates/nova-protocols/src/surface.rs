@@ -38,6 +38,15 @@ pub const SURFACE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
 /// The only pixel format M6 accepts.
 pub const PIXEL_FORMAT_XRGB8888: u32 = 1;
 
+/// Create flag: the surface is pinned to the bottom of the z-order.
+///
+/// The desktop background is one fullscreen client, and without this
+/// flag a click on the wallpaper would raise it above every window —
+/// the windows do not close, they are simply covered. A bottom-pinned
+/// surface still takes focus and pointer events; it just never stacks
+/// above an ordinary surface.
+pub const SURFACE_CREATE_FLAG_BOTTOM: u32 = 1;
+
 /// Opcodes from §15.3's surface protocol draft.
 pub const SURFACE_OP_CREATE: u64 = 1;
 pub const SURFACE_OP_ATTACH: u64 = 2;
@@ -255,7 +264,7 @@ pub struct SurfaceCreateRequest {
     pub height: u32,
     /// The pixel format. Only XRGB8888 is accepted.
     pub format: PixelFormat,
-    /// Reserved flags. Must be zero.
+    /// Create flags: [`SURFACE_CREATE_FLAG_BOTTOM`], or zero.
     pub flags: u32,
 }
 

@@ -38,6 +38,7 @@
 //! drag starts on the press and resolves on the release.
 
 use nova_apps::graphics::{self, InputEvent, Window};
+use nova_apps::syscall::wall_time;
 use nova_apps::{console, fsclient, process, yield_now};
 use nova_desktop::wallpaper;
 use nova_ede_about::AboutContent;
@@ -54,22 +55,32 @@ use nova_protocols::input::{
     INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER,
 };
 use nova_ui::keyboard::{Decoder, Key};
-use nova_ui::{Canvas, Rect, typeface};
+use nova_ui::{Canvas, Rect, palette, typeface};
 
 static HAN_SANS: &[u8] = include_bytes!("../../../../assets/fonts/han-sans-gui.ttf");
 
-const WIDTH: u32 = 1024;
-const HEIGHT: u32 = 768;
+const DEFAULT_WIDTH: u32 = 1024;
+const DEFAULT_HEIGHT: u32 = 768;
 const MAX_EVENTS: usize = 8;
 
-/// The start menu's geometry, in surface coordinates.
+/// The EDE menu's geometry, in surface coordinates.
+///
+/// The menu sizes itself to its page: a header bar, up to
+/// [`MAX_MENU_ROWS`] rows of [`MENU_ROW_PITCH`], and a 4px floor gap.
 const MENU_WIDTH: i32 = 240;
-const MENU_OFFSET: i32 = 264;
-const MENU_ROWS_TOP: i32 = 70;
-const MENU_ROW_PITCH: i32 = 34;
-const MENU_ROW_HEIGHT: i32 = 28;
-/// The menu fits four application rows above the About row.
-const MAX_MENU_ROWS: usize = 4;
+const MENU_HEADER_H: i32 = 24;
+const MENU_ROW_PITCH: i32 = 24;
+const MENU_FLOOR: i32 = 4;
+const MENU_X: i32 = 8;
+/// The most rows any menu page shows.
+const MAX_MENU_ROWS: usize = 8;
+
+/// The Run dialog's size, and the offsets of its two buttons.
+const RUN_DIALOG_W: i32 = 360;
+const RUN_DIALOG_H: i32 = 116;
+const RUN_OK_INSET: i32 = 184;
+const RUN_CANCEL_INSET: i32 = 96;
+const RUN_BUTTON_INSET_Y: i32 = 84;
 
 /// How many `icons=` names `desktop.conf` may filter by.
 const MAX_ICON_FILTER: usize = 16;
@@ -131,26 +142,75 @@ struct Shell {
     /// The last pointer position, for the auto-hider.
     pointer_x: i32,
     pointer_y: i32,
+    /// The scanout size this shell lays itself out for.
+    ///
+    /// Read from the display service at startup, not assumed: the
+    /// desktop must fill whatever mode the GPU reports, and a shell
+    /// that hard-coded 1024x768 would leave a band of untouched
+    /// framebuffer wherever the device chose something else.
+    width: u32,
+    height: u32,
     /// Ticks the pointer has been away from an auto-hiding panel.
     hider_ticks: u32,
     /// The window list's fingerprint as last published: membership and
     /// state, not the round trip, is what warrants a redraw.
     windows_fingerprint: Option<u64>,
+    /// The clock text the panel draws (`HH:MM`) and the minute it was
+    /// read — the wall clock is an RTC poll, so it is fetched when the
+    /// minute turns, not per frame. Empty until the first successful
+    /// read.
+    clock_text: [u8; 6],
+    clock_len: usize,
+    clock_minute: i64,
+    /// The window list as last published, for the EDE menu's Window
+    /// List page.
+    window_list: [TaskEntry; taskbar::MAX_WINDOWS],
+    window_count: usize,
+    /// Which page of the EDE menu is showing.
+    menu_page: MenuPage,
+    /// The highlighted row on the current menu page.
+    menu_selection: usize,
+    /// The Run dialog: open flag, typed command, caret, and buttons.
+    run_open: bool,
+    run_input: [u8; RUN_INPUT_MAX],
+    run_len: usize,
+    run_cursor: usize,
+    run_ok: nova_ui::Button,
+    run_cancel: nova_ui::Button,
     /// The name of a notification file that resisted deletion: its
     /// content is posted once, not again on every drain.
     stuck_notify: [u8; 32],
     stuck_notify_len: usize,
 }
 
+/// The maximum command the Run dialog keeps.
+const RUN_INPUT_MAX: usize = 48;
+
+/// Which page of the EDE menu is open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MenuPage {
+    /// The top level: Programs, Window List, Run…, About EDE.
+    Root,
+    /// The Programs page: one row per category.
+    Programs,
+    /// One category's applications; the index is into the category
+    /// list [`Shell::menu_categories`] builds — stable for a given set
+    /// of `.desktop` files, which is what makes it safe to draw the
+    /// page and to hit-test it separately.
+    Category(usize),
+    /// The window list.
+    WindowList,
+}
+
 impl Shell {
-    fn new() -> Self {
+    fn new(width: u32, height: u32) -> Self {
         let mut shell = Self {
             layer: DesktopLayer::new(),
             start_menu: false,
             about: false,
             launchpad: Launchpad::new(),
             notify: NotifyBus::new(),
-            panel: Panel::new(WIDTH),
+            panel: Panel::new(width),
             hover: None,
             hover_ticks: 0,
             tip: Tooltip::new(12),
@@ -166,8 +226,39 @@ impl Shell {
             own_surface: 0,
             pointer_x: -1,
             pointer_y: -1,
+            width,
+            height,
             hider_ticks: 0,
             windows_fingerprint: None,
+            clock_text: [0; 6],
+            clock_len: 0,
+            clock_minute: -1,
+            window_list: [TaskEntry::new(0, "", false, false); taskbar::MAX_WINDOWS],
+            window_count: 0,
+            menu_page: MenuPage::Root,
+            menu_selection: 0,
+            run_open: false,
+            run_input: [0; RUN_INPUT_MAX],
+            run_len: 0,
+            run_cursor: 0,
+            run_ok: nova_ui::Button::new(
+                Rect::new(
+                    (width as i32 - RUN_DIALOG_W) / 2 + RUN_DIALOG_W - RUN_OK_INSET,
+                    (height as i32 - RUN_DIALOG_H) / 2 + RUN_BUTTON_INSET_Y,
+                    80,
+                    24,
+                ),
+                "OK",
+            ),
+            run_cancel: nova_ui::Button::new(
+                Rect::new(
+                    (width as i32 - RUN_DIALOG_W) / 2 + RUN_DIALOG_W - RUN_CANCEL_INSET,
+                    (height as i32 - RUN_DIALOG_H) / 2 + RUN_BUTTON_INSET_Y,
+                    80,
+                    24,
+                ),
+                "Cancel",
+            ),
             stuck_notify: [0; 32],
             stuck_notify_len: 0,
         };
@@ -305,6 +396,39 @@ impl Shell {
         changed
     }
 
+    /// Read the wall clock when the minute turns.
+    ///
+    /// The wall clock is an RTC read through the kernel — not a cheap
+    /// call — so the shell polls it once a minute of *wall time* and
+    /// keeps the formatted `HH:MM` between polls. Returns whether the
+    /// displayed text changed.
+    fn refresh_clock(&mut self) -> bool {
+        let Ok(seconds) = wall_time() else {
+            return false;
+        };
+        if seconds < 0 {
+            return false;
+        }
+        let minute = seconds / 60;
+        if minute == self.clock_minute {
+            return false;
+        }
+        self.clock_minute = minute;
+        let day_seconds = seconds.rem_euclid(86_400);
+        let hour = (day_seconds / 3600) as u8;
+        let mins = ((day_seconds % 3600) / 60) as u8;
+        let text = [
+            b'0' + hour / 10,
+            b'0' + hour % 10,
+            b':',
+            b'0' + mins / 10,
+            b'0' + mins % 10,
+        ];
+        self.clock_text[..5].copy_from_slice(&text);
+        self.clock_len = 5;
+        true
+    }
+
     /// Page through the compositor's window list and republish it to
     /// the panel's taskbar. The shell's own surface is skipped — a
     /// window does not list itself as one of its own chips.
@@ -353,6 +477,9 @@ impl Shell {
             return false;
         }
         self.windows_fingerprint = Some(fingerprint);
+        // Keep a copy for the EDE menu's Window List page.
+        self.window_list = collected;
+        self.window_count = count;
         let mut model = TaskbarModel::new();
         model.sync(&collected[..count]);
         self.panel.set_windows(&model);
@@ -367,7 +494,7 @@ impl Shell {
         if !self.panel_settings.hider {
             return false;
         }
-        let panel_top = HEIGHT as i32 - self.panel.height() as i32;
+        let panel_top = self.height as i32 - self.panel.height() as i32;
         if self.pointer_y >= panel_top {
             self.hider_ticks = 0;
             if !self.panel.hider_open() {
@@ -385,14 +512,133 @@ impl Shell {
         false
     }
 
-    /// The start menu's top edge, in surface coordinates.
-    fn menu_top(&self) -> i32 {
-        HEIGHT as i32 - self.panel.height() as i32 - MENU_OFFSET
+    /// The rows the current menu page shows, capped at the page budget.
+    fn menu_row_count(&self) -> usize {
+        let rows = match self.menu_page {
+            MenuPage::Root => 4,
+            MenuPage::Programs => self.launchpad.category_count(),
+            MenuPage::Category(category) => self
+                .launchpad
+                .category_at(category)
+                .map(|name| self.launchpad.matching_in_category(name).count())
+                .unwrap_or(0),
+            MenuPage::WindowList => self.window_count,
+        };
+        rows.min(MAX_MENU_ROWS)
     }
 
-    /// How many application rows the menu shows right now.
-    fn menu_rows(&self) -> usize {
-        self.launchpad.matches().min(MAX_MENU_ROWS)
+    /// The menu's height for its current page: header, rows, floor.
+    fn menu_height(&self) -> i32 {
+        MENU_HEADER_H + (self.menu_row_count() as i32) * MENU_ROW_PITCH + MENU_FLOOR
+    }
+
+    /// The menu's top edge: it hangs directly above the panel.
+    fn menu_top(&self) -> i32 {
+        self.height as i32 - self.panel.height() as i32 - 4 - self.menu_height()
+    }
+
+    /// The Run dialog's left edge, centred on the screen.
+    fn run_dialog_x(&self) -> i32 {
+        (self.width as i32 - RUN_DIALOG_W) / 2
+    }
+
+    /// The Run dialog's top edge, centred on the screen.
+    fn run_dialog_y(&self) -> i32 {
+        (self.height as i32 - RUN_DIALOG_H) / 2
+    }
+
+    /// The header's title for the current page.
+    fn menu_title(&self) -> &str {
+        match self.menu_page {
+            MenuPage::Root => "EDE",
+            MenuPage::Programs => "Programs",
+            MenuPage::Category(index) => self.launchpad.category_at(index).unwrap_or("Programs"),
+            MenuPage::WindowList => "Window List",
+        }
+    }
+
+    /// The label of one row of the current page, and whether it opens
+    /// a submenu (the row then gets a ▸ arrow).
+    fn menu_row_text(&self, row: usize) -> (&str, bool) {
+        match self.menu_page {
+            MenuPage::Root => match row {
+                0 => ("Programs", true),
+                1 => ("Window List", true),
+                2 => ("Run...", false),
+                _ => ("About EDE", false),
+            },
+            MenuPage::Programs => (self.launchpad.category_at(row).unwrap_or(""), true),
+            MenuPage::Category(category) => {
+                let name = self.launchpad.category_at(category).unwrap_or("");
+                let label = self
+                    .launchpad
+                    .matching_in_category(name)
+                    .nth(row)
+                    .and_then(|index| self.launchpad.entry_ref(index))
+                    .map(|entry| entry.name())
+                    .unwrap_or("");
+                (label, false)
+            }
+            MenuPage::WindowList => (
+                self.window_list
+                    .get(row)
+                    .map(|entry| entry.title())
+                    .unwrap_or(""),
+                false,
+            ),
+        }
+    }
+
+    /// Move the menu's highlight, wrapping at both ends.
+    fn menu_move(&mut self, delta: i32) -> bool {
+        let rows = self.menu_row_count();
+        if rows == 0 {
+            return false;
+        }
+        let mut next = self.menu_selection as i32 + delta;
+        while next < 0 {
+            next += rows as i32;
+        }
+        let next = (next as usize) % rows;
+        if next != self.menu_selection {
+            self.menu_selection = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Go up one menu page; at the root there is nowhere to go.
+    fn menu_back(&mut self) -> bool {
+        let next = match self.menu_page {
+            MenuPage::Category(_) => Some(MenuPage::Programs),
+            MenuPage::Programs | MenuPage::WindowList => Some(MenuPage::Root),
+            MenuPage::Root => None,
+        };
+        match next {
+            Some(page) => {
+                self.menu_page = page;
+                self.menu_selection = 0;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Close the menu and forget its page and filter.
+    fn close_menu(&mut self) {
+        self.start_menu = false;
+        self.launchpad.clear();
+        self.menu_page = MenuPage::Root;
+        self.menu_selection = 0;
+    }
+
+    /// Open the Run dialog with an empty field.
+    fn open_run_dialog(&mut self) {
+        self.close_menu();
+        self.run_open = true;
+        self.run_len = 0;
+        self.run_cursor = 0;
     }
 
     fn draw(&mut self, canvas: &mut Canvas) {
@@ -404,7 +650,7 @@ impl Shell {
             wallpaper::paint(canvas);
         } else {
             let color = self.desktop_conf.color & 0x00FF_FFFF;
-            canvas.fill_rect(Rect::new(0, 0, WIDTH, HEIGHT), color);
+            canvas.fill_rect(Rect::new(0, 0, self.width, self.height), color);
         }
 
         // Desktop icons, with the selection highlight.
@@ -420,14 +666,15 @@ impl Shell {
                 icon.cell.height as u32,
             );
             if icon.selected {
-                canvas.fill_rect(cell, 0x0068AAC4);
-                canvas.fill_rect(cell.inset(2), 0x001A2A3A);
+                canvas.fill_rect(cell, palette::SELECTED);
+                canvas.fill_rect(cell.inset(2), palette::SURFACE);
             }
-            // Glyph plate and a simple glyph per app.
+            // Glyph plate and a simple glyph per app: EDE's light
+            // window gray with the theme's border.
             let gx = cell.x + 28;
             let gy = cell.y + 8;
-            canvas.fill_rect(Rect::new(gx, gy, 48, 40), 0x001A2A3A);
-            canvas.stroke_rect(Rect::new(gx, gy, 48, 40), 0x0068AAC4);
+            canvas.fill_rect(Rect::new(gx, gy, 48, 40), palette::SURFACE);
+            canvas.stroke_rect(Rect::new(gx, gy, 48, 40), palette::BORDER);
             nova_ede_panel::glyph(canvas, icon.exec(), gx + 24, gy + 20);
             // Label with shadow.
             canvas.draw_text(cell.x + 6, cell.y + 56, icon.label(), 0x00000000, None);
@@ -440,7 +687,7 @@ impl Shell {
                 if let Some(icon) = self.layer.icon(index) {
                     let text = icon.label();
                     let w = nova_ui::Canvas::text_width(text) as i32 + 20;
-                    let bx = (icon.cell.x + 60).min(WIDTH as i32 - w - 8);
+                    let bx = (icon.cell.x + 60).min(self.width as i32 - w - 8);
                     let by = icon.cell.y + 84;
                     canvas.fill_rect(Rect::new(bx, by, w as u32, 26), 0x00FFF7B0);
                     canvas.draw_text(bx + 10, by + 5, text, 0x00201A08, Some(0x00FFF7B0));
@@ -448,19 +695,25 @@ impl Shell {
             }
         }
 
-        // The panel.
-        let panel_top = HEIGHT as i32 - self.panel.height() as i32;
+        // The panel, with the clock read from the wall clock. The text
+        // is copied first: `panel.draw` needs `&mut self.panel`, which
+        // cannot coexist with a borrow of `self` for the string.
+        let panel_top = self.height as i32 - self.panel.height() as i32;
+        let mut clock_buf = [0u8; 6];
+        let clock_len = self.clock_len;
+        clock_buf[..clock_len].copy_from_slice(&self.clock_text[..clock_len]);
+        let clock = core::str::from_utf8(&clock_buf[..clock_len]).unwrap_or("");
         self.panel
-            .draw(canvas, panel_top, self.notify.pending() > 0);
+            .draw(canvas, panel_top, self.notify.pending() > 0, clock);
 
-        // The start menu, if open.
+        // The EDE menu, if open.
         if self.start_menu {
-            self.draw_start_menu(canvas);
+            self.draw_ede_menu(canvas);
         }
 
         // The notification balloon, if any.
         if let Some(note) = self.notify.current() {
-            let bx = WIDTH as i32 - 280;
+            let bx = self.width as i32 - 280;
             let by = panel_top - 96;
             canvas.fill_rect(Rect::new(bx, by, 256, 88), 0x00172028);
             canvas.stroke_rect(Rect::new(bx, by, 256, 88), 0x0068AAC4);
@@ -479,110 +732,174 @@ impl Shell {
         if self.about {
             self.draw_about(canvas);
         }
+
+        // The Run dialog, if open — topmost of all.
+        if self.run_open {
+            self.draw_run_dialog(canvas);
+        }
     }
 
     fn draw_about(&self, canvas: &mut Canvas) {
         let about = AboutContent::novaos();
-        let bx = (WIDTH as i32 - 360) / 2;
-        let by = (HEIGHT as i32 - 280) / 2;
-        canvas.fill_rect(Rect::new(bx, by, 360, 280), 0x001B2530);
-        canvas.stroke_rect(Rect::new(bx, by, 360, 280), 0x0068AAC4);
+        let bx = (self.width as i32 - 360) / 2;
+        let by = (self.height as i32 - 280) / 2;
+        let rect = Rect::new(bx, by, 360, 280);
+        canvas.fill_rect(rect, palette::SURFACE);
+        canvas.stroke_rect(rect, palette::BORDER);
+        nova_ui::draw_titlebar_at(canvas, bx, by, 360, "About EDE", true);
         canvas.draw_text(
             bx + 20,
-            by + 16,
+            by + 32,
             about.product,
-            0x00E6ECF2,
-            Some(0x001B2530),
+            palette::TEXT,
+            Some(palette::SURFACE),
         );
         canvas.draw_text(
             bx + 20,
-            by + 40,
+            by + 54,
             about.version,
-            0x0068AAC4,
-            Some(0x001B2530),
+            palette::CHROME,
+            Some(palette::SURFACE),
         );
         canvas.draw_text(
             bx + 20,
-            by + 62,
+            by + 76,
             about.tagline,
-            0x00C8D4DE,
-            Some(0x001B2530),
+            palette::TEXT_DIM,
+            Some(palette::SURFACE),
         );
         for (index, line) in about.credits.iter().enumerate() {
             canvas.draw_text(
                 bx + 20,
-                by + 92 + index as i32 * 18,
+                by + 104 + index as i32 * 18,
                 line,
-                0x008A93A4,
-                Some(0x001B2530),
+                palette::TEXT,
+                Some(palette::SURFACE),
             );
         }
         canvas.draw_text(
             bx + 20,
-            by + 250,
+            by + 254,
             "click anywhere to close",
-            0x005A6270,
-            Some(0x001B2530),
+            palette::TEXT_DIM,
+            Some(palette::SURFACE),
         );
     }
 
-    fn draw_start_menu(&mut self, canvas: &mut Canvas) {
-        let bx = 8;
+    /// Draw the EDE menu: a header bar over a page of rows, in the
+    /// theme's near-white body with the title blue as the selection.
+    fn draw_ede_menu(&mut self, canvas: &mut Canvas) {
+        let rows = self.menu_row_count();
+        let height = self.menu_height();
         let by = self.menu_top();
-        // Deep slate popup with an accent edge.
-        canvas.fill_rect(Rect::new(bx, by, MENU_WIDTH as u32, 260), 0x00152022);
-        canvas.stroke_rect(Rect::new(bx, by, MENU_WIDTH as u32, 260), 0x0068AAC4);
-        // Header: comet + wordmark + tagline (or the active filter).
-        nova_ede_panel::draw_comet(canvas, bx + 18, by + 16, 0x0068AAC4);
-        canvas.draw_text(bx + 44, by + 12, "NovaOS", 0x00E6ECF2, Some(0x00152022));
-        let filter = self.launchpad.filter();
-        let subtitle = if filter.is_empty() {
-            "EDE, reborn in Rust"
-        } else {
-            filter
-        };
-        canvas.draw_text(bx + 44, by + 30, subtitle, 0x007E8896, Some(0x00152022));
-        canvas.fill_rect(Rect::new(bx, by + 58, MENU_WIDTH as u32, 1), 0x001F3142);
-        // The matching applications, one row each, selected row lit.
-        let selected = self.launchpad.selected_index();
-        let mut row = 0u32;
-        for index in self.launchpad.matching_indices() {
-            if row as usize >= MAX_MENU_ROWS {
-                break;
-            }
-            let Some(entry) = self.launchpad.entry(index) else {
-                continue;
-            };
-            let y = by + MENU_ROWS_TOP + (row as i32) * MENU_ROW_PITCH;
-            let bg = if row as usize == selected {
-                0x0023485C
-            } else {
-                0x001B2836
-            };
-            canvas.fill_rect(
-                Rect::new(bx + 8, y, (MENU_WIDTH - 16) as u32, MENU_ROW_HEIGHT as u32),
-                bg,
-            );
-            nova_ede_panel::glyph(canvas, entry.exec(), bx + 22, y + 14);
-            canvas.draw_text(bx + 40, y + 7, entry.name(), 0x00E6ECF2, Some(bg));
-            row += 1;
-        }
-        // The About row.
-        let y = by + MENU_ROWS_TOP + (row as i32) * MENU_ROW_PITCH;
+        let bx = MENU_X;
+        let width = MENU_WIDTH as u32;
+
+        // Body and border.
+        canvas.fill_rect(Rect::new(bx, by, width, height as u32), palette::MENU_FACE);
+        canvas.stroke_rect(Rect::new(bx, by, width, height as u32), palette::BORDER);
+
+        // Header: the page title, and a "<" back affordance on subpages.
         canvas.fill_rect(
-            Rect::new(bx + 8, y, (MENU_WIDTH - 16) as u32, MENU_ROW_HEIGHT as u32),
-            0x001B2836,
+            Rect::new(bx, by, width, MENU_HEADER_H as u32),
+            palette::MENU_HEADER,
         );
-        canvas.draw_text(bx + 40, y + 7, "About NovaOS", 0x00E6A65C, Some(0x001B2836));
-        // Footer: the credit line, the EDE lineage and the GPL.
-        canvas.fill_rect(Rect::new(bx, by + 236, MENU_WIDTH as u32, 1), 0x001F3142);
         canvas.draw_text(
-            bx + 12,
-            by + 244,
-            "NovaOS EDE 0.1.0 - GPL-2.0",
-            0x00406077,
-            Some(0x00152022),
+            bx + 8,
+            by + 4,
+            self.menu_title(),
+            palette::TEXT_ON_CHROME,
+            Some(palette::MENU_HEADER),
         );
+        if self.menu_page != MenuPage::Root {
+            canvas.draw_text(
+                bx + MENU_WIDTH - 16,
+                by + 4,
+                "<",
+                palette::TEXT_ON_CHROME,
+                Some(palette::MENU_HEADER),
+            );
+        }
+
+        // Rows: the highlighted one wears the title blue.
+        for row in 0..rows {
+            let y = by + MENU_HEADER_H + (row as i32) * MENU_ROW_PITCH;
+            let selected = row == self.menu_selection;
+            let (label, submenu) = self.menu_row_text(row);
+            if selected {
+                canvas.fill_rect(
+                    Rect::new(bx + 1, y, width - 2, MENU_ROW_PITCH as u32),
+                    palette::CHROME,
+                );
+            }
+            let (text, bg) = if selected {
+                (palette::TEXT_ON_CHROME, Some(palette::CHROME))
+            } else {
+                (palette::TEXT, Some(palette::MENU_FACE))
+            };
+            canvas.draw_text(bx + 10, y + 5, label, text, bg);
+            if submenu {
+                // A small right-pointing triangle at the row's end.
+                let ax = bx + MENU_WIDTH - 18;
+                let ay = y + 7;
+                for step in 0..5 {
+                    canvas.fill_rect(
+                        Rect::new(ax + step, ay + step, 1, (10 - step * 2) as u32),
+                        text,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Draw the Run dialog: an EDE window with one text field and
+    /// OK/Cancel buttons.
+    fn draw_run_dialog(&mut self, canvas: &mut Canvas) {
+        let rect = Rect::new(
+            self.run_dialog_x(),
+            self.run_dialog_y(),
+            RUN_DIALOG_W as u32,
+            RUN_DIALOG_H as u32,
+        );
+        canvas.fill_rect(rect, palette::SURFACE);
+        canvas.stroke_rect(rect, palette::BORDER);
+        nova_ui::draw_titlebar_at(
+            canvas,
+            self.run_dialog_x(),
+            self.run_dialog_y(),
+            RUN_DIALOG_W,
+            "Run...",
+            true,
+        );
+        canvas.draw_text(
+            self.run_dialog_x() + 16,
+            self.run_dialog_y() + 34,
+            "Command:",
+            palette::TEXT,
+            Some(palette::SURFACE),
+        );
+        // The field: white with the theme's border, caret at the end
+        // of what has been typed.
+        let field = Rect::new(
+            self.run_dialog_x() + 16,
+            self.run_dialog_y() + 54,
+            (RUN_DIALOG_W - 32) as u32,
+            22,
+        );
+        canvas.fill_rect(field, palette::FIELD);
+        canvas.stroke_rect(field, palette::BORDER);
+        let typed = core::str::from_utf8(&self.run_input[..self.run_len]).unwrap_or("");
+        canvas.draw_text(
+            field.x + 6,
+            field.y + 3,
+            typed,
+            palette::TEXT,
+            Some(palette::FIELD),
+        );
+        let caret_x = field.x + 6 + Canvas::text_width(typed) as i32 + 1;
+        canvas.fill_rect(Rect::new(caret_x, field.y + 3, 1, 16), palette::TEXT);
+        self.run_ok.draw(canvas);
+        self.run_cancel.draw(canvas);
     }
 
     /// Launch a service by name, reporting a failure honestly: a
@@ -604,11 +921,6 @@ impl Shell {
     }
 
     /// Resolve a start-menu row to the entry it shows.
-    fn menu_entry(&self, row: usize) -> Option<nova_ede_launch::AppEntry> {
-        let index = self.launchpad.matching_indices().nth(row)?;
-        self.launchpad.entry(index)
-    }
-
     /// A key while the start menu is open: type to filter, arrows to
     /// move the selection, Enter to launch, Escape to close.
     fn on_key(&mut self, event: &InputEvent) -> bool {
@@ -618,6 +930,12 @@ impl Shell {
         else {
             return false;
         };
+
+        // The Run dialog takes the keyboard while it is open.
+        if self.run_open {
+            return self.run_key(key);
+        }
+
         if !self.start_menu {
             if key == Key::Escape && self.about {
                 self.about = false;
@@ -625,42 +943,91 @@ impl Shell {
             }
             return false;
         }
+
         match key {
             Key::Escape => {
-                self.start_menu = false;
-                self.launchpad.clear();
+                // Escape climbs one page; at the root it closes.
+                if !self.menu_back() {
+                    self.close_menu();
+                }
                 true
             }
             Key::Char(byte) => {
-                self.launchpad.type_char(byte);
-                true
+                // Typing filters the applications on a category page;
+                // the other pages have nothing to filter.
+                if matches!(self.menu_page, MenuPage::Category(_)) {
+                    self.launchpad.type_char(byte);
+                    self.menu_selection = 0;
+                    true
+                } else {
+                    false
+                }
             }
             Key::Backspace => {
-                self.launchpad.backspace();
+                if matches!(self.menu_page, MenuPage::Category(_)) {
+                    let removed = self.launchpad.backspace();
+                    if removed {
+                        self.menu_selection = 0;
+                    }
+                    removed
+                } else {
+                    false
+                }
+            }
+            Key::Up => self.menu_move(-1),
+            Key::Down => self.menu_move(1),
+            Key::Left => self.menu_back(),
+            Key::Right | Key::Enter => {
+                let row = self.menu_selection;
+                self.activate_menu_row(row)
+            }
+            _ => false,
+        }
+    }
+
+    /// A key while the Run dialog is open: type the command, Enter
+    /// runs it, Escape cancels.
+    fn run_key(&mut self, key: Key) -> bool {
+        match key {
+            Key::Escape => {
+                self.run_open = false;
                 true
             }
-            Key::Up => {
-                self.launchpad.move_selection(-1);
-                true
+            Key::Char(byte) => {
+                if (0x20..0x7f).contains(&byte) && self.run_len < RUN_INPUT_MAX {
+                    self.run_input[self.run_len] = byte;
+                    self.run_len += 1;
+                    true
+                } else {
+                    false
+                }
             }
-            Key::Down => {
-                self.launchpad.move_selection(1);
-                true
+            Key::Backspace => {
+                if self.run_len > 0 {
+                    self.run_len -= 1;
+                    true
+                } else {
+                    false
+                }
             }
             Key::Enter => {
-                if let Some(entry) = self.menu_entry(self.launchpad.selected_index()) {
-                    let mut name = [0u8; 48];
-                    let bytes = entry.exec().as_bytes();
-                    let take = bytes.len().min(name.len());
-                    name[..take].copy_from_slice(&bytes[..take]);
-                    self.start_menu = false;
-                    self.launchpad.clear();
-                    self.launch(core::str::from_utf8(&name[..take]).unwrap_or(""));
-                }
+                self.run_submit();
                 true
             }
             _ => false,
         }
+    }
+
+    /// Run the Run dialog's command: the typed text is an executable
+    /// name, exactly what `ede-launch`'s Run line accepts.
+    fn run_submit(&mut self) {
+        let mut buffer = [0u8; RUN_INPUT_MAX];
+        let len = self.run_len;
+        buffer[..len].copy_from_slice(&self.run_input[..len]);
+        self.run_open = false;
+        self.run_len = 0;
+        let text = core::str::from_utf8(&buffer[..len]).unwrap_or("");
+        self.launch(text);
     }
 
     /// Handle one pointer event, on the button's *edges*.
@@ -669,7 +1036,7 @@ impl Shell {
     /// a motion event while the button is held is neither, which is
     /// what keeps a hover from launching anything.
     fn on_pointer(&mut self, event: &InputEvent) -> bool {
-        let panel_top = HEIGHT as i32 - self.panel.height() as i32;
+        let panel_top = self.height as i32 - self.panel.height() as i32;
         let held = event.buttons & INPUT_BUTTON_PRIMARY != 0;
         let was_held = self.prev_buttons & INPUT_BUTTON_PRIMARY != 0;
         let pressed = held && !was_held;
@@ -680,6 +1047,24 @@ impl Shell {
         self.pointer_x = event.x;
         self.pointer_y = event.y;
 
+        // The Run dialog is modal: its buttons and field take the
+        // pointer, and Escape (in on_key) or Cancel closes it.
+        if self.run_open {
+            if self.run_ok.on_pointer(event.x, event.y, held) {
+                self.run_submit();
+                return true;
+            }
+            if self.run_cancel.on_pointer(event.x, event.y, held) {
+                self.run_open = false;
+                return true;
+            }
+            if secondary_pressed {
+                self.run_open = false;
+                return true;
+            }
+            return false;
+        }
+
         // About dialog is modal: a press closes it.
         if self.about {
             if pressed || secondary_pressed {
@@ -689,15 +1074,17 @@ impl Shell {
             return false;
         }
 
-        // The start menu, if open, eats everything above the panel.
+        // The EDE menu, if open, eats everything above the panel.
         if self.start_menu && event.y < panel_top {
             if secondary_pressed {
-                self.start_menu = false;
-                self.launchpad.clear();
+                // Right-click climbs one page, closing at the root.
+                if !self.menu_back() {
+                    self.close_menu();
+                }
                 return true;
             }
             if pressed {
-                return self.click_start_menu(event.x, event.y);
+                return self.click_ede_menu(event.x, event.y);
             }
             return false;
         }
@@ -711,7 +1098,11 @@ impl Shell {
                     Some(PanelAction::OpenStartMenu) => {
                         self.start_menu = !self.start_menu;
                         if self.start_menu {
+                            // Every opening starts at the root page
+                            // with a clean filter.
                             self.launchpad.clear();
+                            self.menu_page = MenuPage::Root;
+                            self.menu_selection = 0;
                         }
                     }
                     Some(PanelAction::Launch(name)) => self.launch(name),
@@ -730,7 +1121,7 @@ impl Shell {
         }
 
         // Balloon hit test: a press on the balloon dismisses it.
-        if event.y >= panel_top - 96 && event.x >= (WIDTH as i32) - 280 {
+        if event.y >= panel_top - 96 && event.x >= (self.width as i32) - 280 {
             if pressed {
                 if let Some(note) = self.notify.current() {
                     let id = note.id;
@@ -890,40 +1281,87 @@ impl Shell {
     /// row opens About, empty space inside the popup does nothing, and
     /// a press outside closes the menu. Returns whether the screen
     /// changed.
-    fn click_start_menu(&mut self, x: i32, y: i32) -> bool {
+    /// A press inside the open EDE menu: the header goes up a page,
+    /// a row activates, and a press outside closes the menu.
+    fn click_ede_menu(&mut self, x: i32, y: i32) -> bool {
+        let rows = self.menu_row_count();
         let by = self.menu_top();
-        let rows = self.menu_rows();
+        // The header: "<" goes up one page on subpages.
+        if y >= by && y < by + MENU_HEADER_H && x >= MENU_X && x < MENU_X + MENU_WIDTH {
+            if self.menu_page != MenuPage::Root {
+                return self.menu_back();
+            }
+            return false;
+        }
         for row in 0..rows {
-            let row_y = by + MENU_ROWS_TOP + (row as i32) * MENU_ROW_PITCH;
-            if y >= row_y && y < row_y + MENU_ROW_HEIGHT && x >= 8 && x < 8 + MENU_WIDTH {
-                if let Some(entry) = self.menu_entry(row) {
-                    let mut name = [0u8; 48];
-                    let bytes = entry.exec().as_bytes();
-                    let take = bytes.len().min(name.len());
-                    name[..take].copy_from_slice(&bytes[..take]);
-                    self.start_menu = false;
-                    self.launchpad.clear();
-                    self.launch(core::str::from_utf8(&name[..take]).unwrap_or(""));
-                    return true;
-                }
-                return false;
+            let row_y = by + MENU_HEADER_H + (row as i32) * MENU_ROW_PITCH;
+            if y >= row_y && y < row_y + MENU_ROW_PITCH && x >= MENU_X && x < MENU_X + MENU_WIDTH {
+                return self.activate_menu_row(row);
             }
         }
-        let about_y = by + MENU_ROWS_TOP + (rows as i32) * MENU_ROW_PITCH;
-        if y >= about_y && y < about_y + MENU_ROW_HEIGHT && x >= 8 && x < 8 + MENU_WIDTH {
-            self.about = true;
-            self.start_menu = false;
-            self.launchpad.clear();
-            return true;
-        }
-        // Inside the popup but on no row: leave it open. Outside: close.
-        let inside = y >= by && y < by + 260 && x >= 8 && x < 8 + MENU_WIDTH;
+        // Outside the popup: close.
+        let height = self.menu_height();
+        let inside = y >= by && y < by + height && x >= MENU_X && x < MENU_X + MENU_WIDTH;
         if !inside {
-            self.start_menu = false;
-            self.launchpad.clear();
+            self.close_menu();
             return true;
         }
         false
+    }
+
+    /// Activate row `row` of the current menu page: descend into a
+    /// submenu, launch an application, activate a window, open the
+    /// Run dialog, or show About.
+    fn activate_menu_row(&mut self, row: usize) -> bool {
+        match self.menu_page {
+            MenuPage::Root => match row {
+                0 => {
+                    self.menu_page = MenuPage::Programs;
+                    self.menu_selection = 0;
+                }
+                1 => {
+                    self.menu_page = MenuPage::WindowList;
+                    self.menu_selection = 0;
+                }
+                2 => self.open_run_dialog(),
+                _ => {
+                    self.about = true;
+                    self.close_menu();
+                }
+            },
+            MenuPage::Programs => {
+                if self.launchpad.category_at(row).is_some() {
+                    self.menu_page = MenuPage::Category(row);
+                    self.menu_selection = 0;
+                }
+            }
+            MenuPage::Category(category) => {
+                let Some(name) = self.launchpad.category_at(category) else {
+                    return false;
+                };
+                let Some(index) = self.launchpad.matching_in_category(name).nth(row) else {
+                    return false;
+                };
+                let Some(entry) = self.launchpad.entry(index) else {
+                    return false;
+                };
+                let mut command = [0u8; 48];
+                let bytes = entry.exec().as_bytes();
+                let take = bytes.len().min(command.len());
+                command[..take].copy_from_slice(&bytes[..take]);
+                self.close_menu();
+                self.launch(core::str::from_utf8(&command[..take]).unwrap_or(""));
+            }
+            MenuPage::WindowList => {
+                let Some(entry) = self.window_list.get(row) else {
+                    return false;
+                };
+                let id = entry.id;
+                self.close_menu();
+                let _ = graphics::compositor_activate(id);
+            }
+        }
+        true
     }
 }
 
@@ -933,7 +1371,21 @@ pub extern "C" fn main() -> i64 {
 
     let _ = console::write_str("[NOVA] desktop-shell ready\r\n");
 
-    let mut window = match Window::open(WIDTH, HEIGHT) {
+    // Lay the desktop out for the mode the GPU actually scans out. The
+    // device is the authority: a size assumed here would be wrong on any
+    // resolution but that one, and the wallpaper, panel and dialog
+    // placement all follow from it.
+    let (width, height) = match graphics::display_query() {
+        Ok(mode) if mode.width >= 320 && mode.height >= 240 => (mode.width, mode.height),
+        _ => (DEFAULT_WIDTH, DEFAULT_HEIGHT),
+    };
+
+    let _ = console::write_fmt(format_args!(
+        "[NOVA] desktop: {}x{} from the display service\r\n",
+        width, height
+    ));
+
+    let mut window = match Window::open_bottom(width, height) {
         Ok(window) => window,
         Err(error) => {
             let _ = console::write_fmt(format_args!(
@@ -945,9 +1397,10 @@ pub extern "C" fn main() -> i64 {
     };
     let _ = graphics::compositor_move(window.surface, 0, 0);
 
-    let mut canvas = Canvas::new(window.buffer, WIDTH, HEIGHT);
-    let mut shell = Shell::new();
+    let mut canvas = Canvas::new(window.buffer, width, height);
+    let mut shell = Shell::new(width, height);
     shell.own_surface = window.surface;
+    shell.refresh_clock();
     let mut events = [InputEvent::EMPTY; MAX_EVENTS];
 
     shell.draw(&mut canvas);
@@ -986,6 +1439,11 @@ pub extern "C" fn main() -> i64 {
         }
         if shell.ticks % 64 == 0 {
             dirty |= shell.refresh_windows();
+        }
+        if shell.ticks % 512 == 0 {
+            // The wall clock is an RTC read: poll it when the minute
+            // can have turned, not every frame.
+            dirty |= shell.refresh_clock();
         }
         dirty |= shell.tick_hider();
         if dirty {

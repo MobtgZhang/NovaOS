@@ -136,3 +136,12 @@ pub fn boot_mode() -> Result<i64, SyscallError> {
 pub fn console_clear() -> Result<i64, SyscallError> {
     call(Syscall(nr::CONSOLE_CLEAR.number()).raw(), [0; 6])
 }
+
+/// The wall clock as Unix seconds, or `-1` when the RTC could not be
+/// read plausibly.
+///
+/// This reads hardware through the kernel and is not a fast call: a
+/// panel clock should poll it once a minute, not once a frame.
+pub fn wall_time() -> Result<i64, SyscallError> {
+    call(Syscall(nr::TIME.number()).raw(), [0; 6])
+}

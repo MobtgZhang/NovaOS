@@ -34,6 +34,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 pub mod blk;
+pub mod gpu;
 pub mod net;
 pub mod pci;
 pub mod queue;

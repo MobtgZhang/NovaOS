@@ -55,6 +55,22 @@ pub const ADDRESS_SPACE: AddressSpace = match AddressSpace::new(0x1000, Some(52)
     None => unreachable!(),
 };
 
+/// A monotonic cycle counter for bounding how long a wait has run.
+///
+/// `RDTSC` counts at a fixed rate on every processor this kernel runs on
+/// — virtualised x86-64 keeps it monotonic across cores — so the
+/// difference between two reads is a real elapsed interval on that
+/// rate. It is not a wall clock: nothing converts it to seconds, and a
+/// deadline derived from it is only ever compared against itself.
+#[inline]
+pub fn cycles() -> u64 {
+    // SAFETY: `rdtsc` reads a time-stamp counter; it has no memory
+    // operands and no side effects beyond the value it returns, so the
+    // only requirement is that the counter exists — which every x86-64
+    // CPU this kernel targets has.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
 /// x86-64 interrupt mask, backed by `cli`/`sti`.
 ///
 /// # Concurrency

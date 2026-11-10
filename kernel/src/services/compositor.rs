@@ -46,14 +46,14 @@ use nova_protocols::surface::{
     COMPOSITOR_MOVE_REQUEST_SIZE, COMPOSITOR_OP_CONFIGURE, COMPOSITOR_OP_FRAME_DONE,
     COMPOSITOR_OP_MOVE, COMPOSITOR_OP_RAISE, COMPOSITOR_RAISE_REQUEST_SIZE, COMPOSITOR_SCALE_ONE,
     MAX_DAMAGE_RECTS, PixelFormat, SURFACE_ACTIVATE_REQUEST_SIZE, SURFACE_ATTACH_REQUEST_SIZE,
-    SURFACE_COMMIT_REQUEST_SIZE, SURFACE_CREATE_REPLY_SIZE, SURFACE_CREATE_REQUEST_SIZE,
-    SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE, SURFACE_DESTROY_REQUEST_SIZE,
-    SURFACE_LIST_REPLY_SIZE, SURFACE_LIST_REQUEST_SIZE, SURFACE_MINIMIZE_REQUEST_SIZE,
-    SURFACE_NAME_REPLY_SIZE, SURFACE_NAME_REQUEST_SIZE, SURFACE_OP_ACTIVATE, SURFACE_OP_ATTACH,
-    SURFACE_OP_COMMIT, SURFACE_OP_CREATE, SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_OP_LIST,
-    SURFACE_OP_MINIMIZE, SURFACE_OP_NAME, SURFACE_REPLY_SIZE, SURFACE_VERSION, SurfaceRect,
-    WINDOW_FLAG_FOCUSED, WINDOW_FLAG_MINIMIZED, WINDOW_LIST_PAGE, WINDOW_NAME_MAX,
-    required_buffer_bytes,
+    SURFACE_COMMIT_REQUEST_SIZE, SURFACE_CREATE_FLAG_BOTTOM, SURFACE_CREATE_REPLY_SIZE,
+    SURFACE_CREATE_REQUEST_SIZE, SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE,
+    SURFACE_DESTROY_REQUEST_SIZE, SURFACE_LIST_REPLY_SIZE, SURFACE_LIST_REQUEST_SIZE,
+    SURFACE_MINIMIZE_REQUEST_SIZE, SURFACE_NAME_REPLY_SIZE, SURFACE_NAME_REQUEST_SIZE,
+    SURFACE_OP_ACTIVATE, SURFACE_OP_ATTACH, SURFACE_OP_COMMIT, SURFACE_OP_CREATE,
+    SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_OP_LIST, SURFACE_OP_MINIMIZE, SURFACE_OP_NAME,
+    SURFACE_REPLY_SIZE, SURFACE_VERSION, SurfaceRect, WINDOW_FLAG_FOCUSED, WINDOW_FLAG_MINIMIZED,
+    WINDOW_LIST_PAGE, WINDOW_NAME_MAX, required_buffer_bytes,
 };
 
 use nova_desktop_server::damage::{DamageAccumulator, DamageRect};
@@ -137,6 +137,13 @@ pub struct Surface {
     /// Whether the window is minimized: kept alive, but not drawn and
     /// not hit by the pointer.
     pub minimized: bool,
+    /// Whether the surface is pinned to the bottom of the z-order.
+    ///
+    /// The desktop background is the one client that wants this: it is
+    /// fullscreen, so raising it would cover every window on the
+    /// desktop. Pinned surfaces still receive focus and clicks; they
+    /// simply keep a rank below every ordinary surface.
+    pub bottom: bool,
 }
 
 /// One entry of a window-list page.
@@ -316,6 +323,7 @@ impl CompositorService {
             full: false,
             dirty: false,
             minimized: false,
+            bottom: false,
         };
 
         self.next_z = self.next_z.saturating_add(1);
@@ -323,6 +331,24 @@ impl CompositorService {
 
         if self.focused.is_none() {
             self.focused = Some(id);
+        }
+        Ok(id)
+    }
+
+    /// Create a surface pinned to the bottom of the z-order.
+    ///
+    /// The desktop background uses this: it is fullscreen, so an
+    /// ordinary raise would cover every window. It still takes focus
+    /// and pointer events — only its stacking is pinned.
+    pub fn create_bottom(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+    ) -> Result<u32, ErrorCode> {
+        let id = self.create(width, height, format)?;
+        if let Some(surface) = self.surface_mut(id) {
+            surface.bottom = true;
         }
         Ok(id)
     }
@@ -524,7 +550,23 @@ impl CompositorService {
     /// Raise a surface the compositor itself selected, such as the topmost
     /// surface under a click.
     fn raise_unchecked(&mut self, id: u32) -> Result<(), ErrorCode> {
-        let z = self.next_z;
+        let bottom = self.surface(id).is_some_and(|surface| surface.bottom);
+        let z = if bottom {
+            // A pinned surface stays below every ordinary one: its rank
+            // is one below the lowest ordinary rank, so clicking the
+            // wallpaper can focus the desktop without covering the
+            // windows on it.
+            self.surfaces
+                .iter()
+                .flatten()
+                .filter(|surface| !surface.bottom)
+                .map(|surface| surface.z)
+                .min()
+                .unwrap_or(0)
+                .saturating_sub(1)
+        } else {
+            self.next_z
+        };
         {
             let Some(surface) = self.surface_mut(id) else {
                 return Err(ErrorCode::BadHandle);
@@ -533,7 +575,9 @@ impl CompositorService {
             surface.full = true;
             surface.dirty = true;
         }
-        self.next_z = z.saturating_add(1);
+        if !bottom {
+            self.next_z = z.saturating_add(1);
+        }
         Ok(())
     }
 
@@ -735,9 +779,17 @@ impl CompositorService {
         }
         if !gui {
             // The console owns the screen. Consume the frame trigger
-            // without touching the display — no clear, no cursor, no
-            // repaint: the text on screen is the console's, and it stays.
+            // without painting — no clear, no cursor: the text on
+            // screen is the console's, and it stays. The device flush
+            // runs only when the console has actually drawn something
+            // since the last present: the console's content changes
+            // rarely, and this path runs on every timer tick, so an
+            // unconditional flush would move an unchanged surface
+            // thousands of times a second.
             self.pointer_moved = false;
+            if crate::drivers::screen::console_take_dirty() {
+                crate::drivers::display::flush();
+            }
             return Ok(0);
         }
         if !self.frame_pending() {
@@ -775,6 +827,9 @@ impl CompositorService {
         } else {
             Plan::Nothing
         };
+        // Whether this call put pixels anywhere decides whether the
+        // device has to be told about them.
+        let drew = !matches!(plan, Plan::Nothing);
 
         match plan {
             Plan::Full => {
@@ -832,6 +887,12 @@ impl CompositorService {
         // Draw the mouse pointer on top of every surface.
         if let Some((x, y)) = crate::drivers::input::mouse_position() {
             draw_mouse_pointer(x, y)?;
+        }
+        if drew {
+            // Hand the frame to the display device: on a GPU scanout
+            // that is the transfer and flush that make it visible; on
+            // a firmware framebuffer it is one branch.
+            crate::drivers::display::flush();
         }
 
         Ok(self.surface_count())
@@ -1060,14 +1121,19 @@ impl CompositorService {
         let Some(flags) = read_u32(payload, 16) else {
             return reply_error(ErrorCode::Invalid, SURFACE_CREATE_REPLY_SIZE);
         };
-        if flags != 0 {
+        if flags & !SURFACE_CREATE_FLAG_BOTTOM != 0 {
             return reply_error(ErrorCode::Invalid, SURFACE_CREATE_REPLY_SIZE);
         }
         let Some(format) = PixelFormat::from_u32(format_word) else {
             return reply_error(ErrorCode::Unsupported, SURFACE_CREATE_REPLY_SIZE);
         };
 
-        match self.create(width, height, format) {
+        let created = if flags & SURFACE_CREATE_FLAG_BOTTOM != 0 {
+            self.create_bottom(width, height, format)
+        } else {
+            self.create(width, height, format)
+        };
+        match created {
             Ok(id) => {
                 let _ = self.set_owner(id, owner);
                 reply_create(id)
@@ -1622,6 +1688,7 @@ mod tests {
             full: false,
             dirty: false,
             minimized: false,
+            bottom: false,
         };
         assert_eq!(
             required_buffer_bytes(surface.width, surface.height, surface.stride),

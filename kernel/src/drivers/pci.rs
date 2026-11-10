@@ -281,6 +281,14 @@ pub const DEVICE_VIRTIO_NET_LEGACY: u16 = 0x1000;
 /// VirtIO network, modern (VirtIO 1.0) device ID.
 pub const DEVICE_VIRTIO_NET_MODERN: u16 = 0x1041;
 
+/// VirtIO GPU device ID.
+///
+/// The GPU is a modern-only device — there is no legacy transport to
+/// keep an ID for — so this one number names it, and
+/// [`Device::virtio_capabilities`] still has the last word on whether
+/// the transport beside it is one this kernel can drive.
+pub const DEVICE_VIRTIO_GPU: u16 = 0x1050;
+
 /// Class code: the device is a bridge between buses.
 pub const CLASS_BRIDGE: u8 = 0x06;
 
@@ -386,6 +394,11 @@ impl Device {
         self.vendor_id == VENDOR_VIRTIO
             && (self.device_id == DEVICE_VIRTIO_NET_LEGACY
                 || self.device_id == DEVICE_VIRTIO_NET_MODERN)
+    }
+
+    /// Whether this is a VirtIO GPU device this kernel can drive.
+    pub const fn is_virtio_gpu(&self) -> bool {
+        self.vendor_id == VENDOR_VIRTIO && self.device_id == DEVICE_VIRTIO_GPU
     }
 
     /// Whether this function is a PCI-to-PCI bridge.

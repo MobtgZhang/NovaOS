@@ -235,6 +235,10 @@ impl ScreenConsole {
             return;
         };
 
+        // The pixel writes below change what the screen shows; the present
+        // path flushes the device when it sees this mark.
+        CONSOLE_DIRTY.store(true, Ordering::Relaxed);
+
         // Cache hit or fresh rasterization: either way the bitmap is owned
         // locally, so the draw below borrows nothing from the cache.
         let bitmap = match self.cache.lookup(glyph, FONT_SIZE_PX) {
@@ -365,6 +369,10 @@ pub fn clear_for_userland() {
     }
     let mut console = CONSOLE.lock();
     console.reset();
+    // A cleared canvas is a visible change, and the next console draw
+    // would set this anyway — but the handover flush must not depend on
+    // a draw that has not happened yet.
+    CONSOLE_DIRTY.store(true, Ordering::Relaxed);
 }
 
 /// Whether the quiet flag is set for the on-screen console.
@@ -391,6 +399,20 @@ static SCREEN_QUIET: AtomicBool = AtomicBool::new(false);
 /// The compositor's present path flips this flag as the first window
 /// commits and as the last one dies.
 static DESKTOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the console has drawn since the compositor last looked.
+///
+/// On a device scanout the console draws into a backing buffer that only
+/// a device transfer publishes, so the present path needs to know *when*
+/// the console's content changed — flushing a fixed number of times a
+/// second would move an unchanged surface, and the console draws often
+/// enough during boot that "often" is a flood.
+static CONSOLE_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Take the console's "content changed" mark.
+pub fn console_take_dirty() -> bool {
+    CONSOLE_DIRTY.swap(false, Ordering::Relaxed)
+}
 
 /// Set or clear the quiet flag.
 pub fn set_quiet(quiet: bool) {

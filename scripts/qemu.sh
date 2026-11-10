@@ -184,6 +184,7 @@ set -- \
     -device "virtio-blk-pci,drive=nova1" \
     -netdev "user,id=novanet,guestfwd=tcp:10.0.2.100:80-cmd:/bin/cat" \
     -device "virtio-net-pci,netdev=novanet" \
+    -device "virtio-vga,xres=1024,yres=768" \
     -device "isa-debug-exit,iobase=$DEBUG_EXIT_IOBASE,iosize=0x04" \
     -no-reboot
 

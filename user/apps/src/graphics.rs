@@ -41,14 +41,14 @@ use nova_protocols::surface::{
     COMPOSITOR_OP_CONFIGURE, COMPOSITOR_OP_FRAME_DONE, COMPOSITOR_OP_MOVE, COMPOSITOR_OP_RAISE,
     CompositorConfigureRequest, CompositorFrameDoneRequest, CompositorMoveRequest,
     CompositorRaiseRequest, PIXEL_FORMAT_XRGB8888, PixelFormat, SURFACE_ACTIVATE_REQUEST_SIZE,
-    SURFACE_CREATE_REPLY_SIZE, SURFACE_DAMAGE_REPLY_SIZE, SURFACE_DAMAGE_REQUEST_SIZE,
-    SURFACE_LIST_REPLY_SIZE, SURFACE_LIST_REQUEST_SIZE, SURFACE_MINIMIZE_REQUEST_SIZE,
-    SURFACE_NAME_REPLY_SIZE, SURFACE_NAME_REQUEST_SIZE, SURFACE_OP_ACTIVATE, SURFACE_OP_ATTACH,
-    SURFACE_OP_COMMIT, SURFACE_OP_CREATE, SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_OP_LIST,
-    SURFACE_OP_MINIMIZE, SURFACE_OP_NAME, SURFACE_RECT_SIZE, SURFACE_REPLY_SIZE, SURFACE_VERSION,
-    SurfaceAttachRequest, SurfaceCommitRequest, SurfaceCreateRequest, SurfaceDamageRequest,
-    SurfaceDestroyRequest, SurfaceRect, WINDOW_FLAG_FOCUSED, WINDOW_FLAG_MINIMIZED,
-    WINDOW_LIST_PAGE, WINDOW_NAME_MAX,
+    SURFACE_CREATE_FLAG_BOTTOM, SURFACE_CREATE_REPLY_SIZE, SURFACE_DAMAGE_REPLY_SIZE,
+    SURFACE_DAMAGE_REQUEST_SIZE, SURFACE_LIST_REPLY_SIZE, SURFACE_LIST_REQUEST_SIZE,
+    SURFACE_MINIMIZE_REQUEST_SIZE, SURFACE_NAME_REPLY_SIZE, SURFACE_NAME_REQUEST_SIZE,
+    SURFACE_OP_ACTIVATE, SURFACE_OP_ATTACH, SURFACE_OP_COMMIT, SURFACE_OP_CREATE,
+    SURFACE_OP_DAMAGE, SURFACE_OP_DESTROY, SURFACE_OP_LIST, SURFACE_OP_MINIMIZE, SURFACE_OP_NAME,
+    SURFACE_RECT_SIZE, SURFACE_REPLY_SIZE, SURFACE_VERSION, SurfaceAttachRequest,
+    SurfaceCommitRequest, SurfaceCreateRequest, SurfaceDamageRequest, SurfaceDestroyRequest,
+    SurfaceRect, WINDOW_FLAG_FOCUSED, WINDOW_FLAG_MINIMIZED, WINDOW_LIST_PAGE, WINDOW_NAME_MAX,
 };
 
 use crate::syscall::{self, SyscallError};
@@ -203,12 +203,18 @@ pub fn display_query() -> Result<DisplayMode, ErrorCode> {
 
 /// Create a surface and return its identifier.
 pub fn surface_create(width: u32, height: u32) -> Result<u32, ErrorCode> {
+    surface_create_with_flags(width, height, 0)
+}
+
+/// Open a surface with create flags — [`SURFACE_CREATE_FLAG_BOTTOM`] for
+/// the desktop background, which must never stack above a window.
+pub fn surface_create_with_flags(width: u32, height: u32, flags: u32) -> Result<u32, ErrorCode> {
     let request = SurfaceCreateRequest {
         version: SURFACE_VERSION,
         width,
         height,
         format: PixelFormat::Xrgb8888,
-        flags: 0,
+        flags,
     };
     let mut reply = [0u8; SURFACE_CREATE_REPLY_SIZE];
     let length = service_request(
@@ -611,6 +617,22 @@ impl Window {
         })
     }
 
+    /// Open a window pinned to the bottom of the z-order.
+    ///
+    /// The desktop background is the one client that wants this: it is
+    /// fullscreen, so an ordinary raise would cover every window on the
+    /// desktop. A pinned window still takes focus and pointer events.
+    pub fn open_bottom(width: u32, height: u32) -> Result<Window, ErrorCode> {
+        let (surface, buffer) = open_window_with_flags(width, height, SURFACE_CREATE_FLAG_BOTTOM)?;
+        Ok(Window {
+            surface,
+            buffer,
+            width,
+            height,
+            serial: 0,
+        })
+    }
+
     /// Show the window's current contents under a fresh serial.
     pub fn present(&mut self) -> Result<(), ErrorCode> {
         self.serial = self.serial.wrapping_add(1);
@@ -772,13 +794,22 @@ pub const fn colour(red: u8, green: u8, blue: u8) -> u32 {
 
 /// Draw a simple window and commit it.
 pub fn open_window(width: u32, height: u32) -> Result<(u32, *mut u8), ErrorCode> {
+    open_window_with_flags(width, height, 0)
+}
+
+/// Draw a simple window with create flags and commit it.
+pub fn open_window_with_flags(
+    width: u32,
+    height: u32,
+    flags: u32,
+) -> Result<(u32, *mut u8), ErrorCode> {
     let bytes = (width as u64)
         .checked_mul(height as u64)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or(ErrorCode::Invalid)?;
     let stride = width.checked_mul(4).ok_or(ErrorCode::Invalid)?;
 
-    let surface = surface_create(width, height)?;
+    let surface = surface_create_with_flags(width, height, flags)?;
     let buffer = match memory_object(
         bytes,
         Rights::MAP | Rights::CONTROL | Rights::READ | Rights::WRITE,

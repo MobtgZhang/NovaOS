@@ -201,6 +201,18 @@ pub const fn arch_name() -> &'static str {
     NAME
 }
 
+/// A monotonic cycle counter for bounding how long a wait has run.
+///
+/// The rate is the backend's own — callers derive a deadline from it
+/// and never present it as time to anyone. As with `init_cpu` and the
+/// other machine helpers above, this names the x86 backend directly:
+/// the aarch64 backend is still the stub [`aarch64`] describes, and
+/// giving it an arm is part of giving it an implementation.
+#[inline]
+pub fn cycles() -> u64 {
+    x86_64::cycles()
+}
+
 /// Compile-time proof that each backend provides every capability.
 ///
 /// A backend that forgets `Console` or `MachineExit` should fail here, at the

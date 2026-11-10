@@ -521,11 +521,15 @@ pub fn write_leaf(root: &PageTable, virt: u64, entry: u64) -> Result<(), VmmErro
     Ok(())
 }
 
-/// The physical frame mapped at `virt`, if any.
+/// The physical address of `virt`, if it is mapped.
 ///
-/// Huge leaves are handled: a 2 MiB or 1 GiB leaf contributes the offset
-/// within its page, so the result is the exact physical address of `virt`
-/// rather than the base of the region it falls in.
+/// The *exact* address — an ordinary leaf contributes the offset within its
+/// frame, and a huge leaf the offset within its 2 MiB or 1 GiB region — so
+/// the result names the byte asked for rather than the base of the page it
+/// falls in. (Every caller used to ask for page-aligned addresses, which is
+/// how a walk that dropped the offset looked correct until one asked for the
+/// middle of a page and got DMA pointing at the wrong bytes.) Callers that
+/// want a frame base mask the result themselves.
 pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
     let mut table = *root;
 
@@ -553,7 +557,13 @@ pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
     }
 
     let index = WalkLevel::Pt.index_of(virt);
-    table.target(index)
+    // The ordinary leaf is the one case `leaf_physical` does not cover: its
+    // entry names the frame's base, and the offset within the page has to go
+    // back on to answer with the exact address — the same addition a huge
+    // leaf gets.
+    table
+        .target(index)
+        .map(|frame| frame | (virt & (P1_PAGE_BYTES - 1)))
 }
 
 /// Translate a *user* virtual address only if every walk level is user-accessible.
@@ -589,5 +599,8 @@ pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
     if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
         return None;
     }
-    Some(decode_entry(entry))
+    // Exact address, not frame base — the contract [`translate`] documents
+    // and the huge-leaf path above already honours. Callers that align down
+    // before asking get the same answer they always did.
+    Some(decode_entry(entry) | (virt & (P1_PAGE_BYTES - 1)))
 }

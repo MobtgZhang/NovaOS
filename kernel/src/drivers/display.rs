@@ -35,6 +35,7 @@
 
 use core::cell::UnsafeCell;
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::boot::PAGE_SIZE;
 use crate::boot::info::FramebufferInfo;
@@ -157,11 +158,15 @@ impl DisplayCell {
 
 static DISPLAY: DisplayCell = DisplayCell::new();
 
-/// Bring up the framebuffer.
+/// Bring up the display.
 ///
-/// Maps every page into the kernel's address space, validates the shifts, and
-/// publishes the mode. A boot without a framebuffer is a normal headless boot:
-/// it logs at `Info` and leaves the mode `None`, so M0–M5 runs are unaffected.
+/// The virtio-gpu comes first: a device scanout replaces the firmware
+/// framebuffer entirely, which is the point — the pixels are composed
+/// in guest RAM and moved to the host by the device, and nothing
+/// touches a UEFI resource after `ExitBootServices`. A machine
+/// without a GPU (or one that refuses) falls through to the firmware
+/// framebuffer exactly as before, so a headless or legacy boot is
+/// unaffected.
 ///
 /// # Safety
 ///
@@ -169,6 +174,36 @@ static DISPLAY: DisplayCell = DisplayCell::new();
 /// the kernel's address space, and before any draw calls. `boot_info` must be
 /// the immutable snapshot `boot::capture` published.
 pub unsafe fn init(boot_info: &crate::boot::BootInfo) {
+    match crate::drivers::virtio::gpu::install() {
+        Ok((width, height, pitch, base_virtual)) => {
+            // The device's format is B8G8R8X8: blue at bits 0-7, green at
+            // 8-15, red at 16-23 — the shifts `compose` needs to write
+            // NovaOS's native `0x00RRGGBB` words straight into it.
+            let mode = DisplayMode {
+                width,
+                height,
+                pitch,
+                red_shift: 16,
+                green_shift: 8,
+                blue_shift: 0,
+                base_virtual,
+            };
+            // SAFETY: `init` is the only writer, and it runs once during boot.
+            unsafe { DISPLAY.set(Some(mode)) };
+            klog!(
+                Level::Info,
+                "display: virtio-gpu scanout {width}x{height} pitch {pitch} at virt {base_virtual:#x} — the device owns the scanout"
+            );
+            return;
+        }
+        Err(error) => {
+            klog!(
+                Level::Info,
+                "display: virtio-gpu unavailable ({error:?}); using the firmware framebuffer"
+            );
+        }
+    }
+
     let Some(info) = boot_info.framebuffer_info() else {
         klog!(Level::Info, "display: no framebuffer");
         return;
@@ -258,6 +293,46 @@ pub unsafe fn init(boot_info: &crate::boot::BootInfo) {
 /// The current display mode, if a framebuffer was brought up.
 pub fn mode() -> Option<DisplayMode> {
     DISPLAY.get()
+}
+
+/// The soonest a second device flush may follow the first, in cycles of
+/// [`crate::arch::cycles`].
+///
+/// The timer path presents on every local-APIC tick — about 15 kHz under
+/// QEMU's 1 GHz APIC bus rate, not the 100 Hz [`crate::arch::x86_64::pit`]
+/// advertises for the PIT this kernel no longer drives. A device transfer
+/// per tick would move a whole surface 15,000 times a second: megabytes of
+/// DMA per frame for a screen that has not changed, and a host main loop
+/// so busy copying that the guest's other devices starve. The limiter caps
+/// the device's frame rate instead — roughly 100 Hz on a 1 GHz
+/// time-stamp counter, faster on a higher rate, which the display
+/// requirement takes as a floor rather than a ceiling.
+static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
+
+/// The interval between device flushes: 10 million cycles — about 10 ms
+/// at a 1 GHz counter rate, and never below ~3 ms at any faster rate.
+const FLUSH_INTERVAL_CYCLES: u64 = 10_000_000;
+
+/// Push the composed frame to the display device.
+///
+/// On a virtio-gpu scanout this is the device-side `TRANSFER` +
+/// `FLUSH` that makes the pixels visible — the compositor's CPU work
+/// ends at the backing buffer, and the display path from there is the
+/// GPU's DMA, not a CPU write to a firmware resource. On a firmware
+/// framebuffer the pixels are already where they need to be and this
+/// is one branch.
+///
+/// Rate-limited: a caller that presents more often than
+/// [`FLUSH_INTERVAL_CYCLES`] asks for a frame is answered with the
+/// previous one still on screen, which is exactly what an un-changed
+/// screen deserves.
+pub fn flush() {
+    let now = crate::arch::cycles();
+    if now.wrapping_sub(LAST_FLUSH.load(Ordering::Relaxed)) < FLUSH_INTERVAL_CYCLES {
+        return;
+    }
+    LAST_FLUSH.store(now, Ordering::Relaxed);
+    let _ = crate::drivers::virtio::gpu::flush();
 }
 
 /// The pixel word a colour makes in the framebuffer.

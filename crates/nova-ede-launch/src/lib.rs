@@ -22,6 +22,8 @@ pub const MAX_SHOWN: usize = 8;
 pub const MAX_FIELD: usize = 48;
 /// The longest command the history remembers.
 pub const MAX_HISTORY: usize = 8;
+/// The longest category name the Programs menu keeps.
+pub const MAX_CATEGORY: usize = 24;
 
 /// One application in the list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,6 +32,10 @@ pub struct AppEntry {
     name_len: usize,
     exec: [u8; MAX_FIELD],
     exec_len: usize,
+    /// The first member of the entry's `Categories=` list — the
+    /// Programs menu groups by it. Defaults to `Other`.
+    category: [u8; MAX_CATEGORY],
+    category_len: usize,
 }
 
 impl AppEntry {
@@ -41,6 +47,11 @@ impl AppEntry {
     /// The `Exec` command.
     pub fn exec(&self) -> &str {
         core::str::from_utf8(&self.exec[..self.exec_len]).unwrap_or("")
+    }
+
+    /// The category the Programs menu files this entry under.
+    pub fn category(&self) -> &str {
+        core::str::from_utf8(&self.category[..self.category_len]).unwrap_or("Other")
     }
 }
 
@@ -174,6 +185,8 @@ impl Launchpad {
             name_len: 0,
             exec: [0; MAX_FIELD],
             exec_len: 0,
+            category: [0; MAX_CATEGORY],
+            category_len: 0,
         };
         copy_field(
             &mut entry.name,
@@ -181,6 +194,13 @@ impl Launchpad {
             file.name().unwrap_or("?").as_bytes(),
         );
         copy_field(&mut entry.exec, &mut entry.exec_len, file.exec_bytes());
+        // The first Categories member groups the entry in the Programs
+        // menu; a `.desktop` with no categories still lands somewhere.
+        let category = file.categories().next().unwrap_or("Other");
+        let bytes = category.as_bytes();
+        let take = bytes.len().min(MAX_CATEGORY);
+        entry.category[..take].copy_from_slice(&bytes[..take]);
+        entry.category_len = take;
         self.entries[slot] = Some(entry);
         self.count += 1;
         true
@@ -373,6 +393,67 @@ impl Launchpad {
         })
     }
 
+    /// The indices of applications that both match the current filter
+    /// and belong to `category` — the Programs menu's category page.
+    pub fn matching_in_category<'a>(
+        &'a self,
+        category: &'a str,
+    ) -> impl Iterator<Item = usize> + 'a {
+        self.matching_indices().filter(move |&index| {
+            self.entries[index]
+                .as_ref()
+                .is_some_and(|entry| entry.category() == category)
+        })
+    }
+
+    /// The distinct first-categories of the registered applications,
+    /// in registration order — the Programs menu's top page. The nth
+    /// one is fetched with [`Launchpad::category_at`]; both walk the
+    /// same order, so drawing and hit-testing always agree.
+    pub fn category_count(&self) -> usize {
+        let mut seen = [[0u8; MAX_CATEGORY]; MAX_SHOWN];
+        let mut seen_len = [0usize; MAX_SHOWN];
+        let mut count = 0usize;
+        for entry in self.entries[..self.count].iter().flatten() {
+            let bytes = entry.category().as_bytes();
+            let duplicate = (0..count).any(|slot| {
+                seen_len[slot] == bytes.len() && &seen[slot][..seen_len[slot]] == bytes
+            });
+            if duplicate || count >= MAX_SHOWN {
+                continue;
+            }
+            let take = bytes.len().min(MAX_CATEGORY);
+            seen[count][..take].copy_from_slice(&bytes[..take]);
+            seen_len[count] = take;
+            count += 1;
+        }
+        count
+    }
+
+    /// The nth distinct category — see [`Launchpad::category_count`].
+    pub fn category_at(&self, nth: usize) -> Option<&str> {
+        let mut seen = [[0u8; MAX_CATEGORY]; MAX_SHOWN];
+        let mut seen_len = [0usize; MAX_SHOWN];
+        let mut count = 0usize;
+        for entry in self.entries[..self.count].iter().flatten() {
+            let bytes = entry.category().as_bytes();
+            let duplicate = (0..count).any(|slot| {
+                seen_len[slot] == bytes.len() && &seen[slot][..seen_len[slot]] == bytes
+            });
+            if duplicate || count >= MAX_SHOWN {
+                continue;
+            }
+            if count == nth {
+                return Some(entry.category());
+            }
+            let take = bytes.len().min(MAX_CATEGORY);
+            seen[count][..take].copy_from_slice(&bytes[..take]);
+            seen_len[count] = take;
+            count += 1;
+        }
+        None
+    }
+
     /// The currently selected matching entry, if any.
     pub fn selected_entry(&self) -> Option<AppEntry> {
         self.matching_indices()
@@ -383,6 +464,13 @@ impl Launchpad {
     /// The application at `index` — the start menu's row lookup.
     pub fn entry(&self, index: usize) -> Option<AppEntry> {
         self.entries.get(index).copied().flatten()
+    }
+
+    /// The application at `index`, borrowed — for callers that need
+    /// the entry's strings to outlive a local copy, such as a menu
+    /// drawing its rows.
+    pub fn entry_ref(&self, index: usize) -> Option<&AppEntry> {
+        self.entries.get(index)?.as_ref()
     }
 
     /// Move the selection by `delta` (wrapping).
@@ -596,5 +684,42 @@ mod tests {
             assert!(pad.remember(text));
         }
         assert_eq!(pad.history_count(), MAX_HISTORY);
+    }
+
+    #[test]
+    fn categories_group_the_programs_menu() {
+        let mut pad = Launchpad::new();
+        let term =
+            b"[Desktop Entry]\nType=Application\nName=Term\nExec=terminal\nCategories=System;\n";
+        let files = b"[Desktop Entry]\nType=Application\nName=Files\nExec=file-manager\nCategories=System;\n";
+        let calc =
+            b"[Desktop Entry]\nType=Application\nName=Calc\nExec=calc\nCategories=Utility;\n";
+        let bare = b"[Desktop Entry]\nType=Application\nName=Bare\nExec=bare\n";
+        assert!(pad.add_desktop(term));
+        assert!(pad.add_desktop(files));
+        assert!(pad.add_desktop(calc));
+        assert!(pad.add_desktop(bare));
+
+        // System (two entries), Utility, Other: distinct, in
+        // registration order, capped by the menu's row budget.
+        assert_eq!(pad.category_count(), 3);
+        assert_eq!(pad.category_at(0), Some("System"));
+        assert_eq!(pad.category_at(1), Some("Utility"));
+        assert_eq!(pad.category_at(2), Some("Other"));
+        assert_eq!(pad.category_at(3), None);
+
+        let mut system_rows = 0;
+        for _ in pad.matching_in_category("System") {
+            system_rows += 1;
+        }
+        assert_eq!(system_rows, 2, "Term and Files are both System");
+
+        // The typed filter narrows the category page too.
+        pad.type_char(b'l');
+        let mut filtered = 0;
+        for _ in pad.matching_in_category("System") {
+            filtered += 1;
+        }
+        assert_eq!(filtered, 1, "only Files contains an l");
     }
 }

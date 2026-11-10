@@ -28,12 +28,14 @@
 //! that says "too deep".
 
 use nova_abi::error::ErrorCode;
-use nova_apps::graphics::{InputEvent, Window};
+use nova_apps::graphics::{self, InputEvent, Window};
 use nova_apps::{console, fsclient, yield_now};
 use nova_protocols::input::{INPUT_BUTTON_PRIMARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER};
 use nova_ui::font::GLYPH_WIDTH;
 use nova_ui::keyboard::{Decoder, Key};
-use nova_ui::{Button, Canvas, Rect, colour, decimal, palette};
+use nova_ui::{
+    Button, Canvas, Rect, TitlebarHit, colour, decimal, draw_titlebar, palette, titlebar_hit,
+};
 
 /// Window width in pixels.
 /// The GUI face embedded in this program: Source Han Sans subset to ASCII,
@@ -146,6 +148,10 @@ struct FileManager {
     /// activates on the release, and only the edge between two events tells
     /// them apart: a held button that merely moves is not a new click.
     primary_down: bool,
+    /// The surface this window owns, for the iconify button.
+    surface: u32,
+    /// Set by the close button; the main loop exits on it.
+    quit: bool,
 }
 
 impl FileManager {
@@ -163,6 +169,8 @@ impl FileManager {
             status: [0; STATUS_SIZE],
             status_len: 0,
             primary_down: false,
+            surface: 0,
+            quit: false,
         };
         manager.path[0] = b'/';
         manager.reload();
@@ -380,6 +388,22 @@ impl FileManager {
         let pressed = primary && !self.primary_down;
         self.primary_down = primary;
 
+        // The title bar's buttons fire on the press edge: close quits,
+        // iconify minimizes to the taskbar.
+        if pressed {
+            match titlebar_hit(event.x, event.y, WIDTH as i32) {
+                TitlebarHit::Close => {
+                    self.quit = true;
+                    return true;
+                }
+                TitlebarHit::Iconify => {
+                    let _ = graphics::compositor_minimize(self.surface, true);
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         let before = (self.up.is_down(), self.refresh.is_down());
 
         let mut fired = false;
@@ -425,14 +449,7 @@ impl FileManager {
     fn draw(&self, canvas: &mut Canvas) {
         canvas.clear(palette::SURFACE);
 
-        canvas.fill_rect(Rect::new(0, 0, WIDTH, TITLE_HEIGHT), palette::CHROME);
-        canvas.draw_text(
-            8,
-            3,
-            "File Manager",
-            palette::TEXT_ON_CHROME,
-            Some(palette::CHROME),
-        );
+        draw_titlebar(canvas, WIDTH as i32, "File Manager", true);
 
         let bar = Rect::new(8, 26, WIDTH - 16, 20);
         canvas.fill_rect(bar, palette::FIELD);
@@ -448,10 +465,17 @@ impl FileManager {
         for index in 0..self.count {
             let entry = self.entries[index];
             let y = LIST_TOP + (index as i32) * ROW_HEIGHT;
-            let background = if self.selected == Some(index) {
+            let is_selected = self.selected == Some(index);
+            let background = if is_selected {
                 palette::SELECTED
             } else {
                 palette::SURFACE
+            };
+            // The blue selection carries white text; the gray row does not.
+            let row_text = if is_selected {
+                palette::TEXT_ON_CHROME
+            } else {
+                palette::TEXT
             };
             canvas.fill_rect(Rect::new(8, y, WIDTH - 16, ROW_HEIGHT as u32), background);
 
@@ -471,7 +495,7 @@ impl FileManager {
                 y,
                 &entry.name[..entry.len],
                 NAME_COLUMNS,
-                palette::TEXT,
+                row_text,
                 Some(background),
             );
 
@@ -482,7 +506,7 @@ impl FileManager {
                 decimal(entry.size as usize, &mut digits)
             };
             let width = Canvas::text_width(label) as i32;
-            canvas.draw_text(432 - width, y, label, palette::TEXT, Some(background));
+            canvas.draw_text(432 - width, y, label, row_text, Some(background));
         }
 
         self.up.draw(canvas);
@@ -496,7 +520,7 @@ impl FileManager {
             8,
             STATUS_TOP + 8,
             core::str::from_utf8(&self.status[..self.status_len]).unwrap_or(""),
-            palette::TEXT_ON_CHROME,
+            palette::TEXT,
             Some(palette::STATUS),
         );
     }
@@ -595,6 +619,7 @@ pub extern "C" fn main() -> i64 {
     let mut canvas = Canvas::new(window.buffer, WIDTH, HEIGHT);
 
     let mut manager = FileManager::new();
+    manager.surface = window.surface;
     let mut decoder = Decoder::new();
     let mut events = [InputEvent::EMPTY; MAX_EVENTS];
 
@@ -637,9 +662,15 @@ pub extern "C" fn main() -> i64 {
             }
         }
 
+        if manager.quit {
+            break;
+        }
+
         // Yield rather than spin: the desktop's idle CPU is one of the
         // milestone's acceptance suites, and a window that polls in a tight
         // loop is exactly what it is there to catch.
         yield_now();
     }
+
+    0
 }

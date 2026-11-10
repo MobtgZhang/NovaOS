@@ -297,6 +297,68 @@ impl VirtQueue {
         Ok(0)
     }
 
+    /// Publish one request/response pair: a buffer the device reads
+    /// followed by a buffer the device writes.
+    ///
+    /// This is the shape every virtio-gpu control command has — a
+    /// request the device consumes and a response it fills — and it is
+    /// deliberately *not* [`Self::publish`]'s header/data/status chain:
+    /// the block protocol's status byte is one byte of a separate
+    /// stage, while a GPU response is a whole second buffer. Folding
+    /// the two shapes together would publish a chain one of the two
+    /// devices does not understand.
+    ///
+    /// # Safety
+    ///
+    /// Both physical addresses must name kernel-owned memory that
+    /// outlives the request — of `request_len` and `response_len`
+    /// bytes respectively — and no other request may be in flight.
+    pub unsafe fn publish_pair(
+        &mut self,
+        request_phys: u64,
+        request_len: u32,
+        response_phys: u64,
+        response_len: u32,
+    ) -> Result<u16, QueueError> {
+        if self.in_flight() {
+            return Err(QueueError::Busy);
+        }
+        if request_len == 0 || response_len == 0 {
+            return Err(QueueError::UnsupportedSize);
+        }
+
+        // SAFETY: the descriptor table is `size * 16` bytes in its own
+        // frame, and the indices below are constants 0 and 1 — both
+        // below `size`, which is at least 8 (checked in `allocate`).
+        unsafe {
+            write_descriptor(self.desc, 0, request_phys, request_len, FLAG_NEXT, 1);
+            write_descriptor(
+                self.desc,
+                1,
+                response_phys,
+                response_len,
+                FLAG_DEVICE_WRITES,
+                0,
+            );
+        }
+
+        let slot = (self.published % self.size) as usize;
+        // SAFETY: the available ring's data slot is `4 + slot * 2`
+        // bytes into the ring, and `slot` is below `size`.
+        unsafe {
+            mmio::write_u16(self.avail, 4 + slot * 2, 0);
+        }
+        mmio::fence();
+        self.published = self.published.wrapping_add(1);
+        // SAFETY: the index field is the ring's second word.
+        unsafe {
+            mmio::write_u16(self.avail, 2, self.published);
+        }
+        mmio::fence();
+
+        Ok(0)
+    }
+
     /// What the two rings say right now: (available index, used index).
     ///
     /// A diagnostic for the timeout path. A request that never completes has

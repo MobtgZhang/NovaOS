@@ -563,23 +563,23 @@ impl FileServer {
         // more of them, exactly as EDE would have them do.
         self.seed_file(
             b"/home/nova/Desktop/terminal.desktop",
-            b"[Desktop Entry]\nType=Application\nName=Terminal\nExec=terminal\nIcon=utilities-terminal\nComment=NovaOS terminal\n",
+            b"[Desktop Entry]\nType=Application\nName=Terminal\nExec=terminal\nIcon=utilities-terminal\nComment=NovaOS terminal\nCategories=System;\n",
         );
         self.seed_file(
             b"/home/nova/Desktop/files.desktop",
-            b"[Desktop Entry]\nType=Application\nName=Files\nExec=file-manager\nIcon=system-file-manager\nComment=Browse and manage files\n",
+            b"[Desktop Entry]\nType=Application\nName=Files\nExec=file-manager\nIcon=system-file-manager\nComment=Browse and manage files\nCategories=System;\n",
         );
         self.seed_file(
             b"/home/nova/Desktop/editor.desktop",
-            b"[Desktop Entry]\nType=Application\nName=Editor\nExec=editor\nIcon=accessories-text-editor\nComment=Edit a file\n",
+            b"[Desktop Entry]\nType=Application\nName=Editor\nExec=editor\nIcon=accessories-text-editor\nComment=Edit a file\nCategories=Utility;\n",
         );
         self.seed_file(
             b"/home/nova/Desktop/widgets.desktop",
-            b"[Desktop Entry]\nType=Application\nName=Widgets\nExec=widgets-demo\nIcon=preferences-desktop\nComment=novagraph widget showcase\n",
+            b"[Desktop Entry]\nType=Application\nName=Widgets\nExec=widgets-demo\nIcon=preferences-desktop\nComment=novagraph widget showcase\nCategories=Utility;\n",
         );
         self.seed_file(
             b"/home/nova/.ede/panel.conf",
-            b"[Panel]\napplets=start-menu,quick-launch,taskbar,systray\nheight=32\n",
+            b"[Panel]\napplets=start-menu,quick-launch,clock,taskbar,systray\nheight=32\n",
         );
         self.seed_file(
             b"/home/nova/.ede/desktop.conf",

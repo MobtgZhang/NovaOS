@@ -229,6 +229,24 @@ fn qemu_command(
         "virtio-net-pci,netdev=novanet".to_string(),
     ));
 
+    // The display device. The compositor composites into guest RAM and
+    // hands each frame to this device; `xres`/`yres` pin the scanout to
+    // the mode every window in the tree is laid out for, so the mode the
+    // GPU reports is the mode the shell assumes.
+    //
+    // `virtio-vga`, not `virtio-gpu-pci`: the machine would otherwise
+    // create its default std VGA beside this device, and the firmware's
+    // GOP (the only linear framebuffer OVMF's virtio-gpu driver does
+    // not provide) would draw the boot menu on the VGA's console while
+    // the host's display watched that console and never this device's.
+    // The two-in-one device gives the firmware a VGA framebuffer for
+    // boot and the kernel's driver the virtio-gpu backend for the
+    // desktop, on one console the host actually shows.
+    command.extend(device(
+        "-device",
+        "virtio-vga,xres=1024,yres=768".to_string(),
+    ));
+
     // The exit device. `iosize=0x04` matches the kernel's 32-bit write.
     command.extend(device(
         "-device",

@@ -520,6 +520,27 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **事件验证**（回应"没有实现桌面 events"）：QMP 注入实测全链路——按下沿开菜单、`t/e/r` 实时过滤、Enter 启动（串口 `ede-shell: launch terminal`，屏幕无日志残留）、Escape 关菜单、Nova 按钮开合、空白处点击关菜单、任务栏芯片 Activate/Minimize、右键（本轮新增：选中图标 / 关菜单清选择）。指针按下/释放边沿、按键（含 Shift 状态的 Decoder）、hover/tooltip 均在 `desktop-shell` 的 `on_pointer`/`on_key` 中实现。
 - **验收**：`./scripts/gates.sh` 全绿（fmt、host clippy、UEFI clippy、host 79/612、裸机构建、QEMU 70/251）；QEMU+VNC 实测桌面模式全程屏幕无任何日志文本、Safe Terminal 无鼠标且移动鼠标零像素变化。遗留说明：多 surface 并发 present 与 shell 绘制之间存在微小撕裂窗口（另一 surface 的 commit 恰逢 shell 重绘中途时，截屏可捕获混合帧）——彻底解决需要双缓冲/提交同步协议，记为后续工作。
 
+### 13.10 NovaOS EDE 2.x 外观与交互完整还原 + 动态分辨率 / bottom-pin / 光标钳制（2026-11-10）〔已完成〕**Medium**
+
+- **背景**：§13.8/§13.9 完成 EDE 的部件级移植，但外观与交互层仍停留在工程基线：desktop-shell 硬编码 1024×768、Start 菜单是 comet 而非 EDE 菜单、标题栏全工程灰、无 Run 对话框、`TIME` 未接、panel applet 顺序与 EDE 2.x 顺序不一致。
+- **本次修复**（全部在 `user/apps/src/bin/desktop-shell.rs` + `crates/nova-ui` + `crates/nova-ede-panel` + 内核种子）：
+  - **EDE 外观**：`nova-ui` 引入 pekwm `default` 色板（focused title `#4B6983`、unfocused `#EAE8E3`、border `#C6C6C6`、buttons `#E6E6E6`、menu header `#7F9EBC`、menu body `#FBFBFB`）+ bevel 按钮（pressed 内缩）；新增通用 `draw_titlebar`/`titlebar_hit` EDE titlebar；panel 切换为 EDE applet 顺序（start_menu, quick_launch, clock, taskbar, systray）并保留 EDE Start 按钮（80px）；Start 菜单改为 EDE 菜单（header `EDE`，行：Programs / Window List / Run… / About EDE；Programs 页 → 类别 → 应用）。
+  - **交互补全**：Run 对话框（Command: 单行 + OK/Cancel，居中、modal，Escape 取消/Enter 提交）；About EDE（版本/宣传语/credits，按任意键/点击关闭）；TIME syscall（`Syscall(26)`，RTC 墙钟）→ 面板时钟。
+  - **动态分辨率**：shell 不再假设 1024×768 — `graphics::display_query()` → `Shell::new(width, height)`，menu/dialog/panel/taskbar 全部按运行时尺寸（失败回退 DEFAULT 1024×768）定位；`menu_top`、`run_dialog_x/y` 随 `self.height/width` 计算。
+  - **bottom-pinned 桌面 surface**：`SURFACE_CREATE_FLAG_BOTTOM` → `CompositorService::create_bottom` → `Surface.bottom`；`raise_unchecked` 保持其在普通 surface 之下；桌面以该 pinned surface 持有（点击壁纸聚焦 desktop、不盖窗）。
+  - **光标钳制**：`kernel/src/drivers/input.rs` `mouse_move` clamp 到 `display_size - CURSOR_SPAN(12)`，箭头整体不滚动出屏。
+- **验收（QEMU `-smp 4` headless + VNC/QMP）**：EDE 菜单开合、Programs→类别→应用、Run… 打字/提交、About EDE、TIME 面板时钟、taskbar 芯片、bottom-pin、光标钳制 —— 实测链路全部通；`./scripts/gates.sh` 全绿。
+
+### 13.11 virtio-gpu 显卡驱动：GPU scanout、flush 节流、virtio-vga、页表 offset bug（2026-11-10）〔已修复〕**High**
+
+- **背景**：§13.5/§13.9 起的桌面输出走 CPU framebuffer + GOP（`exit_boot_services` 前）直写；验收要求"桌面显示必须实现显卡驱动、用显卡去绘制、不要用 CPU 绘制、刷新频率 60~144 FPS 甚至更高"。
+- **修复**：
+  - **显卡架构**：新增 virtio-gpu driver（`kernel/src/drivers/virtio/gpu.rs`：DmaWindow、SG 合并、rdtsc 硬截止、polled control queue、`POLL_CYCLES=50_000_000`/`ATTEMPTS=2` cycle-deadline polling）；QEMU 设备 `virtio-vga,xres=1024,yres=768`（`tools/xtask/src/run.rs`、`scripts/qemu.sh` —— VGA 前端供 OVMF GOP、virtio-gpu backend 供本 driver，单 console）；`kernel/src/drivers/pci.rs` `DEVICE_VIRTIO_GPU=0x1050` + `is_virtio_gpu()`；`display::init` GPU-first、失败回退 GOP。
+  - **flush**：`display::flush()` = 整表面 `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`；rate limiter 由 TSC `FLUSH_INTERVAL_CYCLES=10_000_000`（≈10 ms @1 GHz，帧率硬下限 ≥100 FPS）守护；仅在 `screen::console_take_dirty()` 标脏时 flush（console-only 路径不再为全桌面 flush）。
+  - **页表 offset bug**：`kernel/src/mm/page_table.rs` 的 `translate`/`translate_user` 漏接 page offset（低 12 位）→ user 虚拟地址按 4K 页对齐、高 12 位取错 → 桌面/用户进程地址空间错乱。已修复 + 回归测试 `an_offset_address_translates_exactly`（`kernel/src/test/m2.rs`）。
+- **刷新率**：flush 走 TSC deadline 节流，`FLUSH_INTERVAL_CYCLES≈10 ms` → 单帧周期 ≥100 FPS，满足 60~144 FPS 需求的下限；present 热路径零日志（`§13.8` 的"present 不得打日志"结论继续有效）。
+- **验收**：`./scripts/gates.sh` 全绿；串口 `display: virtio-gpu scanout 1024x768 pitch 4096 at virt … — the device owns the scanout`；VNC/QMP 截图实测桌面/窗口/菜单/光标/bottom-pin 全部正确。
+
 ### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
 
 - **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。

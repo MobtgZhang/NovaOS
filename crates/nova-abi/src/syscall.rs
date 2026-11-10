@@ -213,6 +213,16 @@ pub mod nr {
     /// would let one process erase another's pixels.
     pub const CONSOLE_CLEAR: Syscall = Syscall(25);
 
+    /// Read the wall clock.
+    ///
+    /// Takes no arguments. Returns the number of seconds since the Unix
+    /// epoch as read from the battery-backed RTC, or `-1` when the clock
+    /// could not be read plausibly (no century register, implausible
+    /// date). This is what a panel clock draws from; it reads hardware
+    /// and is therefore not a fast call — poll it for a display, not in
+    /// a hot loop.
+    pub const TIME: Syscall = Syscall(26);
+
     /// Read bytes from standard input (the serial console).
     ///
     /// Arguments: `fd`, `buffer`, `length`. `fd` must be `0` (stdin). The
@@ -249,6 +259,7 @@ pub mod nr {
         SERVICE_REQUEST,
         GET_BOOT_MODE,
         CONSOLE_CLEAR,
+        TIME,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -280,6 +291,7 @@ pub mod nr {
             GET_BOOT_MODE => "get_boot_mode",
             READ => "read",
             CONSOLE_CLEAR => "console_clear",
+            TIME => "time",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

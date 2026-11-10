@@ -478,6 +478,20 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         };
     }
 
+    if number == nova_abi::nr::TIME.number() as u64 {
+        // The RTC read is a port-I/O affair the kernel test suite and the
+        // network stack already perform from service context; a caller
+        // gets `-1` when the reading is not plausible rather than a
+        // wrong date.
+        let seconds = crate::time::wall_clock_seconds()
+            .map(|value| value as i64)
+            .unwrap_or(-1);
+        return Outcome {
+            result: nova_core::syscall::SyscallResult::Value(seconds),
+            effect: nova_core::syscall::ThreadEffect::Continue,
+        };
+    }
+
     if number == nova_abi::nr::READ.number() as u64 {
         return read_from_console(args);
     }
