@@ -138,6 +138,8 @@ struct FileManager {
     up: Button,
     /// The button that asks for the listing again.
     refresh: Button,
+    /// The button that creates a directory in the current path.
+    new_folder: Button,
     /// The status line's live bytes.
     status: [u8; STATUS_SIZE],
     /// How many of `status` are live.
@@ -166,6 +168,7 @@ impl FileManager {
             selected: None,
             up: Button::new(Rect::new(8, 312, 60, 24), "Up"),
             refresh: Button::new(Rect::new(76, 312, 76, 24), "Refresh"),
+            new_folder: Button::new(Rect::new(160, 312, 108, 24), "New Folder"),
             status: [0; STATUS_SIZE],
             status_len: 0,
             primary_down: false,
@@ -287,6 +290,43 @@ impl FileManager {
         self.reload();
     }
 
+    /// Create a directory in the current path.
+    ///
+    /// The name is unique in the directory: `New Folder`, then `New Folder
+    /// 2`, `New Folder 3`, … — the shape every file manager on every
+    /// desktop uses. A name the server refused is tried as the next
+    /// number rather than reported, because the refusal almost always
+    /// means the name exists, and the first free number is the answer the
+    /// user wanted anyway.
+    fn create_folder(&mut self) {
+        let mut candidate = [0u8; fsclient::MAX_PATH];
+        for index in 0..100usize {
+            let mut name = [0u8; 24];
+            name[..10].copy_from_slice(b"New Folder");
+            let mut name_len = 10;
+            if index > 0 {
+                name[10] = b' ';
+                let mut digits = [0u8; 4];
+                let text = decimal(index + 1, &mut digits);
+                name[11..11 + text.len()].copy_from_slice(text.as_bytes());
+                name_len = 11 + text.len();
+            }
+            let Some(path_len) = join(
+                &self.path[..self.path_len],
+                &name[..name_len],
+                &mut candidate,
+            ) else {
+                self.set_status("path too long", &[], "");
+                return;
+            };
+            if fsclient::mkdir(&candidate[..path_len]).is_ok() {
+                self.reload();
+                return;
+            }
+        }
+        self.set_status("could not create a folder", &[], "");
+    }
+
     /// Walk into `entry`, refusing a path that would not fit the wire.
     fn descend(&mut self, entry: &Entry) {
         let mut next = [0u8; fsclient::MAX_PATH];
@@ -404,7 +444,11 @@ impl FileManager {
             }
         }
 
-        let before = (self.up.is_down(), self.refresh.is_down());
+        let before = (
+            self.up.is_down(),
+            self.refresh.is_down(),
+            self.new_folder.is_down(),
+        );
 
         let mut fired = false;
         if self.up.on_pointer(event.x, event.y, primary) {
@@ -413,6 +457,10 @@ impl FileManager {
         }
         if self.refresh.on_pointer(event.x, event.y, primary) {
             self.reload();
+            fired = true;
+        }
+        if self.new_folder.on_pointer(event.x, event.y, primary) {
+            self.create_folder();
             fired = true;
         }
 
@@ -430,7 +478,13 @@ impl FileManager {
         // A press that only arms a button still changes what it looks like,
         // so it counts as a redraw — otherwise the button would not appear
         // to go down until it fired.
-        fired || before != (self.up.is_down(), self.refresh.is_down())
+        fired
+            || before
+                != (
+                    self.up.is_down(),
+                    self.refresh.is_down(),
+                    self.new_folder.is_down(),
+                )
     }
 
     /// The row a pointer at `y` lands in, if it lands on one that exists.
@@ -511,6 +565,7 @@ impl FileManager {
 
         self.up.draw(canvas);
         self.refresh.draw(canvas);
+        self.new_folder.draw(canvas);
 
         canvas.fill_rect(
             Rect::new(0, STATUS_TOP, WIDTH, STATUS_HEIGHT),

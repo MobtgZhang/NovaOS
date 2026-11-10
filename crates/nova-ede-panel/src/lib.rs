@@ -50,7 +50,10 @@ use nova_ui::{Canvas, Rect};
 
 pub mod icon_theme;
 
-use icon_theme::{FILE_MANAGER_RGBA, SYSTEM_MONITOR_RGBA, TERMINAL_RGBA, TEXT_EDITOR_RGBA};
+use icon_theme::{
+    APPLICATION_RGBA, FILE_MANAGER_RGBA, FOLDER_RGBA, SYSTEM_MONITOR_RGBA, TERMINAL_RGBA,
+    TEXT_EDITOR_RGBA,
+};
 
 pub mod settings;
 pub mod taskbar;
@@ -588,15 +591,21 @@ pub fn draw_comet(canvas: &mut Canvas, x: i32, y: i32, color: u32) {
 /// The edeneu icon for an application, as 64x64 RGBA pixels — the
 /// theme `edeproject/ede` ships in `data/icon-themes/edeneu`, embedded
 /// in [`icon_theme`]. `None` for a service this port does not carry an
-/// edeneu icon for; callers fall back to their own drawing.
+/// edeneu icon for; callers fall back to their own drawing. The map
+/// takes both the `.desktop` `Icon=` name and the service's executable
+/// name, because the desktop layer hands out whichever it has.
 pub fn icon_rgba(command: &str) -> Option<&'static [u8]> {
     match command {
-        "terminal" => Some(&TERMINAL_RGBA),
-        "file-manager" => Some(&FILE_MANAGER_RGBA),
-        "editor" => Some(&TEXT_EDITOR_RGBA),
+        "utilities-terminal" | "terminal" => Some(&TERMINAL_RGBA),
+        "system-file-manager" | "file-manager" => Some(&FILE_MANAGER_RGBA),
+        "accessories-text-editor" | "editor" => Some(&TEXT_EDITOR_RGBA),
         // The showcase gets edeneu's system monitor icon: the closest
         // thing the theme ships to a "widgets" noun.
-        "widgets-demo" => Some(&SYSTEM_MONITOR_RGBA),
+        "utilities-system-monitor" | "widgets-demo" => Some(&SYSTEM_MONITOR_RGBA),
+        // The generic application icon for launchers the user creates.
+        "application-x-executable" => Some(&APPLICATION_RGBA),
+        // The folder icon for folder launchers.
+        "folder" => Some(&FOLDER_RGBA),
         _ => None,
     }
 }

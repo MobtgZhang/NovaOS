@@ -51,6 +51,7 @@ use nova_ede_panel::taskbar::{self, TaskEntry, TaskbarModel};
 use nova_ede_panel::{self, Action as PanelAction, Panel};
 use nova_ede_tip::Tooltip;
 use nova_edelib::EdeConfig;
+use nova_protocols::file::{FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE};
 use nova_protocols::input::{
     INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER,
 };
@@ -81,6 +82,22 @@ const RUN_DIALOG_H: i32 = 116;
 const RUN_OK_INSET: i32 = 184;
 const RUN_CANCEL_INSET: i32 = 96;
 const RUN_BUTTON_INSET_Y: i32 = 84;
+
+/// The desktop context menu's geometry, in surface coordinates.
+const CONTEXT_WIDTH: i32 = 224;
+const CONTEXT_HEADER_H: i32 = 0;
+const CONTEXT_ROW_PITCH: i32 = 24;
+const CONTEXT_FLOOR: i32 = 4;
+const CONTEXT_MARGIN: i32 = 2;
+
+/// The launcher creation dialog's size, and the offsets of its buttons.
+const LAUNCHER_DIALOG_W: i32 = 400;
+const LAUNCHER_DIALOG_H: i32 = 152;
+const LAUNCHER_OK_INSET: i32 = 184;
+const LAUNCHER_CANCEL_INSET: i32 = 96;
+const LAUNCHER_BUTTON_INSET_Y: i32 = 120;
+/// The longest field the launcher dialog keeps.
+const LAUNCHER_FIELD_MAX: usize = 47;
 
 /// How many `icons=` names `desktop.conf` may filter by.
 const MAX_ICON_FILTER: usize = 16;
@@ -177,6 +194,22 @@ struct Shell {
     run_cursor: usize,
     run_ok: nova_ui::Button,
     run_cancel: nova_ui::Button,
+    /// A right-click context menu on the desktop — EDE's
+    /// `ede-desktop` menu with Create Launcher/Folder, Arrange Icons,
+    /// Icons Settings and Background.
+    context_open: bool,
+    context_x: i32,
+    context_y: i32,
+    /// The launcher creation dialog: Name and Command fields and their
+    /// focus. `launcher_focus` is `0` for Name, `1` for Command.
+    launcher_open: bool,
+    launcher_name: [u8; LAUNCHER_FIELD_MAX + 1],
+    launcher_name_len: usize,
+    launcher_command: [u8; LAUNCHER_FIELD_MAX + 1],
+    launcher_command_len: usize,
+    launcher_focus: u8,
+    launcher_ok: nova_ui::Button,
+    launcher_cancel: nova_ui::Button,
     /// The name of a notification file that resisted deletion: its
     /// content is posted once, not again on every drain.
     stuck_notify: [u8; 32],
@@ -254,6 +287,34 @@ impl Shell {
                 Rect::new(
                     (width as i32 - RUN_DIALOG_W) / 2 + RUN_DIALOG_W - RUN_CANCEL_INSET,
                     (height as i32 - RUN_DIALOG_H) / 2 + RUN_BUTTON_INSET_Y,
+                    80,
+                    24,
+                ),
+                "Cancel",
+            ),
+            context_open: false,
+            context_x: 0,
+            context_y: 0,
+            launcher_open: false,
+            launcher_name: [0; LAUNCHER_FIELD_MAX + 1],
+            launcher_name_len: 0,
+            launcher_command: [0; LAUNCHER_FIELD_MAX + 1],
+            launcher_command_len: 0,
+            launcher_focus: 0,
+            launcher_ok: nova_ui::Button::new(
+                Rect::new(
+                    (width as i32 - LAUNCHER_DIALOG_W) / 2 + LAUNCHER_DIALOG_W - LAUNCHER_OK_INSET,
+                    (height as i32 - LAUNCHER_DIALOG_H) / 2 + LAUNCHER_BUTTON_INSET_Y,
+                    80,
+                    24,
+                ),
+                "OK",
+            ),
+            launcher_cancel: nova_ui::Button::new(
+                Rect::new(
+                    (width as i32 - LAUNCHER_DIALOG_W) / 2 + LAUNCHER_DIALOG_W
+                        - LAUNCHER_CANCEL_INSET,
+                    (height as i32 - LAUNCHER_DIALOG_H) / 2 + LAUNCHER_BUTTON_INSET_Y,
                     80,
                     24,
                 ),
@@ -671,10 +732,19 @@ impl Shell {
             }
             // The real edeneu icon, alpha-blended straight on the
             // wallpaper — no plate behind it, exactly how EDE renders
-            // icons over the background.
+            // icons over the background. The `.desktop`'s Icon= name is
+            // the theme lookup; fall back to the executable name for
+            // entries that carry no Icon= line.
             let icon_size = 64i32;
             let ix = cell.x + (cell.width as i32 - icon_size) / 2;
-            nova_ede_panel::draw_app_icon(canvas, icon.exec(), ix, cell.y + 4);
+            let theme = icon
+                .icon_name()
+                .or_else(|| {
+                    let exec = icon.exec();
+                    if exec.is_empty() { None } else { Some(exec) }
+                })
+                .unwrap_or("");
+            nova_ede_panel::draw_app_icon(canvas, theme, ix, cell.y + 4);
             // Label with shadow.
             canvas.draw_text(cell.x + 6, cell.y + 70, icon.label(), 0x00000000, None);
             canvas.draw_text(cell.x + 5, cell.y + 69, icon.label(), 0x00E6ECF2, None);
@@ -732,9 +802,20 @@ impl Shell {
             self.draw_about(canvas);
         }
 
+        // The desktop context menu, if open — above windows, below the
+        // launcher dialog.
+        if self.context_open {
+            self.draw_context_menu(canvas);
+        }
+
         // The Run dialog, if open — topmost of all.
         if self.run_open {
             self.draw_run_dialog(canvas);
+        }
+
+        // The launcher creation dialog, if open — topmost of all.
+        if self.launcher_open {
+            self.draw_launcher_dialog(canvas);
         }
     }
 
@@ -901,6 +982,92 @@ impl Shell {
         self.run_cancel.draw(canvas);
     }
 
+    /// Draw the desktop context menu: EDE's `ede-desktop` menu, one row
+    /// per action, in the theme's near-white body with a border.
+    fn draw_context_menu(&self, canvas: &mut Canvas) {
+        let height = Self::CONTEXT_ROWS as i32 * CONTEXT_ROW_PITCH + CONTEXT_FLOOR;
+        let rect = Rect::new(
+            self.context_x,
+            self.context_y,
+            CONTEXT_WIDTH as u32,
+            height as u32,
+        );
+        canvas.fill_rect(rect, palette::MENU_FACE);
+        canvas.stroke_rect(rect, palette::BORDER);
+
+        const ITEMS: [&str; 5] = [
+            "Create Launcher...",
+            "Create Folder...",
+            "Arrange Icons",
+            "Icons Settings...",
+            "Background...",
+        ];
+        for (row, label) in ITEMS.iter().enumerate() {
+            let y = self.context_y + row as i32 * CONTEXT_ROW_PITCH + CONTEXT_MARGIN;
+            canvas.fill_rect(
+                Rect::new(
+                    self.context_x + 1,
+                    y,
+                    (CONTEXT_WIDTH - 2) as u32,
+                    (CONTEXT_ROW_PITCH - CONTEXT_MARGIN * 2) as u32,
+                ),
+                palette::MENU_FACE,
+            );
+            canvas.draw_text(
+                self.context_x + 10,
+                y + 4,
+                label,
+                palette::TEXT,
+                Some(palette::MENU_FACE),
+            );
+        }
+    }
+
+    /// Draw the launcher creation dialog: two labelled text fields and
+    /// OK/Cancel buttons, styled like the Run dialog.
+    fn draw_launcher_dialog(&mut self, canvas: &mut Canvas) {
+        let x = (self.width as i32 - LAUNCHER_DIALOG_W) / 2;
+        let y = (self.height as i32 - LAUNCHER_DIALOG_H) / 2;
+        let rect = Rect::new(x, y, LAUNCHER_DIALOG_W as u32, LAUNCHER_DIALOG_H as u32);
+        canvas.fill_rect(rect, palette::SURFACE);
+        canvas.stroke_rect(rect, palette::BORDER);
+        nova_ui::draw_titlebar_at(canvas, x, y, LAUNCHER_DIALOG_W, "Create Launcher", true);
+
+        // The two fields.
+        for (index, label) in ["Name:", "Command:"].iter().enumerate() {
+            let field_y = self.launcher_field_y(index);
+            canvas.draw_text(
+                x + 16,
+                field_y - 18,
+                label,
+                palette::TEXT,
+                Some(palette::SURFACE),
+            );
+            let field = Rect::new(x + 16, field_y, (LAUNCHER_DIALOG_W - 32) as u32, 22);
+            canvas.fill_rect(field, palette::FIELD);
+            canvas.stroke_rect(field, palette::BORDER);
+            let (bytes, len) = if index == 0 {
+                (&self.launcher_name, self.launcher_name_len)
+            } else {
+                (&self.launcher_command, self.launcher_command_len)
+            };
+            let typed = core::str::from_utf8(&bytes[..len]).unwrap_or("");
+            canvas.draw_text(
+                field.x + 6,
+                field.y + 3,
+                typed,
+                palette::TEXT,
+                Some(palette::FIELD),
+            );
+            if self.launcher_focus == index as u8 {
+                let caret_x = field.x + 6 + Canvas::text_width(typed) as i32 + 1;
+                canvas.fill_rect(Rect::new(caret_x, field.y + 3, 1, 16), palette::TEXT);
+            }
+        }
+        self.launcher_ok.draw(canvas);
+        self.launcher_cancel.draw(canvas);
+    }
+
     /// Launch a service by name, reporting a failure honestly: a
     /// missing service is an error the console sees, not silence.
     fn launch(&self, name: &str) {
@@ -933,6 +1100,20 @@ impl Shell {
         // The Run dialog takes the keyboard while it is open.
         if self.run_open {
             return self.run_key(key);
+        }
+
+        // The launcher creation dialog takes the keyboard while it is open.
+        if self.launcher_open {
+            return self.launcher_key(key);
+        }
+
+        // The context menu closes on Escape.
+        if self.context_open {
+            if key == Key::Escape {
+                self.context_open = false;
+                return true;
+            }
+            return false;
         }
 
         if !self.start_menu {
@@ -1029,6 +1210,327 @@ impl Shell {
         self.launch(text);
     }
 
+    /// The context menu's row height — one row per menu item.
+    const CONTEXT_ROWS: usize = 5;
+
+    /// The launcher dialog's text field `index` (0 Name, 1 Command):
+    /// the y of the field's top edge.
+    fn launcher_field_y(&self, index: usize) -> i32 {
+        (self.height as i32 - LAUNCHER_DIALOG_H) / 2 + 40 + index as i32 * 44
+    }
+
+    /// Open the launcher creation dialog with empty fields.
+    fn open_launcher(&mut self) {
+        self.context_open = false;
+        self.launcher_open = true;
+        self.launcher_name_len = 0;
+        self.launcher_command_len = 0;
+        self.launcher_focus = 0;
+    }
+
+    /// Submit the launcher dialog: write the `.desktop` file and add
+    /// the icon to the desktop.
+    fn launcher_submit(&mut self) {
+        let mut name = [0u8; LAUNCHER_FIELD_MAX];
+        let name_len = self.launcher_name_len;
+        name[..name_len].copy_from_slice(&self.launcher_name[..name_len]);
+        let mut command = [0u8; LAUNCHER_FIELD_MAX];
+        let command_len = self.launcher_command_len;
+        command[..command_len].copy_from_slice(&self.launcher_command[..command_len]);
+        self.launcher_open = false;
+        let label = core::str::from_utf8(&name[..name_len]).unwrap_or("").trim();
+        let exec = core::str::from_utf8(&command[..command_len])
+            .unwrap_or("")
+            .trim();
+        self.create_launcher(label, exec);
+    }
+
+    /// Sanitize a name into a file-name stem: letters, digits, space,
+    /// dash and underscore are kept, spaces become dashes, everything
+    /// else is dropped, and the stem is capped short enough to leave
+    /// room for `.desktop`.
+    fn file_stem(name: &str, out: &mut [u8]) -> usize {
+        let mut len = 0usize;
+        for byte in name.bytes() {
+            if len + 1 >= out.len() {
+                break;
+            }
+            let keep = byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+            if keep {
+                out[len] = byte;
+                len += 1;
+            } else if byte == b' ' && len > 0 {
+                out[len] = b'-';
+                len += 1;
+            }
+        }
+        len
+    }
+
+    /// Write a launcher `.desktop` file into `~/Desktop` and add its
+    /// icon to the desktop — a desktop entry the user just created,
+    /// appearing live, exactly like EDE.
+    fn create_launcher(&mut self, label: &str, command: &str) {
+        if label.is_empty() || command.is_empty() {
+            return;
+        }
+        let mut stem = [0u8; 48];
+        let stem_len = Self::file_stem(label, &mut stem);
+        if stem_len == 0 {
+            return;
+        }
+        let mut path = [0u8; 128];
+        let base = b"/home/nova/Desktop/";
+        let mut path_len = base.len();
+        path[..base.len()].copy_from_slice(base);
+        path[path_len..path_len + stem_len].copy_from_slice(&stem[..stem_len]);
+        path_len += stem_len;
+        path[path_len..path_len + 8].copy_from_slice(b".desktop");
+        path_len += 8;
+
+        let page = {
+            let mut page = [0u8; 1024];
+            let mut cursor = 0usize;
+            let mut push = |dst: &mut [u8], cursor: &mut usize, src: &[u8]| {
+                if *cursor + src.len() > dst.len() {
+                    return false;
+                }
+                dst[*cursor..*cursor + src.len()].copy_from_slice(src);
+                *cursor += src.len();
+                true
+            };
+            if !push(
+                &mut page,
+                &mut cursor,
+                b"[Desktop Entry]\nType=Application\nName=",
+            ) {
+                return;
+            }
+            if !push(&mut page, &mut cursor, label.as_bytes()) {
+                return;
+            }
+            if !push(&mut page, &mut cursor, b"\nExec=") {
+                return;
+            }
+            if !push(&mut page, &mut cursor, command.as_bytes()) {
+                return;
+            }
+            if !push(
+                &mut page,
+                &mut cursor,
+                b"\nIcon=application-x-executable\nTerminal=false\nCategories=Utility;\n",
+            ) {
+                return;
+            }
+            (cursor, page)
+        };
+
+        match fsclient::open(&path[..path_len], FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE) {
+            Ok(handle) => {
+                let written = page.0;
+                let _ = fsclient::write(handle.handle, &page.1[..written]);
+                let _ = fsclient::close(handle.handle);
+                // Add the icon to the desktop layer, keeping the launcher
+                // model in step so the start menu offers it too.
+                let mut contents = [0u8; 1024];
+                contents[..written].copy_from_slice(&page.1[..written]);
+                let index = self.layer.len();
+                let _ = self.layer.add_from_desktop(&contents[..written], index);
+                let _ = self.launchpad.add_desktop(&contents[..written]);
+            }
+            Err(_) => {}
+        }
+    }
+
+    /// Create a directory in `~/Desktop` and a shortcut launcher that
+    /// opens the file manager there — EDE's `Create Folder`, which
+    /// makes a folder you can see without leaving the desktop.
+    fn create_folder(&mut self) {
+        for index in 0..100usize {
+            let mut name = [0u8; 32];
+            name[..10].copy_from_slice(b"New Folder");
+            let mut name_len = 10;
+            if index > 0 {
+                name[10] = b' ';
+                let mut digits = [0u8; 4];
+                let text = nova_ui::decimal(index + 1, &mut digits);
+                name[11..11 + text.len()].copy_from_slice(text.as_bytes());
+                name_len = 11 + text.len();
+            }
+            let mut path = [0u8; 128];
+            let base = b"/home/nova/Desktop/";
+            let mut path_len = base.len();
+            path[..path_len].copy_from_slice(base);
+            path[path_len..path_len + name_len].copy_from_slice(&name[..name_len]);
+            path_len += name_len;
+            if fsclient::mkdir(&path[..path_len]).is_ok() {
+                // A shortcut launcher icon for the folder.
+                let mut shortcut = [0u8; 128];
+                path_len = base.len();
+                path[..path_len].copy_from_slice(base);
+                path[path_len..path_len + name_len].copy_from_slice(&name[..name_len]);
+                path_len += name_len;
+                shortcut[..path_len].copy_from_slice(&path[..path_len]);
+                shortcut[path_len..path_len + 8].copy_from_slice(b".desktop");
+                path_len += 8;
+
+                let mut page = [0u8; 512];
+                let mut cursor = 0usize;
+                let mut push = |dst: &mut [u8], cursor: &mut usize, src: &[u8]| {
+                    if *cursor + src.len() > dst.len() {
+                        return false;
+                    }
+                    dst[*cursor..*cursor + src.len()].copy_from_slice(src);
+                    *cursor += src.len();
+                    true
+                };
+                if !push(
+                    &mut page,
+                    &mut cursor,
+                    b"[Desktop Entry]\nType=Application\nName=",
+                ) {
+                    return;
+                }
+                if !push(&mut page, &mut cursor, &name[..name_len]) {
+                    return;
+                }
+                if !push(
+                    &mut page,
+                    &mut cursor,
+                    b"\nExec=file-manager\nIcon=folder\nTerminal=false\nCategories=Utility;\n",
+                ) {
+                    return;
+                }
+                match fsclient::open(&shortcut[..path_len], FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE) {
+                    Ok(handle) => {
+                        let _ = fsclient::write(handle.handle, &page[..cursor]);
+                        let _ = fsclient::close(handle.handle);
+                        let mut contents = [0u8; 1024];
+                        contents[..cursor].copy_from_slice(&page[..cursor]);
+                        let index = self.layer.len();
+                        let _ = self.layer.add_from_desktop(&contents[..cursor], index);
+                        let _ = self.launchpad.add_desktop(&contents[..cursor]);
+                    }
+                    Err(_) => {}
+                }
+                return;
+            }
+        }
+    }
+
+    /// Arrange the desktop icons on the grid — EDE's `Arrange Icons`.
+    fn arrange_icons(&mut self) {
+        self.layer.auto_arrange();
+    }
+
+    /// Toggle single-click activation and persist `Icons/one_click_exec`
+    /// to `desktop.conf`, like EDE's icon settings.
+    fn toggle_one_click(&mut self) {
+        self.desktop_conf.one_click_exec = !self.desktop_conf.one_click_exec;
+        self.write_desktop_conf();
+    }
+
+    /// Cycle the desktop background and persist it.
+    fn cycle_background(&mut self) {
+        // Deep sea (default) → midnight solid → slate solid → deep sea.
+        if self.desktop_conf.wallpaper_use {
+            self.desktop_conf.wallpaper_use = false;
+            self.desktop_conf.color = 0x001C2733;
+        } else if self.desktop_conf.color == 0x001C2733 {
+            self.desktop_conf.color = 0x00242E33;
+        } else {
+            self.desktop_conf.wallpaper_use = true;
+            self.desktop_conf.color = 0x000A1218;
+        }
+        self.write_desktop_conf();
+    }
+
+    /// Rewrite `desktop.conf` from the in-memory configuration.
+    fn write_desktop_conf(&mut self) {
+        let mut buffer = [0u8; 1024];
+        let len = self.desktop_conf.to_config(&mut buffer);
+        if let Ok(handle) = fsclient::open(
+            b"/home/nova/.ede/desktop.conf",
+            FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE,
+        ) {
+            let _ = fsclient::write(handle.handle, &buffer[..len]);
+            let _ = fsclient::close(handle.handle);
+        }
+    }
+
+    /// Act on a context menu row.
+    fn click_context_menu(&mut self, x: i32, y: i32) -> bool {
+        let by = self.context_y;
+        if x < self.context_x || x >= self.context_x + CONTEXT_WIDTH {
+            self.context_open = false;
+            return true;
+        }
+        let row = (y - by) / CONTEXT_ROW_PITCH;
+        let row_count = Self::CONTEXT_ROWS as i32;
+        if y < by || row >= row_count {
+            self.context_open = false;
+            return true;
+        }
+        match row {
+            0 => self.open_launcher(),
+            1 => self.create_folder(),
+            2 => self.arrange_icons(),
+            3 => self.toggle_one_click(),
+            _ => self.cycle_background(),
+        }
+        self.context_open = false;
+        true
+    }
+
+    /// A key while the launcher creation dialog is open: type into the
+    /// focused field, Tab switches fields, Enter submits, Escape closes.
+    fn launcher_key(&mut self, key: Key) -> bool {
+        match key {
+            Key::Escape => {
+                self.launcher_open = false;
+                true
+            }
+            Key::Tab => {
+                self.launcher_focus = if self.launcher_focus == 0 { 1 } else { 0 };
+                true
+            }
+            Key::Char(byte) => {
+                if !(0x20..0x7f).contains(&byte) {
+                    return false;
+                }
+                let (buffer, len) = if self.launcher_focus == 0 {
+                    (&mut self.launcher_name, &mut self.launcher_name_len)
+                } else {
+                    (&mut self.launcher_command, &mut self.launcher_command_len)
+                };
+                if *len >= LAUNCHER_FIELD_MAX {
+                    return false;
+                }
+                buffer[*len] = byte;
+                *len += 1;
+                true
+            }
+            Key::Backspace => {
+                let (_, len) = if self.launcher_focus == 0 {
+                    (&mut self.launcher_name, &mut self.launcher_name_len)
+                } else {
+                    (&mut self.launcher_command, &mut self.launcher_command_len)
+                };
+                if *len > 0 {
+                    *len -= 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            Key::Enter => {
+                self.launcher_submit();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Handle one pointer event, on the button's *edges*.
     ///
     /// `pressed` is the up→down transition, `released` the down→up one;
@@ -1069,6 +1571,56 @@ impl Shell {
             if pressed || secondary_pressed {
                 self.about = false;
                 return true;
+            }
+            return false;
+        }
+
+        // The launcher creation dialog is modal.
+        if self.launcher_open {
+            if self.launcher_ok.on_pointer(event.x, event.y, held) {
+                self.launcher_submit();
+                return true;
+            }
+            if self.launcher_cancel.on_pointer(event.x, event.y, held) {
+                self.launcher_open = false;
+                return true;
+            }
+            if pressed {
+                // Clicking a field focuses it; clicking elsewhere does
+                // nothing — the dialog is modal by design.
+                let focus = if event.y >= self.launcher_field_y(0)
+                    && event.y < self.launcher_field_y(0) + 22
+                {
+                    Some(0)
+                } else if event.y >= self.launcher_field_y(1)
+                    && event.y < self.launcher_field_y(1) + 22
+                {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(focus) = focus {
+                    self.launcher_focus = focus;
+                    return true;
+                }
+                return false;
+            }
+            if secondary_pressed {
+                self.launcher_open = false;
+                return true;
+            }
+            return false;
+        }
+
+        // The desktop context menu is a popup: a press inside acts or
+        // ignores, a press outside closes it.
+        if self.context_open {
+            if secondary_pressed {
+                self.context_open = false;
+                return true;
+            }
+            if pressed {
+                return self.click_context_menu(event.x, event.y);
             }
             return false;
         }
@@ -1179,11 +1731,9 @@ impl Shell {
             self.drag = None;
         }
 
-        // Right-click: select the icon under the pointer, or — on empty
-        // ground — close the menu and clear the selection. A full
-        // context menu is EDE's `ede-desktop` menu, which this port does
-        // not yet carry; what must not happen is a right click that
-        // does nothing at all.
+        // Right-click: select the icon under the pointer, or on empty
+        // ground open the desktop context menu — EDE's `ede-desktop`
+        // menu.
         if secondary_pressed {
             if let Some(index) = self.layer.hit(event.x, event.y) {
                 let was_selected = self.layer.icon(index).is_some_and(|icon| icon.selected);
@@ -1191,19 +1741,17 @@ impl Shell {
                     self.layer.select(Some(index));
                     return true;
                 }
-                return false;
+                // Right-click on an already-selected icon offers the
+                // context menu too — the shell has nothing else to give
+                // it.
             }
-            let mut changed = false;
-            if self.start_menu {
-                self.start_menu = false;
-                self.launchpad.clear();
-                changed = true;
-            }
-            if self.layer.selected_count() > 0 {
-                self.layer.select(None);
-                changed = true;
-            }
-            return changed;
+            self.context_open = true;
+            self.context_x = event.x.min(self.width as i32 - CONTEXT_WIDTH - 4).max(0);
+            self.context_y = event
+                .y
+                .min(self.height as i32 - (Self::CONTEXT_ROWS as i32 * CONTEXT_ROW_PITCH) - 4)
+                .max(0);
+            return true;
         }
 
         // Desktop icons: a press selects; a press on the already

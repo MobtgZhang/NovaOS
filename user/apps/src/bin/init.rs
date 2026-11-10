@@ -27,13 +27,19 @@ const DESKTOP_SERVICES: &[Service] = &[
     // wallpaper from appearing a second and a half late.
     ("file-server", None),
     ("console-server", None),
-    ("desktop-shell", Some(("/", Rights::READ))),
+    // The desktop shell must write: it creates launchers and folders
+    // from its own right-click menu and rewrites `desktop.conf` for the
+    // background/icons toggles.
+    ("desktop-shell", Some(("/", HOME))),
     ("shell", Some(("/", HOME))),
     ("terminal", Some(("/", HOME))),
     // The editor reads and writes the user's own files, and nothing else.
     ("editor", Some(("/home", HOME))),
-    // The file manager browses; it never writes.
-    ("file-manager", Some(("/", Rights::READ))),
+    // The file manager manages: browse, create folders, and (with the
+    // taskbar's open buttons) launch what it shows. WRITE on `/` is the
+    // point of a file manager — read-only was a browsing demo, not a
+    // manager.
+    ("file-manager", Some(("/", HOME))),
     ("widgets-demo", None),
 ];
 

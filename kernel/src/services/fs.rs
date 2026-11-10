@@ -45,8 +45,8 @@ use nova_ipc::Message;
 use nova_protocols::ProtocolVersion;
 use nova_protocols::file::{
     FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE, FILE_LIST_REPLY_SIZE, FILE_OP_CHMOD, FILE_OP_CHOWN,
-    FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ,
-    FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_READ_REPLY_SIZE, FILE_VERSION,
+    FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST, FILE_OP_LIST_AT, FILE_OP_MKDIR, FILE_OP_OPEN,
+    FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_READ_REPLY_SIZE, FILE_VERSION,
     FileCloseReply, FileDirEntry, FileKind, FileListReply, FileOpenReply, FileReadReply,
     FileStatReply, FileWriteReply,
 };
@@ -966,6 +966,34 @@ impl FileServer {
     /// Only the disk format has a delete: the RAM filesystem holds its files
     /// for the whole session, and reports the operation as unsupported
     /// rather than half-honouring it.
+    /// Create a directory at `path`, under the caller's scopes.
+    ///
+    /// Mirrors the create half of `open`: the path needs a write grant
+    /// before the directory exists, and creating an existing directory is
+    /// a success — the caller keeps the directory it has, exactly as a
+    /// create of an existing file opens it for writing rather than
+    /// failing. Only the RAM filesystem can gain directories: mounted
+    /// images are byte-for-byte images on this machine, and writing one
+    /// back is not something the block device layer is asked to do.
+    pub fn mkdir_scoped(
+        &mut self,
+        scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
+        path: &[u8],
+    ) -> Result<(), FsError> {
+        let canonical = canonicalize(path).map_err(FsError::InvalidPath)?;
+        if scopes.denies(&canonical, Rights::WRITE) {
+            return Err(FsError::Denied);
+        }
+
+        // A mount covering the path means the request lands on a disk; disk
+        // images are fixed-layout and cannot gain directories.
+        if self.mount_covering(&canonical).is_some() {
+            return Err(FsError::Unsupported);
+        }
+
+        self.fs.create_dir(path)
+    }
+
     pub fn delete_scoped(
         &mut self,
         scopes: &ScopeSet<MAX_SCOPES_PER_TASK>,
@@ -1069,6 +1097,7 @@ impl FileServer {
             FILE_OP_LIST_AT => self.handle_list_at(scopes, payload),
             FILE_OP_STAT => self.handle_stat(scopes, payload),
             FILE_OP_DELETE => self.handle_delete(scopes, payload),
+            FILE_OP_MKDIR => self.handle_mkdir(scopes, payload),
             FILE_OP_RENAME => self.handle_rename(scopes, payload),
             FILE_OP_CHMOD => self.handle_chmod(scopes, payload),
             FILE_OP_CHOWN => self.handle_chown(scopes, payload),
@@ -1227,6 +1256,29 @@ impl FileServer {
     /// Deleting is defined for the disk format, which is where names can be
     /// removed; the RAM filesystem keeps its files for the whole session and
     /// reports the operation as unsupported rather than half-honouring it.
+    /// The `mkdir` operation: create a directory at `path`.
+    ///
+    /// The scope check mirrors create-at-that-path: a write grant on the
+    /// path itself is required, the same right creating the file needed.
+    /// Creating an existing directory is not an error — the caller keeps
+    /// the directory it has, exactly as creating an existing file opens it
+    /// for writing rather than failing.
+    fn handle_mkdir(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
+        let Some((version, path_len)) = read_path_header(payload) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        if negotiate(FILE_VERSION, version).is_err() {
+            return reply_error(ErrorCode::Unsupported);
+        }
+        let Some(path) = slice_at(payload, 16, path_len) else {
+            return reply_error(ErrorCode::Invalid);
+        };
+        match self.mkdir_scoped(scopes, path) {
+            Ok(()) => reply_status(),
+            Err(error) => reply_error(error.code()),
+        }
+    }
+
     fn handle_delete(&mut self, scopes: &ScopeSet<MAX_SCOPES_PER_TASK>, payload: &[u8]) -> Message {
         let Some((version, path_len)) = read_path_header(payload) else {
             return reply_error(ErrorCode::Invalid);

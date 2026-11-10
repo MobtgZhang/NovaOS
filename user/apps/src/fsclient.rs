@@ -37,9 +37,9 @@ use nova_abi::error::ErrorCode;
 use nova_protocols::file::{
     FILE_CLOSE_REQUEST_SIZE, FILE_DIR_ENTRY_SIZE, FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE,
     FILE_LIST_REPLY_SIZE, FILE_OP_CHMOD, FILE_OP_CHOWN, FILE_OP_CLOSE, FILE_OP_DELETE,
-    FILE_OP_LIST_AT, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE,
-    FILE_OPEN_REPLY_SIZE, FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE, FILE_VERSION,
-    FILE_WRITE_REQUEST_SIZE, FileKind,
+    FILE_OP_LIST_AT, FILE_OP_MKDIR, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT,
+    FILE_OP_WRITE, FILE_OPEN_REPLY_SIZE, FILE_READ_REPLY_SIZE, FILE_READ_REQUEST_SIZE,
+    FILE_VERSION, FILE_WRITE_REQUEST_SIZE, FileKind,
 };
 
 use crate::graphics::{MAX_PAYLOAD, read_u32, read_u64, reply_ok, service_request};
@@ -239,6 +239,34 @@ pub fn close(handle: u64) -> Result<(), ErrorCode> {
 
     let mut reply = [0u8; MAX_PAYLOAD];
     let length = service_request(SERVICE_FILE, FILE_OP_CLOSE, &request, &mut reply)?;
+    reply_ok(&reply[..length])
+}
+
+/// Create the directory at `path`.
+///
+/// The RAM filesystem holds directories for the whole session exactly like
+/// files: a directory that already exists answers as success, the same way
+/// creating an existing file is not an error. The scope check treats the new
+/// directory like a create at that path — a write grant on the path itself
+/// is required. Deleting a directory is not supported: the RAM filesystem
+/// keeps its contents for the life of the session.
+pub fn mkdir(path: &[u8]) -> Result<(), ErrorCode> {
+    if path.is_empty() || path.len() > MAX_PATH {
+        return Err(ErrorCode::Invalid);
+    }
+
+    let mut request = [0u8; MAX_PAYLOAD];
+    write_version(&mut request);
+    request[8..12].copy_from_slice(&(path.len() as u32).to_le_bytes());
+    request[16..16 + path.len()].copy_from_slice(path);
+
+    let mut reply = [0u8; MAX_PAYLOAD];
+    let length = service_request(
+        SERVICE_FILE,
+        FILE_OP_MKDIR,
+        &request[..16 + path.len()],
+        &mut reply,
+    )?;
     reply_ok(&reply[..length])
 }
 

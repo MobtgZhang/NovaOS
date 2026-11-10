@@ -32,7 +32,9 @@ use crate::ProtocolVersion;
 /// negotiation accepts an older minor, so a client that predates the two
 /// operations still talks to a server that has them: the version is a floor
 /// on what a peer may offer, not a requirement that it offer everything.
-pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
+/// Minor `2` added `FILE_OP_CHMOD` and `FILE_OP_CHOWN`; minor `3` adds
+/// `FILE_OP_MKDIR`.
+pub const FILE_VERSION: ProtocolVersion = ProtocolVersion::new(1, 3);
 
 /// Opcode for opening a file.
 pub const FILE_OP_OPEN: u64 = 1;
@@ -95,6 +97,16 @@ pub const FILE_OP_CHMOD: u64 = 10;
 /// the path; the privilege convention — root only — is the caller's to
 /// enforce, and the shell enforces it. Added at protocol minor `2`.
 pub const FILE_OP_CHOWN: u64 = 11;
+
+/// Opcode for creating a directory.
+///
+/// The path follows the header in the payload, exactly as [`FILE_OP_DELETE`]'s
+/// does. The scope check treats the new directory like a file being created
+/// at that path: a write grant on the path itself is required. A directory
+/// that already exists answers exactly like a create that finds the file
+/// already there: the operation succeeds and the caller proceeds with the
+/// directory it has. Added at protocol minor `3`.
+pub const FILE_OP_MKDIR: u64 = 12;
 
 /// Flag: open without failing if the file does not exist.
 pub const FILE_FLAG_CREATE: u32 = 1 << 0;
@@ -601,9 +613,9 @@ mod tests {
     use super::{
         FILE_CHMOD_REQUEST_SIZE, FILE_CHOWN_REQUEST_SIZE, FILE_FLAG_CREATE, FILE_FLAG_TRUNCATE,
         FILE_OP_CHMOD, FILE_OP_CHOWN, FILE_OP_CLOSE, FILE_OP_DELETE, FILE_OP_LIST, FILE_OP_LIST_AT,
-        FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE, FILE_VERSION,
-        FileChmodRequest, FileChownRequest, FileCloseReply, FileCloseRequest, FileDirEntry,
-        FileKind, FileListAtRequest, FileListReply, FileListRequest, FileOpenReply,
+        FILE_OP_MKDIR, FILE_OP_OPEN, FILE_OP_READ, FILE_OP_RENAME, FILE_OP_STAT, FILE_OP_WRITE,
+        FILE_VERSION, FileChmodRequest, FileChownRequest, FileCloseReply, FileCloseRequest,
+        FileDirEntry, FileKind, FileListAtRequest, FileListReply, FileListRequest, FileOpenReply,
         FileOpenRequest, FileReadReply, FileReadRequest, FileStatReply, FileStatRequest,
         FileWriteReply, FileWriteRequest, WireHandle,
     };
@@ -628,6 +640,7 @@ mod tests {
         assert_eq!(size_of::<FileChownRequest>(), FILE_CHOWN_REQUEST_SIZE);
         assert_eq!(FILE_OP_CHMOD, 10);
         assert_eq!(FILE_OP_CHOWN, 11);
+        assert_eq!(FILE_OP_MKDIR, 12);
         assert_eq!(size_of::<FileListRequest>(), 16);
         assert_eq!(size_of::<FileListAtRequest>(), 16);
         assert_eq!(size_of::<FileDirEntry>(), 16);
@@ -714,7 +727,7 @@ mod tests {
 
     #[test]
     fn the_version_is_checked_before_anything_else() {
-        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 2));
+        assert_eq!(FILE_VERSION, ProtocolVersion::new(1, 3));
         assert!(crate::negotiate(FILE_VERSION, FILE_VERSION).is_ok());
         // A minor-0 client still negotiates with a minor-1 server: the two
         // new operations are refused individually, not by version gate.
@@ -763,7 +776,7 @@ mod tests {
             reserved: 0,
         };
         assert_eq!(request.version.major, 1);
-        assert_eq!(request.version.minor, 2);
+        assert_eq!(request.version.minor, 3);
         assert_eq!(request.flags, FILE_FLAG_CREATE | FILE_FLAG_TRUNCATE);
         assert_eq!(request.path_len, 11);
         assert_eq!(request.reserved, 0);
