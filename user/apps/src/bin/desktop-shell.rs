@@ -669,16 +669,15 @@ impl Shell {
                 canvas.fill_rect(cell, palette::SELECTED);
                 canvas.fill_rect(cell.inset(2), palette::SURFACE);
             }
-            // Glyph plate and a simple glyph per app: EDE's light
-            // window gray with the theme's border.
-            let gx = cell.x + 28;
-            let gy = cell.y + 8;
-            canvas.fill_rect(Rect::new(gx, gy, 48, 40), palette::SURFACE);
-            canvas.stroke_rect(Rect::new(gx, gy, 48, 40), palette::BORDER);
-            nova_ede_panel::glyph(canvas, icon.exec(), gx + 24, gy + 20);
+            // The real edeneu icon, alpha-blended straight on the
+            // wallpaper — no plate behind it, exactly how EDE renders
+            // icons over the background.
+            let icon_size = 64i32;
+            let ix = cell.x + (cell.width as i32 - icon_size) / 2;
+            nova_ede_panel::draw_app_icon(canvas, icon.exec(), ix, cell.y + 4);
             // Label with shadow.
-            canvas.draw_text(cell.x + 6, cell.y + 56, icon.label(), 0x00000000, None);
-            canvas.draw_text(cell.x + 5, cell.y + 55, icon.label(), 0x00E6ECF2, None);
+            canvas.draw_text(cell.x + 6, cell.y + 70, icon.label(), 0x00000000, None);
+            canvas.draw_text(cell.x + 5, cell.y + 69, icon.label(), 0x00E6ECF2, None);
         }
 
         // The hover tooltip, near the bottom of the hovered icon.

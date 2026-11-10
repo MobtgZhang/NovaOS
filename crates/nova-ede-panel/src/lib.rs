@@ -21,6 +21,15 @@
 //! one a click lands on. It owns no window; the shell drives it with a
 //! canvas and turns the clicks into `Action`s.
 //!
+//! # The edeneu icon theme
+//!
+//! The desktop launches four applications whose icons the NovaOS tree
+//! used to draw from rectangles. The real EDE icons are embedded in
+//! [`icon_theme`]: `terminal` → `utilities-terminal`, `file-manager` →
+//! `system-file-manager`, `editor` → `accessories-text-editor`, and the
+//! widgets showcase → `utilities-system-monitor` — the actual
+//! `edeneu` theme, not a re-drawn lookalike.
+//!
 //! # The applets
 //!
 //! - `start-menu` — a comet-emblem button with the `Nova` wordmark; clicking
@@ -38,6 +47,10 @@
 
 use nova_ui::palette;
 use nova_ui::{Canvas, Rect};
+
+pub mod icon_theme;
+
+use icon_theme::{FILE_MANAGER_RGBA, SYSTEM_MONITOR_RGBA, TERMINAL_RGBA, TEXT_EDITOR_RGBA};
 
 pub mod settings;
 pub mod taskbar;
@@ -572,6 +585,31 @@ pub fn draw_comet(canvas: &mut Canvas, x: i32, y: i32, color: u32) {
 }
 
 /// Draw the glyph for an application's `Icon=`/exec name.
+/// The edeneu icon for an application, as 64x64 RGBA pixels — the
+/// theme `edeproject/ede` ships in `data/icon-themes/edeneu`, embedded
+/// in [`icon_theme`]. `None` for a service this port does not carry an
+/// edeneu icon for; callers fall back to their own drawing.
+pub fn icon_rgba(command: &str) -> Option<&'static [u8]> {
+    match command {
+        "terminal" => Some(&TERMINAL_RGBA),
+        "file-manager" => Some(&FILE_MANAGER_RGBA),
+        "editor" => Some(&TEXT_EDITOR_RGBA),
+        // The showcase gets edeneu's system monitor icon: the closest
+        // thing the theme ships to a "widgets" noun.
+        "widgets-demo" => Some(&SYSTEM_MONITOR_RGBA),
+        _ => None,
+    }
+}
+
+/// Draw the application's edeneu icon at `(x, y)` (top-left), alpha-
+/// blended on whatever is underneath — no plate, the way the real
+/// desktop renders its icons on the wallpaper.
+pub fn draw_app_icon(canvas: &mut Canvas, command: &str, x: i32, y: i32) {
+    if let Some(rgba) = icon_rgba(command) {
+        canvas.blit_rgba(x, y, 64, 64, rgba);
+    }
+}
+
 pub fn glyph(canvas: &mut Canvas, command: &str, x: i32, y: i32) {
     match command {
         "terminal" => {

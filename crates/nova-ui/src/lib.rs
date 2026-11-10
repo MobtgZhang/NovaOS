@@ -447,6 +447,38 @@ impl Canvas {
         }
     }
 
+    /// Alpha-blend a tightly packed RGBA image onto the canvas.
+    ///
+    /// The source is `width * height` pixels in RGBA byte order, alpha as
+    /// coverage per pixel — the same straight-alpha blend the compositor
+    /// and the text path apply. It exists for images a face cannot
+    /// supply: the edeneu application icons the desktop shell ships.
+    pub fn blit_rgba(&mut self, x: i32, y: i32, width: u32, height: u32, src: &[u8]) {
+        let expected = width as usize * height as usize * 4;
+        if src.len() != expected {
+            return;
+        }
+        for row in 0..height as i32 {
+            for col in 0..width as i32 {
+                let dx = x + col;
+                let dy = y + row;
+                let offset = ((row * width as i32 + col) * 4) as usize;
+                let alpha = src[offset + 3];
+                if alpha == 0 {
+                    continue;
+                }
+                let Some(dst) = self.get(dx, dy) else {
+                    continue;
+                };
+                self.set(
+                    dx,
+                    dy,
+                    mix3(src[offset], src[offset + 1], src[offset + 2], alpha, dst),
+                );
+            }
+        }
+    }
+
     /// The width `text` occupies when drawn with [`Canvas::draw_text`].
     pub fn text_width(text: &str) -> u32 {
         match typeface::with_face(|face| text.chars().map(|ch| face.char_advance(ch)).sum::<u32>())
@@ -467,6 +499,18 @@ impl Canvas {
         let y = rect.y + (rect.height.saturating_sub(GLYPH_HEIGHT as u32) / 2) as i32;
         self.draw_text(x, y, text, foreground, background);
     }
+}
+
+/// Blend a straight-alpha RGB source pixel over an XRGB8888 `dst` at
+/// `alpha` coverage (0..=255), rounding to nearest.
+fn mix3(sr: u8, sg: u8, sb: u8, alpha: u8, dst: u32) -> u32 {
+    let a = u32::from(alpha);
+    let inv = 255 - a;
+    let channel = |fg: u8, shift: u32| -> u32 {
+        let bg = (dst >> shift) & 0xFF;
+        ((u32::from(fg) * a + bg * inv + 127) / 255) << shift
+    };
+    channel(sr, 16) | channel(sg, 8) | channel(sb, 0)
 }
 
 /// Blend an XRGB8888 `foreground` over `background` at `alpha` coverage

@@ -575,7 +575,7 @@ impl FileServer {
         );
         self.seed_file(
             b"/home/nova/Desktop/widgets.desktop",
-            b"[Desktop Entry]\nType=Application\nName=Widgets\nExec=widgets-demo\nIcon=preferences-desktop\nComment=novagraph widget showcase\nCategories=Utility;\n",
+            b"[Desktop Entry]\nType=Application\nName=Widgets\nExec=widgets-demo\nIcon=utilities-system-monitor\nComment=novagraph widget showcase\nCategories=Utility;\n",
         );
         self.seed_file(
             b"/home/nova/.ede/panel.conf",
