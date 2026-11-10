@@ -43,7 +43,15 @@ fn main() {
         std::env::var("CARGO_MANIFEST_DIR").expect("Cargo always sets CARGO_MANIFEST_DIR"),
     );
 
-    let script = manifest.join("linker.ld");
+    // Each bare-metal target the kernel is built for names its own linker
+    // script; the x86-64 script hard-codes the higher-half entry and the
+    // low load address, which are wrong for the `virt` machines the two
+    // new ports run on.
+    let script = match std::env::var("TARGET").as_deref() {
+        Ok("riscv64gc-unknown-none-elf") => manifest.join("linker-riscv64.ld"),
+        Ok("loongarch64-unknown-none") => manifest.join("linker-loongarch64.ld"),
+        _ => manifest.join("linker.ld"),
+    };
 
     if !script.exists() {
         panic!(

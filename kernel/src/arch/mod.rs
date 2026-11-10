@@ -19,6 +19,17 @@
 //! | --- | --- | --- | --- | --- |
 //! | [`x86_64`] | `x86_64-unknown-none` | NovaBoot UEFI → long mode | 16550 @ 0x3f8 | `isa-debug-exit` @ 0xf4 |
 //! | [`aarch64`] | `aarch64-unknown-none` | NovaBoot UEFI → EL1 (planned) | PL011 @ 0x0900_0000 | PSCI `SYSTEM_OFF` |
+//! | [`riscv64`] | `riscv64gc-unknown-none-elf` | QEMU `virt` + OpenSBI → S-mode | 16550 @ 0x1000_0000 | SBI `SRST` ecall |
+//! | [`loongarch64`] | `loongarch64-unknown-none` | QEMU `virt` → direct `_start` | 16550 @ 0x1fe0_01e0 | park the CPU |
+//!
+//! # Porting status
+//!
+//! Only x86-64 has the complete kernel: paging, memory management, SMP,
+//! services, and the desktop. The two newest ports bring their machines up
+//! as far as the banner — the console is programmed and prints, an exception
+//! vector is installed, and the CPU parks. Everything the boot sequence
+//! *does* after those points is x86-64-only, and `arch/mod.rs` gates it out
+//! rather than promising a half-ported machine.
 //!
 //! # Adding a target
 //!
@@ -52,11 +63,29 @@ pub mod aarch64;
 pub use aarch64::{
     ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, ConsoleImpl, ExitImpl, Interrupts, NAME, arch_init,
 };
+#[cfg(target_arch = "riscv64")]
+pub mod riscv64;
+#[cfg(target_arch = "riscv64")]
+pub use riscv64::{
+    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, ConsoleImpl, ExitImpl, Interrupts, NAME, arch_init,
+};
+#[cfg(target_arch = "loongarch64")]
+pub mod loongarch64;
+#[cfg(target_arch = "loongarch64")]
+pub use loongarch64::{
+    ADDRESS_SPACE as BACKEND_ADDRESS_SPACE, ConsoleImpl, ExitImpl, Interrupts, NAME, arch_init,
+};
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64",
+    target_arch = "loongarch64"
+)))]
 compile_error!(
-    "NovaOS supports x86_64 and aarch64. Adding a target means implementing the \
-     capabilities in `arch::shared` and adding one `cfg` arm in `arch/mod.rs`."
+    "NovaOS supports x86_64, aarch64, riscv64 and loongarch64. Adding a \
+     target means implementing the capabilities in `arch::shared` and adding \
+     one `cfg` arm in `arch/mod.rs`."
 );
 
 /// The executing processor's kernel slot index.
@@ -69,7 +98,7 @@ pub fn current_cpu() -> usize {
     x86_64::percpu::cpu_index()
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(not(target_arch = "x86_64"))]
 pub fn current_cpu() -> usize {
     0
 }
@@ -106,6 +135,12 @@ pub unsafe fn init() {
 ///
 /// Must run on the AP, with interrupts masked, after it has switched to its own
 /// kernel stack and after the kernel address space is active.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+pub unsafe fn init_cpu(_cpu: usize, _direct_map_offset: u64) {
+    // No per-CPU tables yet; the single-processor machine has none to install.
+}
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
     // SAFETY: delegated to this function's contract.
     unsafe { x86_64::init_cpu(cpu, direct_map_offset) }
@@ -120,12 +155,24 @@ pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
 ///
 /// Must run once on the bootstrap processor, with interrupts masked, after
 /// the direct map exists.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+pub unsafe fn init_interrupt_controller(_direct_map_offset: u64) {
+    // Interrupts stay masked until the interrupt-controller driver exists.
+}
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn init_interrupt_controller(direct_map_offset: u64) {
     // SAFETY: delegated to this function's contract.
     unsafe { x86_64::apic::init(direct_map_offset) }
 }
 
 /// The stack pointer privilege transitions to `cpu` use.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+pub fn privilege_stack_for_cpu(_cpu: usize) -> u64 {
+    0
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
     x86_64::privilege_stack_for_cpu(cpu)
 }
@@ -137,6 +184,13 @@ pub fn privilege_stack_for_cpu(cpu: usize) -> u64 {
 /// on x86-64, PSCI `CPU_ON` on AArch64, SBI hart start on RISC-V — but the
 /// contract is one line: after this returns `true`, the slot's per-CPU
 /// scheduler, tables, and idle thread all exist.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+pub fn bring_up_application_processor(_cpu: usize) -> bool {
+    // No AP trampoline exists yet; the machine runs single-processor.
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
 pub fn bring_up_application_processor(cpu: usize) -> bool {
     x86_64::bring_up_application_processor(cpu)
 }
@@ -152,6 +206,14 @@ pub fn console_init() {
 ///
 /// Interrupts must be masked. The caller's frame is abandoned, so this must be
 /// called only from `_start`.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn switch_to_kernel_stack() {
+    // The RISC-V 64 and LoongArch 64 entries switch onto the kernel's own
+    // stack in their assembly stubs before any Rust runs; there is no frame
+    // for this function to abandon, and there is nothing to do.
+}
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn switch_to_kernel_stack() {
     // SAFETY: delegated to this function's contract.
     unsafe { x86_64::gdt::switch_to_kernel_stack() }
@@ -169,6 +231,24 @@ pub unsafe fn switch_to_kernel_stack() {
 ///
 /// Interrupts must be masked. Called exactly once, from the boot entry point.
 /// Does not return.
+#[cfg(not(target_arch = "x86_64"))]
+pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
+    // Unreached by the RISC-V 64 and LoongArch 64 bring-up; the assembly
+    // stub enters directly into `bringup_entry` with no x86-style boot flow.
+    loop {
+        // SAFETY: `wfi`/`idle` are hints with no operands or side effects.
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+        #[cfg(target_arch = "loongarch64")]
+        unsafe {
+            core::arch::asm!("idle 0");
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
     // SAFETY: delegated to this function's contract.
     unsafe { x86_64::gdt::switch_to_kernel_stack_and_continue() }
@@ -208,9 +288,29 @@ pub const fn arch_name() -> &'static str {
 /// other machine helpers above, this names the x86 backend directly:
 /// the aarch64 backend is still the stub [`aarch64`] describes, and
 /// giving it an arm is part of giving it an implementation.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn cycles() -> u64 {
     x86_64::cycles()
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn cycles() -> u64 {
+    #[cfg(target_arch = "riscv64")]
+    {
+        return riscv64::cycles();
+    }
+    #[cfg(target_arch = "loongarch64")]
+    {
+        return loongarch64::cycles();
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return 0;
+    }
+    #[allow(unreachable_code)]
+    0
 }
 
 /// Compile-time proof that each backend provides every capability.

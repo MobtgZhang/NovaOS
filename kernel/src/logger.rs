@@ -105,6 +105,7 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
     sink.push(b"\r\n");
 
     crate::arch::console().send_bytes(sink.as_bytes());
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     crate::drivers::screen::push_bytes(sink.as_bytes());
 }
 
@@ -117,8 +118,11 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
 pub fn panic_report(message: &str) {
     crate::arch::console().send_bytes(message.as_bytes());
     crate::arch::console().send_bytes(b"\r\n");
-    crate::drivers::screen::push_bytes_panic(message.as_bytes());
-    crate::drivers::screen::push_bytes_panic(b"\r\n");
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        crate::drivers::screen::push_bytes_panic(message.as_bytes());
+        crate::drivers::screen::push_bytes_panic(b"\r\n");
+    }
 }
 
 /// Render a [`core::panic::PanicInfo`] into `sink`.

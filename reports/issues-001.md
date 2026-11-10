@@ -561,3 +561,27 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **layout**：`USER_HEAP_SIZE` 1 MiB→4 MiB（桌面全屏 buffer 3 MiB 之需，ABI 常量，文档同步 `0x4040_0000`）；内核 `INITRAMFS_CAPACITY` 6→8 MiB（desktop-shell 使镜像到 6.4 MB）。
 - **验收（QEMU VNC/QMP）**：桌面以 desktop-shell 为最底层启动；壁纸+星空+图标+面板全部渲染；点击 "Widgets" 图标 → `desktop-shell: launch widgets-demo` → 新 widgets-demo 窗口出现在图标列旁；点击面板 "Terminal" 芯片 → 新终端窗口出现（`NovaOS terminal (Sarasa Gothic)`，`NovaOS terminal (Sarasa Gothic)` + 输入行可用）；`-smp 1`/512MB 下 desktop-shell 正常启动（file-manager 窗口在该最小配置报 `E_NO_MEMORY`，`-smp 4`/2048MB 无此问题；属于小内存配置的容量限制，非本次回归）。
 - **Gates**：fmt、clippy `-D warnings`（workspace 含两新 crate）、host 70/251、`cargo xtask test --timeout 240`、裸机构建——全绿。
+
+## 14. RISC-V 64 / LoongArch 64 架构移植（2026-11-11）〔进行中〕**High**
+
+- **背景**：用户验收要求把"x86-64 上已完成的同样任务"移植到 RISC-V 64 与 LoongArch 64。
+- **结论（先说清楚）**：两个端口**没有**达到 x86-64 的完备度。x86-64 是唯一跑完"内核→桌面→VFS→多进程→GPU 显示→EDE"全链路的架构；RISCV64 与 LoongArch 目前只做到"裸机内核进入 boot 流程、串口可以打出 banner、异常能进它的兜底处理"这一层。任何宣称"两个架构都已支持桌面"或"与 x86-64 等价"的说法都不是事实。
+- **已完成（两架构对称）**：
+  - `arch/riscv64`、`arch/loongarch64` 两个后端：`NAME`、`ADDRESS_SPACE`、`ConsoleImpl`（`arch/shared/uart16550::MmioConsole`，分别指向 `0x1000_0000` 与 `0x1fe0_01e0`）、`ExitImpl`（RISC-V 用 SBI SRST `ecall`；LoongArch `virt` 无 exit 设备，只能 park CPU 等 harness 终止）、`Interrupts`（RISC-V 用 `sstatus.SIE`；LoongArch 先按"复位即掩码"报告）、`cycles`（RISC-V `rdcycle`；LoongArch 暂返回 0 并如实标注）。
+  - `_start` 汇编 stub（两架构各自，设 `SP` 到 `.bss` 的 32 KiB 内核栈后跳到 `bringup_entry`）、独立 linker script（`kernel/linker-riscv64.ld` 0x8020_0000、`kernel/linker-loongarch64.ld` 0x0020_0000）、`kernel/build.rs` 按 TARGET 选择脚本、`.cargo/config.toml` 增加两个 target 的 rustflags。
+  - `arch/mod.rs` 门面新增两个 cfg 分支 + 相应的单处理器桩（`current_cpu()`、`init_cpu`、`init_interrupt_controller`、`privilege_stack_for_cpu`、`bring_up_application_processor`、`switch_to_kernel_stack(_and_continue)`、`cycles()`）。`main.rs` 的 boot flow 与 drivers/sched/mm/services/test 等 x86-only 模块全部 `#[cfg]` 起来，新端口只跑 `arch_bringup.rs`（console→banner→异常向量→park）。
+  - **实测（QEMU）**：`qemu-system-riscv64 -machine virt`（OpenSBI 引导，S-mode）与 `qemu-system-loongarch64 -machine virt -kernel`（无固件直接进 `_start`）都打出：
+    ```
+    [NOVA] INFO  | NovaOS riscv64 boot        (或 loongarch64)
+    [NOVA] INFO  | arch: riscv64 page 4096 B
+    [NOVA] INFO  | abi: 0.3 (27 syscalls)
+    [NOVA] INFO  | bring-up complete; halting
+    ```
+    x86-64 的 `cargo xtask test`（70 suites / 252 cases）与 `./scripts/gates.sh` 全绿，说明门面/cfg 的拆分对 x86-64 零影响。
+- **未完成（两架构同等）**：引导交接（x86-64 用 NovaBoot/UEFI；这里需为 `virt` 机写 FDT 解析的 boot handoff）、页表/直接映射、物理帧与内核堆、SMP、定时器中断、initramfs、用户态、服务、桌面、GPU 显示。两个新架构的 `mm/`、`sched/`、`services/`、`drivers/` 目前整体不参与编译。
+- **验收命令**：
+  - `cargo build -p nova-kernel --target riscv64gc-unknown-none-elf`
+  - `qemu-system-riscv64 -machine virt,accel=tcg -cpu rv64 -m 512M -nographic -kernel target/riscv64gc-unknown-none-elf/debug/nova-kernel -serial file:/tmp/boot.log -no-reboot`
+  - `cargo build -p nova-kernel --target loongarch64-unknown-none`
+  - `qemu-system-loongarch64 -machine virt,accel=tcg -cpu max -m 512M -display none -serial file:/tmp/boot.log -kernel target/loongarch64-unknown-none/debug/nova-kernel -no-reboot`
+- **后续（明确的移植顺序）**：① FDT 解析（`virt` 机内存/PLIC/UART/RTC/IRQ）→ ② 直接映射 + 内核堆 + 物理帧 → ③ 定时器 + PLIC/中断控制器 → ④ initramfs 加载 NovaOS 应用 → ⑤ 用户态/EDE 桌面 ⑥ virtiom-gpu 显示路径。

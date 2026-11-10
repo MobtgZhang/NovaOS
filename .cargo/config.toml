@@ -105,6 +105,38 @@ rustflags = [
 # Host builds (xtask, unit tests) use std and the default panic strategy.
 rustflags = []
 
+[target.riscv64gc-unknown-none-elf]
+# RISC-V 64 bare metal. The linker script is named per package by
+# `kernel/build.rs` (see `linker-riscv64.ld`), so this block carries only
+# the flags the target cannot derive, exactly like the x86-64 block does.
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    # Unreferenced sections must not reach the image.
+    "-C", "link-arg=--gc-sections",
+    # The kernel runs from a fixed physical address on the `virt` machine
+    # and has no relocation loop yet.
+    "-C", "relocation-model=static",
+    "-C", "code-model=medium",
+]
+
+[target.loongarch64-unknown-none]
+# LoongArch 64 bare metal. Same shape as the riscv64 port: named linker
+# script per package (`kernel/build.rs` → `linker-loongarch64.ld`), no
+# flags the target cannot derive.
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    # Unreferenced sections must not reach the image.
+    "-C", "link-arg=--gc-sections",
+    # The kernel runs from a fixed physical address on the `virt` machine
+    # and has no relocation loop yet.
+    "-C", "relocation-model=static",
+    "-C", "code-model=medium",
+]
+
 [term]
 quiet = false
 verbose = false

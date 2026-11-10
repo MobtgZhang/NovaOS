@@ -38,25 +38,49 @@
 // The kernel heap (`mm::heap`) backs `alloc` from the frame allocator; the
 // boot path stays allocation-free by design, so the allocator only comes to
 // life once `mm::init` has run.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 extern crate alloc;
 
 mod arch;
+/// The RISC-V 64 and LoongArch 64 bring-up: banner, exception vector,
+/// halt. The full kernel is ported to these machines only as far as
+/// `arch::init` can observe; see `arch_bringup.rs`.
+#[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
+pub mod arch_bringup;
+
+// The kernel's full boot flow is wired for the architectures it has been
+// ported to support. The RISC-V 64 and LoongArch 64 ports are early
+// bring-ups (see `arch_bringup`), and everything below that assumes the
+// UEFI NovaBoot boundary stays out of their build.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod boot;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod drivers;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod initramfs;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod loader;
 mod logger;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod mm;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod sched;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod services;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod stdin;
 mod sync;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod syscall;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod task;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod test;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod time;
 
 use crate::arch::capabilities::Console as _;
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::boot::BootInfo;
 use crate::logger::Level;
 
@@ -89,6 +113,7 @@ pub const KERNEL_NAME: &str = "NovaOS";
 /// environment: long mode, interrupts masked by the jump path, a valid address
 /// space that maps the kernel image and the snapshot through the direct map,
 /// and a stack the stub abandons immediately.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nova_boot_entry(snapshot: u64) -> ! {
     // The pointer is all this frame receives; store it before anything can
@@ -157,6 +182,7 @@ pub unsafe extern "C" fn nova_boot_entry(snapshot: u64) -> ! {
 ///
 /// Must run after the console is up and on the kernel's own stack, with
 /// interrupts still masked and the exception table installed.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn boot_after_stack_switch() -> ! {
     // Order matters within the backend: the exception table must exist before
     // anything that can fault.
@@ -436,6 +462,7 @@ pub unsafe fn boot_after_stack_switch() -> ! {
 /// (`arch::switch_to_kernel_stack_for_cpu_and_continue`), with interrupts
 /// masked, after the bootstrap processor woke this processor. The AP abandons
 /// the trampoline's frame and never unwinds it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn boot_after_ap_stack_switch(cpu: usize) -> ! {
     // SAFETY: delegated to this function's contract. The AP needs the kernel's
     // address space, its own tables, its own APIC timer, and its own scheduler.
