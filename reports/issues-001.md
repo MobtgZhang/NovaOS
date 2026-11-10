@@ -541,6 +541,12 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **刷新率**：flush 走 TSC deadline 节流，`FLUSH_INTERVAL_CYCLES≈10 ms` → 单帧周期 ≥100 FPS，满足 60~144 FPS 需求的下限；present 热路径零日志（`§13.8` 的"present 不得打日志"结论继续有效）。
 - **验收**：`./scripts/gates.sh` 全绿；串口 `display: virtio-gpu scanout 1024x768 pitch 4096 at virt … — the device owns the scanout`；VNC/QMP 截图实测桌面/窗口/菜单/光标/bottom-pin 全部正确。
 
+### 13.12 NovaOS EDE 窗口拖动：pointer-driven title bar move（2026-11-10）〔已完成〕**Medium**
+
+- **背景**：§13.10/§13.9 完成 EDE 外观与交互，但 EDE 窗口管理器还缺"拖动标题栏移动窗口"这一核心交互——`nova_ui::titlebar_hit` 已有 iconify/maximize/close 命中，终端/编辑器/文件管理器的 `on_pointer` 已有 Close/Iconify 处理，唯独没有"按住标题栏拖动"的实现，窗口只能靠 cascade 摆放、无法被用户拖动。
+- **修复**：`kernel/src/services/compositor.rs` 的 `CompositorService` 新增 pointer-driven move —— `pointer_event` 在 primary 按下沿命中标题带（`y - surface.y < TITLEBAR_HEIGHT`）时 armed `MoveDrag{surface, owner, grab_dx, grab_dy}`，button 按住期间每次 pointer event 把窗口 top-left 跟随指针（`move_surface` + `full/dirty` 重绘）；button 释放时 drag 结束。命中区域与 `nova_ui::draw_titlebar`/`titlebar_hit` 的几何（22px 标题带、按钮 2..20）对齐。
+- **验收**：新增内核单测 `a_press_on_the_title_bar_starts_a_pointer_driven_move`（拖动 → 窗口随指针位移、`frame_pending` 置脏）与 `releasing_the_pointer_ends_the_move`；`./scripts/gates.sh` 全绿（kernel 裸机构建 + boot suite 70/252）。
+
 ### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
 
 - **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。

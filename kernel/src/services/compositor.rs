@@ -89,6 +89,24 @@ const DEFAULT_Y: i64 = 48;
 const DEFAULT_X_STEP: i64 = 40;
 const DEFAULT_Y_STEP: i64 = 32;
 
+/// The height of a window's title bar, in pixels.
+///
+/// The band of a surface's top edge that counts as the title bar for
+/// pointer purposes: a press in it starts a window move, anything below
+/// is the client's own content and never drags the window.
+const TITLEBAR_HEIGHT: i64 = 22;
+
+/// A window the pointer is moving, and where the pointer grabbed it:
+/// the grab offset is the pointer position minus the surface's top-left,
+/// so the window follows the pointer exactly.
+#[derive(Clone, Copy, Debug)]
+struct MoveDrag {
+    surface: u32,
+    owner: usize,
+    grab_dx: i64,
+    grab_dy: i64,
+}
+
 /// A client's buffer, as the compositor knows it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SurfaceBuffer {
@@ -195,6 +213,10 @@ pub struct CompositorService {
     /// Whether the last present found a window on screen — the state the
     /// framebuffer-ownership handover (console vs desktop) reacts to.
     desktop_active: bool,
+    /// The window being moved by the pointer right now, if any.
+    move_drag: Option<MoveDrag>,
+    /// Whether the primary button was held on the last pointer event.
+    pointer_primary_held: bool,
 }
 
 impl CompositorService {
@@ -210,6 +232,8 @@ impl CompositorService {
             last_cursor: None,
             spawn_origin_x: DEFAULT_X,
             desktop_active: false,
+            move_drag: None,
+            pointer_primary_held: false,
         }
     }
 
@@ -224,6 +248,8 @@ impl CompositorService {
         self.last_cursor = None;
         self.spawn_origin_x = DEFAULT_X;
         self.desktop_active = false;
+        self.move_drag = None;
+        self.pointer_primary_held = false;
     }
 
     /// Ask future surfaces to cascade from a different x origin.
@@ -735,8 +761,18 @@ impl CompositorService {
     ///
     /// A primary button press moves focus and raises the clicked surface. The
     /// request's named surface is deliberately not used.
+    ///
+    /// A press that lands inside a surface's title bar starts a pointer
+    /// driven move of that window: the window's top-left follows the
+    /// pointer while the button is held, and the drag ends with the
+    /// release. Presses on client content never drag.
     pub fn pointer_event(&mut self, x: i64, y: i64, buttons: u32) -> Option<u32> {
-        if buttons & nova_protocols::input::INPUT_BUTTON_PRIMARY == 0 {
+        let held = buttons & nova_protocols::input::INPUT_BUTTON_PRIMARY != 0;
+        let pressed_edge = held && !self.pointer_primary_held;
+        self.pointer_primary_held = held;
+        if !held {
+            // The button is up: the move, if one was running, is over.
+            self.move_drag = None;
             return self.focused;
         }
 
@@ -744,10 +780,36 @@ impl CompositorService {
         if let Some(id) = hit {
             self.focused = Some(id);
             let _ = self.raise_unchecked(id);
+            if pressed_edge && self.move_drag.is_none() && self.on_titlebar(y, id) {
+                if let Some(surface) = self.surface(id) {
+                    self.move_drag = Some(MoveDrag {
+                        surface: id,
+                        owner: surface.owner,
+                        grab_dx: x - surface.x,
+                        grab_dy: y - surface.y,
+                    });
+                }
+            }
+            if let Some(drag) = self.move_drag {
+                let target = drag.surface;
+                let owner = drag.owner;
+                let new_x = (x - drag.grab_dx).max(0);
+                let new_y = (y - drag.grab_dy).max(0);
+                let _ = self.move_surface(target, owner, new_x, new_y);
+            }
         } else {
             self.focused = None;
         }
         hit
+    }
+
+    /// Whether the pointer at `y` lands on the title band of the
+    /// surface `id` — the press starts a window move there.
+    fn on_titlebar(&self, y: i64, id: u32) -> bool {
+        match self.surface(id) {
+            Some(surface) => y - surface.y < TITLEBAR_HEIGHT,
+            None => false,
+        }
     }
 
     /// Present pending frames.
@@ -1614,6 +1676,7 @@ fn read_u64(payload: &[u8], offset: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{CompositorService, MAX_DAMAGE_ACCUM, Surface, SurfaceRect};
+    use nova_protocols::input::INPUT_BUTTON_PRIMARY;
     use nova_protocols::surface::{PixelFormat, required_buffer_bytes};
 
     fn rect(width: u32, height: u32) -> SurfaceRect {
@@ -1631,6 +1694,43 @@ mod tests {
         assert_eq!(compositor.surface_count(), 0);
         assert!(!compositor.frame_pending());
         assert_eq!(compositor.present().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn a_press_on_the_title_bar_starts_a_pointer_driven_move() {
+        let mut compositor = CompositorService::new();
+        compositor.set_spawn_origin_x(0);
+        let id = compositor.create(200, 100, PixelFormat::Xrgb8888).unwrap();
+        assert_eq!(
+            compositor.pointer_event(50, 5, INPUT_BUTTON_PRIMARY),
+            Some(id)
+        );
+        // The drag is armed by the title-bar press and the window does
+        // not move until the pointer actually moves.
+        assert!(compositor.move_drag.is_some());
+        assert_eq!(
+            compositor.pointer_event(60, 15, INPUT_BUTTON_PRIMARY),
+            Some(id)
+        );
+        let surface = compositor.surface(id).unwrap();
+        // The window's top-left follows the pointer: grabbed at (50,5)
+        // against a surface at (0,48) and dragged to (60,15), so the
+        // window moved by (10, 10).
+        assert_eq!(surface.x, 10);
+        assert_eq!(surface.y, 58);
+        assert!(compositor.frame_pending());
+    }
+
+    #[test]
+    fn releasing_the_pointer_ends_the_move() {
+        let mut compositor = CompositorService::new();
+        compositor.set_spawn_origin_x(0);
+        let _id = compositor.create(200, 100, PixelFormat::Xrgb8888).unwrap();
+        let _ = compositor.pointer_event(50, 5, INPUT_BUTTON_PRIMARY);
+        let _ = compositor.pointer_event(60, 15, INPUT_BUTTON_PRIMARY);
+        assert!(compositor.move_drag.is_some());
+        let _ = compositor.pointer_event(60, 15, 0);
+        assert!(compositor.move_drag.is_none());
     }
 
     #[test]
