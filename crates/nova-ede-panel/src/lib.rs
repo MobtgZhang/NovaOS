@@ -392,7 +392,12 @@ impl Panel {
                     let Some(entry) = self.windows.entry(index) else {
                         continue;
                     };
-                    let bounds = *bounds;
+                    // The chips are laid out in panel-local x, but the
+                    // y is the panel's own: the rects `place()` stores
+                    // carry y=0, so they must be re-based to `top`
+                    // here — otherwise every chip paints itself at the
+                    // top of the screen, on top of the wallpaper.
+                    let bounds = Rect::new(bounds.x, top, bounds.width, height);
                     if entry.active {
                         canvas.fill_rect(bounds, ACCENT);
                         canvas.fill_rect(Rect::new(bounds.x, top, 1, height), palette::CHROME_SUNK);
@@ -635,6 +640,28 @@ mod tests {
         match panel.action_for(hit) {
             Some(Action::Launch(command)) => assert!(!command.is_empty()),
             other => panic!("expected a launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_chip_paints_above_the_panel() {
+        // Regression for the chips painting themselves at the top of
+        // the display: `place()` stores the chip rects with y=0 (panel-
+        // local x only), and `draw()` used them directly, so every chip
+        // landed at y=0..height on top of the wallpaper.
+        let mut panel = panel();
+        panel.set_windows(&windows());
+        const WIDTH: usize = 400;
+        const HEIGHT: usize = 160;
+        const TOP: usize = 128;
+        let mut buffer = [0xAB_u8; WIDTH * HEIGHT * 4];
+        let mut canvas = Canvas::new(buffer.as_mut_ptr(), WIDTH as u32, HEIGHT as u32);
+        panel.draw(&mut canvas, TOP as i32, false, "12:00");
+        let stride = WIDTH * 4;
+        for y in 0..TOP {
+            for byte in &buffer[y * stride..(y + 1) * stride] {
+                assert_eq!(byte, &0xAB, "row {y} was painted above the bar");
+            }
         }
     }
 

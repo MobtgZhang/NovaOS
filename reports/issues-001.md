@@ -547,6 +547,13 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **修复**：`kernel/src/services/compositor.rs` 的 `CompositorService` 新增 pointer-driven move —— `pointer_event` 在 primary 按下沿命中标题带（`y - surface.y < TITLEBAR_HEIGHT`）时 armed `MoveDrag{surface, owner, grab_dx, grab_dy}`，button 按住期间每次 pointer event 把窗口 top-left 跟随指针（`move_surface` + `full/dirty` 重绘）；button 释放时 drag 结束。命中区域与 `nova_ui::draw_titlebar`/`titlebar_hit` 的几何（22px 标题带、按钮 2..20）对齐。
 - **验收**：新增内核单测 `a_press_on_the_title_bar_starts_a_pointer_driven_move`（拖动 → 窗口随指针位移、`frame_pending` 置脏）与 `releasing_the_pointer_ends_the_move`；`./scripts/gates.sh` 全绿（kernel 裸机构建 + boot suite 70/252）。
 
+### 13.13 EDE 面板任务栏芯片异常绘制在屏幕顶部（2026-11-10）〔已修复〕**Medium**
+
+- **现象**（验收反馈）：桌面墙纸顶部横向出现一行有 4 个空白圆角按钮的"芯片条"，位置随窗口聚焦而改变（其中一枚为 focus 蓝 `#4B6983`)。早期被误判为任务栏重绘残留 / 另一 surface 的遗留像素。
+- **定位过程**：QMP 注入点击 → 芯片不响应聚焦 → 排除独立 surface;`draw()` 逐像素分析快照 → 确认芯片 x 坐标与面板任务栏区域逐一吻合（306/426/546/666 步长 120),`Panel::set_windows` 动态芯片命中/绘制逻辑同源；最终在 `nova-ede-panel` 的 `Panel::draw` 中找到根因——`window_chips` 的矩形是 `place()` 用 y=0 布局的局部坐标，而绘制时未重新以 `top` 为 y，导致任务栏芯片把自己画在 y=0（盖住墙纸）。
+- **修复**：`draw()` 绘制动态芯片时把 bounds 重新按 `top` 换算（active 的 ACCENT 底 + `CHROME_SUNK` 左边线、inactive 的 `bevel`)；其余 applet 早已使用 `top +` 偏移，无同类问题。hit-test 使用面板局部 y（shell 传入 `event.y - panel_top`)，坐标系一致，无需改动。
+- **验收**：新增 host 单测 `no_chip_paints_above_the_panel`(draw 到 `top=128` 的画布后逐行断言 `0..top` 全部保持 sentinel 色，含 active 芯片场景）；`cargo test -p nova-ede-panel` **24 例全过**；`./scripts/gates.sh` 全绿；QEMU+VNC 截图实测——墙纸顶部零像素异常、底栏任务栏芯片正常绘制且随聚焦高亮。
+
 ### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
 
 - **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。
