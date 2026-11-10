@@ -284,6 +284,23 @@ impl FrameAllocator {
         }
     }
 
+    /// A run of `count` contiguous frames, or `Err(FrameError::OutOfMemory)`.
+    ///
+    /// A `MemoryObject` is contiguous by construction, so allocating its frames
+    /// one by one through [`Self::alloc`] can strand it on a hole in the bitmap.
+    /// This path finds a span of the wanted size first, then marks all of it at
+    /// once; the caller learns about a hole as one failure, not as a
+    /// half-allocated object it has to release.
+    pub fn alloc_contiguous(&self, count: usize) -> Result<usize, FrameError> {
+        let mut bitmap = self.bitmap.lock();
+        let start = bitmap
+            .find_contiguous_run(count)
+            .ok_or(FrameError::OutOfMemory)?;
+        bitmap.mark_allocated_range(start, count);
+        self.advance_hint(start + count.saturating_sub(1));
+        Ok(start)
+    }
+
     /// Allocate one physical frame.
     ///
     /// Returns a frame *index*, not an address. Mapping a frame into the
@@ -703,6 +720,36 @@ impl Bitmap {
             frame = word * u64::BITS as usize + u64::BITS as usize;
         }
 
+        None
+    }
+
+    /// Lowest free run of `length` consecutive frames, or `None` if there is none.
+    ///
+    /// The layout for a `MemoryObject` needs one large physically-contiguous
+    /// span, so a plain "find first free" is not enough: the allocator has to
+    /// know whether a run of the wanted size exists at all. This is a
+    /// bit-by-bit scan — O(frames) — and it runs once per memory object, at
+    /// boot, not in any hot path.
+    pub fn find_contiguous_run(&self, length: usize) -> Option<usize> {
+        if length == 0 || length > self.len {
+            return None;
+        }
+        let mut start = 0usize;
+        let mut run = 0usize;
+        for frame in 0..self.len {
+            let (word_idx, mask) = Self::bit(frame);
+            if self.word(word_idx) & mask == 0 {
+                if run == 0 {
+                    start = frame;
+                }
+                run += 1;
+                if run >= length {
+                    return Some(start);
+                }
+            } else {
+                run = 0;
+            }
+        }
         None
     }
 

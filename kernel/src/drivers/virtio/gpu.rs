@@ -60,6 +60,8 @@
 use core::alloc::Layout;
 
 use alloc::alloc::{alloc, dealloc};
+use alloc::vec;
+use alloc::vec::Vec;
 
 use super::super::pci as bus;
 use super::pci::Transport;
@@ -198,17 +200,16 @@ pub struct VirtioGpu {
     /// The pixel buffer: `pitch * height` bytes, page-aligned.
     backing: *mut u8,
     /// The physical pages of `backing`, for `RESOURCE_ATTACH_BACKING`.
-    backing_pages: [u64; MAX_BACKING_PAGES],
-    backing_page_count: usize,
+    backing_pages: Vec<u64>,
     /// The window every command's request is built in.
     request: DmaWindow,
     /// The window every command's response lands in.
     response: DmaWindow,
 }
 
-/// The most pages one scanout's backing may span: 4 MiB, twice a
-/// 1024x768 XRGB8888 frame — headroom for a larger mode, not a target.
-const MAX_BACKING_PAGES: usize = 1024;
+/// The most pages one scanout's backing may span: 64 MiB — every mode a
+/// `virt` machine can realistically ask for, including 3840x2160.
+const MAX_BACKING_PAGES: usize = 16384;
 
 impl VirtioGpu {
     /// Find the GPU, negotiate, create the scanout, and claim the
@@ -280,8 +281,7 @@ impl VirtioGpu {
             height: 0,
             pitch: 0,
             backing: core::ptr::null_mut(),
-            backing_pages: [0; MAX_BACKING_PAGES],
-            backing_page_count: 0,
+            backing_pages: Vec::new(),
             request,
             response,
         };
@@ -322,7 +322,8 @@ impl VirtioGpu {
             gpu.teardown();
             return Err(GpuError::Backing);
         }
-        for (index, page) in gpu.backing_pages.iter_mut().take(pages).enumerate() {
+        gpu.backing_pages = vec![0; pages];
+        for (index, page) in gpu.backing_pages.iter_mut().enumerate() {
             // The heap's blocks *are* direct-map frames (`grow_and_take`
             // banks them as `phys_to_virt(frame)`), so a buffer address
             // minus the direct-map offset is its physical address — exact,
@@ -330,7 +331,7 @@ impl VirtioGpu {
             let virt = backing as u64 + (index as u64) * 4096;
             *page = direct_map::virt_to_phys(virt);
         }
-        gpu.backing_page_count = pages;
+        // `backing_pages` now holds exactly `pages` entries.
         gpu.backing = backing;
         gpu.width = width;
         gpu.height = height;
@@ -406,7 +407,7 @@ impl VirtioGpu {
     /// buffer that did fragment is still described exactly rather than
     /// promised contiguity it does not have.
     fn attach_backing(&mut self) -> Result<(), GpuError> {
-        let pages = self.backing_page_count;
+        let pages = self.backing_pages.len();
         let base = self.request.virt;
         let window = self.request.len;
         let mut runs: u32 = 0;

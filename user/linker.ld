@@ -71,7 +71,7 @@ SECTIONS
      * These are absolute symbols rather than an output section: an emitted
      * region spanning the hole between `.bss` and the heap would enlarge the
      * program's `p_memsz`, forcing the loader to pre-map every page. */
-    USER_HEAP_SIZE = 0x00100000;
+    USER_HEAP_SIZE = 0x04000000;
     __heap_start = USER_HEAP_BASE;
     __heap_end = USER_HEAP_BASE + USER_HEAP_SIZE;
 

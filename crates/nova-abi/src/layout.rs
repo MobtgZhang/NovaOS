@@ -64,11 +64,11 @@ pub const USER_HEAP_BASE: u64 = 0x0000_0000_4000_0000;
 
 /// The size of the reserved user heap region, in bytes.
 ///
-/// Four mebibytes, sized so a full-screen XRGB8888 surface buffer — 1024 x
-/// 768 pixels at four bytes each — fits with headroom to spare. The region
-/// is reserved, not mapped, so the reservation costs nothing until a
-/// program maps into it.
-pub const USER_HEAP_SIZE: u64 = 4 * 1024 * 1024;
+/// Sixty-four mebibytes, sized so a full-screen XRGB8888 surface buffer —
+/// 3840x2160 pixels at four bytes each — plus the desktop's own state
+/// fits with headroom to spare. The region is reserved, not mapped, so
+/// the reservation costs nothing until a program maps into it.
+pub const USER_HEAP_SIZE: u64 = 64 * 1024 * 1024;
 
 /// The base of the user stack's lowest page.
 ///

@@ -406,10 +406,11 @@ fn object_create(
 /// Maximum number of frames one `MemoryObject` may occupy.
 ///
 /// The allocation is contiguous, so the object is `base` plus `size`. The bound
-/// keeps the frame bookkeeping on the kernel's stack: a surface buffer is a few
+/// keeps the frame bookkeeping bounded: a surface buffer is a few
 /// megabytes, and a request for more is a quota failure rather than a silent
-/// unbounded allocation.
-pub const MAX_MEMORY_FRAMES: usize = 1024;
+/// unbounded allocation. The frames array itself lives on the kernel heap —
+/// a fixed array on a 16 KiB task stack would not survive a large request.
+pub const MAX_MEMORY_FRAMES: usize = 8192;
 
 /// Create a contiguous physical memory object.
 ///
@@ -437,45 +438,16 @@ fn create_memory_object(size: u64) -> Result<ObjectKind, ErrorCode> {
     }
 
     let allocator = unsafe { crate::mm::frame_allocator() };
-    let mut frames = [0usize; MAX_MEMORY_FRAMES];
-    let mut used = 0usize;
-
-    for _ in 0..count {
-        match allocator.alloc() {
-            Ok(frame) => {
-                frames[used] = frame;
-                used = used.saturating_add(1);
-            }
-            Err(_) => {
-                release_frames(&frames[..used]);
-                return Err(ErrorCode::NoMemory);
-            }
-        }
-    }
-
-    let first = frames[0];
-    for index in 1..used {
-        if frames[index] != first.saturating_add(index) {
-            release_frames(&frames[..used]);
-            return Err(ErrorCode::NoMemory);
-        }
-    }
+    let first = match allocator.alloc_contiguous(count) {
+        Ok(frame) => frame,
+        Err(_) => return Err(ErrorCode::NoMemory),
+    };
 
     let base = (first as u64).saturating_mul(PAGE_SIZE);
     Ok(ObjectKind::MemoryObject {
         base,
         size: aligned,
     })
-}
-
-/// Return frames to the allocator.
-fn release_frames(frames: &[usize]) {
-    let allocator = unsafe { crate::mm::frame_allocator() };
-    for frame in frames {
-        // SAFETY: every frame in this slice was allocated by the caller and has
-        // not been released yet, so the double-free rule holds.
-        unsafe { allocator.dealloc(*frame) };
-    }
 }
 
 /// Return a memory object's frames to the allocator.

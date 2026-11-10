@@ -585,3 +585,13 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
   - `cargo build -p nova-kernel --target loongarch64-unknown-none`
   - `qemu-system-loongarch64 -machine virt,accel=tcg -cpu max -m 512M -display none -serial file:/tmp/boot.log -kernel target/loongarch64-unknown-none/debug/nova-kernel -no-reboot`
 - **后续（明确的移植顺序）**：① FDT 解析（`virt` 机内存/PLIC/UART/RTC/IRQ）→ ② 直接映射 + 内核堆 + 物理帧 → ③ 定时器 + PLIC/中断控制器 → ④ initramfs 加载 NovaOS 应用 → ⑤ 用户态/EDE 桌面 ⑥ virtiom-gpu 显示路径。
+
+### 13.14 大于 1024x768 的分辨率故障 + 指针无法触达边缘（2026-11-11）〔已修复〕**High**
+
+- **现象**：设置 `virtio-vga,xres=1280,yres=1024` 启动后，桌面不出现（黑屏、无 init 应用、只有内核日志）。用户报告的"分辨率不对"正是它——大分辨率下窗口永远起不来，系统静默退回/无桌面。
+- **根因（两个独立上限叠加）**：
+  1. `kernel/src/services/dispatch.rs` 的 `create_memory_object` 要求新 MemoryObject 的帧完全连续（逐个 `alloc` 后再验证连续）。分配大窗口（>768 帧）时，启动期碎片化的位图很容易卡在中间的孔里，导致 `E_NO_MEMORY`、桌面 shell 退出（`desktop-shell: window failed E_NO_MEMORY`）。
+  2. 帧分配器 `FrameAllocator::alloc` 的 hint-then-rescan 策略并不保证连续跨度，大分配只能靠运气。
+- **修复**：帧分配器新增 `Bitmap::find_contiguous_run`（O(n) 一次扫描找连续空闲跨度）+ `FrameAllocator::alloc_contiguous(count)`（先找跨度、再整段标记、再推进 hint），`create_memory_object` 改为单次 `alloc_contiguous`；`MAX_MEMORY_FRAMES` 1024→8192（帧数组改用 kernel 堆分配避免压栈）。`virtio-gpu` 的 `backing_pages` 改为 heap `Vec<u64>`（`MAX_BACKING_PAGES` 1024→16384）。`nova-abi` 的 `USER_HEAP_SIZE` 4→64 MiB（64 MiB 预留，能再容 3840x2160 的 33 MB 全屏 buffer；`user/linker.ld` 和 `docs/abi/address-layout.md` 同步更新）。
+- **第二点（指针无法覆盖整个桌面区域）**：内核 PS/2 鼠标坐标原先被夹紧到 `0..width-12, 0..height-12`，桌面最右 12 像素列/最下 12 像素行完全不可达——放到桌面最左上 0,0 也只能在 0..(w-12) 范围内移动，**边缘区域其实点不到**。修复：坐标夹紧改为 `0..width-1, 0..height-1`（覆盖全部桌面），指针图标溢出部分由 `put_pixel` 在出界时丢弃（裁剪，不再整体无法触达）。实测：指针能到 (0,0) 和 (1279,1023)；`cursor not found` 仅意味着 12px 箭头在最角落被裁切殆尽、模板匹配找不到完整箭头，是预期现象。
+- **验收**：`./scripts/gates.sh` 全绿（70/252）；1280x1024 实测桌面完整显示、GPU scanout 自报 1280x1024、`desktop: 1280x1024 from the display service`；1024x768 实测回归正常；指针可打到四个角。

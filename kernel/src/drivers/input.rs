@@ -233,15 +233,12 @@ pub fn mouse_position() -> Option<(u32, u32)> {
     Some(unsafe { MOUSE_POS.get_copy() })
 }
 
-/// The pointer sprite's width and height, in pixels.
-///
-/// The compositor paints a 12x12 arrow with its top-left at the mouse
-/// coordinate, so the coordinate itself must not reach the last 12
-/// pixels of either axis: clamped at the raw edge, the pointer would be
-/// scrolled almost entirely off the screen and the user would be left
-/// hunting for an arrow they cannot see.
-const CURSOR_SPAN: u32 = 12;
-
+/// The mouse's position is clamped to the display's own edges: the
+/// coordinate is a *point*, and it must be able to reach every pixel of
+/// the desktop. The sprite drawn from it is clipped by
+/// [`crate::drivers::display::put_pixel`], which drops pixels outside the
+/// framebuffer — the arrow loses a few edge pixels at the border rather
+/// than the user losing access to the edge.
 fn mouse_move(dx: i16, dy: i16) {
     // SAFETY: poller-single-instance; the cell is never aliased by two
     // callers, as the poller is `&mut`-owned from one path at a time.
@@ -249,12 +246,12 @@ fn mouse_move(dx: i16, dy: i16) {
     // Do not allow underflow.
     let new_x = pos.0 as i32 + dx as i32;
     let new_y = pos.1 as i32 - dy as i32;
-    // Keep the whole arrow visible: the sprite extends down and right
-    // from this coordinate.
+    // The whole desktop is reachable; the sprite is clipped, not the
+    // coordinate.
     let (limit_x, limit_y) = match crate::drivers::display::mode() {
         Some(mode) => (
-            mode.width.saturating_sub(CURSOR_SPAN) as i32,
-            mode.height.saturating_sub(CURSOR_SPAN) as i32,
+            mode.width.saturating_sub(1) as i32,
+            mode.height.saturating_sub(1) as i32,
         ),
         None => (i32::MAX, i32::MAX),
     };

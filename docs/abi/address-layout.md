@@ -232,7 +232,7 @@ Concretely, on a 48-bit address space the corrected window is
 | --- | --- | --- |
 | `USER_IMAGE_BASE` | `0x0000_0000_0000_1000` | yes |
 | `USER_HEAP_BASE` | `0x0000_0000_4000_0000` | yes |
-| `USER_HEAP_BASE + USER_HEAP_SIZE` | `0x0000_0000_4040_0000` | yes |
+| `USER_HEAP_BASE + USER_HEAP_SIZE` | `0x0000_0000_4400_0000` | yes |
 | `USER_GUARD_BASE` | `0x0000_0000_7FFE_F000` | yes |
 | `USER_STACK_BASE` | `0x0000_0000_7FEF_F000` | yes |
 | `USER_STACK_TOP` | `0x0000_0000_7FFF_F000` | yes |
