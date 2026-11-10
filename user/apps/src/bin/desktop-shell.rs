@@ -50,7 +50,9 @@ use nova_ede_panel::taskbar::{self, TaskEntry, TaskbarModel};
 use nova_ede_panel::{self, Action as PanelAction, Panel};
 use nova_ede_tip::Tooltip;
 use nova_edelib::EdeConfig;
-use nova_protocols::input::{INPUT_BUTTON_PRIMARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER};
+use nova_protocols::input::{
+    INPUT_BUTTON_PRIMARY, INPUT_BUTTON_SECONDARY, INPUT_EVENT_KEY, INPUT_EVENT_POINTER,
+};
 use nova_ui::keyboard::{Decoder, Key};
 use nova_ui::{Canvas, Rect, typeface};
 
@@ -258,10 +260,14 @@ impl Shell {
     /// of it, every drain would post the same message again. The file's
     /// *name* is that memory — it is the posting application's identity,
     /// so one stuck file is skipped until a delete finally succeeds.
-    fn drain_notifications(&mut self) {
+    ///
+    /// Returns whether a notification was posted: that is a screen
+    /// change the shell must repaint for.
+    fn drain_notifications(&mut self) -> bool {
+        let mut changed = false;
         let mut page = [0u8; fsclient::PAGE_BYTES];
         let Ok(info) = fsclient::list_at(b"/var/run/notify", 0, &mut page) else {
-            return;
+            return false;
         };
         let mut records = fsclient::Records::new(&page[..info.bytes]);
         while let Some(record) = records.next() {
@@ -281,7 +287,9 @@ impl Shell {
                 && &self.stuck_notify[..self.stuck_notify_len] == record.name;
             if !stuck {
                 if let Ok(text) = core::str::from_utf8(&contents[..count]) {
-                    let _ = self.notify.post_wire(text);
+                    if self.notify.post_wire(text) {
+                        changed = true;
+                    }
                 }
             }
             if fsclient::delete(full).is_ok() {
@@ -294,6 +302,7 @@ impl Shell {
                 self.stuck_notify_len = take;
             }
         }
+        changed
     }
 
     /// Page through the compositor's window list and republish it to
@@ -665,24 +674,32 @@ impl Shell {
         let was_held = self.prev_buttons & INPUT_BUTTON_PRIMARY != 0;
         let pressed = held && !was_held;
         let released = !held && was_held;
+        let secondary = event.buttons & INPUT_BUTTON_SECONDARY != 0;
+        let secondary_pressed = secondary && self.prev_buttons & INPUT_BUTTON_SECONDARY == 0;
         self.prev_buttons = event.buttons;
         self.pointer_x = event.x;
         self.pointer_y = event.y;
 
         // About dialog is modal: a press closes it.
         if self.about {
-            if pressed {
+            if pressed || secondary_pressed {
                 self.about = false;
+                return true;
             }
-            return true;
+            return false;
         }
 
         // The start menu, if open, eats everything above the panel.
         if self.start_menu && event.y < panel_top {
-            if pressed {
-                self.click_start_menu(event.x, event.y);
+            if secondary_pressed {
+                self.start_menu = false;
+                self.launchpad.clear();
+                return true;
             }
-            return true;
+            if pressed {
+                return self.click_start_menu(event.x, event.y);
+            }
+            return false;
         }
 
         // Panel hit test — actions fire on the press edge only.
@@ -707,8 +724,9 @@ impl Shell {
                     Some(PanelAction::ShowPanel) => self.panel.set_hider_open(true),
                     None => {}
                 }
+                return true;
             }
-            return true;
+            return false;
         }
 
         // Balloon hit test: a press on the balloon dismisses it.
@@ -717,9 +735,10 @@ impl Shell {
                 if let Some(note) = self.notify.current() {
                     let id = note.id;
                     self.notify.dismiss(id);
+                    return true;
                 }
             }
-            return true;
+            return false;
         }
 
         // A drag resolves here: movement makes it a move, a still
@@ -739,9 +758,11 @@ impl Shell {
                         let y = event.y - active.grab_dy;
                         let index = active.index;
                         self.layer.move_to(index, x, y);
+                        return true;
                     }
                 }
-                return true;
+                // Held but not yet moved: nothing on screen changed.
+                return false;
             }
             if released {
                 let drag = self.drag.take().expect("checked above");
@@ -759,10 +780,40 @@ impl Shell {
                         .unwrap_or(0);
                     self.layer.select(None);
                     self.launch(core::str::from_utf8(&name[..len]).unwrap_or(""));
+                    return true;
                 }
-                return true;
+                // The release just ends a drag whose move was already
+                // drawn: no further change.
+                return false;
             }
             self.drag = None;
+        }
+
+        // Right-click: select the icon under the pointer, or — on empty
+        // ground — close the menu and clear the selection. A full
+        // context menu is EDE's `ede-desktop` menu, which this port does
+        // not yet carry; what must not happen is a right click that
+        // does nothing at all.
+        if secondary_pressed {
+            if let Some(index) = self.layer.hit(event.x, event.y) {
+                let was_selected = self.layer.icon(index).is_some_and(|icon| icon.selected);
+                if !was_selected {
+                    self.layer.select(Some(index));
+                    return true;
+                }
+                return false;
+            }
+            let mut changed = false;
+            if self.start_menu {
+                self.start_menu = false;
+                self.launchpad.clear();
+                changed = true;
+            }
+            if self.layer.selected_count() > 0 {
+                self.layer.select(None);
+                changed = true;
+            }
+            return changed;
         }
 
         // Desktop icons: a press selects; a press on the already
@@ -781,6 +832,8 @@ impl Shell {
                             moved: false,
                         });
                     }
+                    // Arming a drag draws nothing until it moves.
+                    return false;
                 } else if self.desktop_conf.one_click_exec {
                     // One-click activation: launch on the press, like
                     // EDE's `Icons/one_click_exec = true`.
@@ -800,12 +853,20 @@ impl Shell {
                 } else {
                     self.layer.select(Some(index));
                 }
-            } else {
-                self.layer.select(None);
+                return true;
             }
+            let changed = self.layer.selected_count() > 0;
+            self.layer.select(None);
+            return changed;
         }
 
-        // Track hover for the tooltip, whatever the button state is.
+        // Track hover for the tooltip. The state always advances, but
+        // the screen changes only when the hover target or the
+        // tooltip's visibility does — a motion event across empty
+        // wallpaper costs no repaint; the cursor is the compositor's
+        // to draw.
+        let old_hover = self.hover;
+        let old_tip = self.tip.visible;
         let hover = self.layer.hit(event.x, event.y);
         if hover == self.hover {
             self.hover_ticks = self.hover_ticks.saturating_add(1);
@@ -820,12 +881,16 @@ impl Shell {
         } else {
             self.tip.leave();
         }
-        true
+        self.hover != old_hover || self.tip.visible != old_tip
     }
 
     /// A press inside the open start menu: a row launches, the About
     /// row opens About, anywhere else closes the menu.
-    fn click_start_menu(&mut self, x: i32, y: i32) {
+    /// A press inside the open start menu: a row launches, the About
+    /// row opens About, empty space inside the popup does nothing, and
+    /// a press outside closes the menu. Returns whether the screen
+    /// changed.
+    fn click_start_menu(&mut self, x: i32, y: i32) -> bool {
         let by = self.menu_top();
         let rows = self.menu_rows();
         for row in 0..rows {
@@ -839,8 +904,9 @@ impl Shell {
                     self.start_menu = false;
                     self.launchpad.clear();
                     self.launch(core::str::from_utf8(&name[..take]).unwrap_or(""));
+                    return true;
                 }
-                return;
+                return false;
             }
         }
         let about_y = by + MENU_ROWS_TOP + (rows as i32) * MENU_ROW_PITCH;
@@ -848,14 +914,16 @@ impl Shell {
             self.about = true;
             self.start_menu = false;
             self.launchpad.clear();
-            return;
+            return true;
         }
         // Inside the popup but on no row: leave it open. Outside: close.
         let inside = y >= by && y < by + 260 && x >= 8 && x < 8 + MENU_WIDTH;
         if !inside {
             self.start_menu = false;
             self.launchpad.clear();
+            return true;
         }
+        false
     }
 }
 
@@ -907,9 +975,14 @@ pub extern "C" fn main() -> i64 {
             }
         }
         shell.ticks = shell.ticks.saturating_add(1);
+        let balloons = shell.notify.pending();
         shell.notify.tick();
+        if shell.notify.pending() != balloons {
+            // A balloon expired: the corner changed.
+            dirty = true;
+        }
         if shell.ticks % 16 == 0 {
-            shell.drain_notifications();
+            dirty |= shell.drain_notifications();
         }
         if shell.ticks % 64 == 0 {
             dirty |= shell.refresh_windows();

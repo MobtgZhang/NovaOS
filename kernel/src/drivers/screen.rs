@@ -354,13 +354,15 @@ static CONSOLE: SpinLock<ScreenConsole> = SpinLock::new(ScreenConsole::new());
 /// Clear the display to the safe-terminal black background and reset the
 /// cursor back to the top-left cell.
 ///
-/// # Safety
-///
-/// The display must be initialised ([`crate::drivers::display::init`] must
-/// have run) — every `display::fn` the clear internally uses panics or
-/// errors otherwise; this function swallows those errors, so a missing
-/// display simply leaves the screen untouched.
+/// No-op while the desktop owns the framebuffer: the `clear` command of
+/// the text shell must not blank a live desktop — there is no console
+/// frame to clear when there is no console. The compositor's handover
+/// calls this *after* [`set_desktop_active(false)`], so a desktop that
+/// dies still gets its clean canvas back.
 pub fn clear_for_userland() {
+    if DESKTOP_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
     let mut console = CONSOLE.lock();
     console.reset();
 }
@@ -373,9 +375,44 @@ pub fn clear_for_userland() {
 /// prompt on a black screen, uncluttered by kernel INFO lines.
 static SCREEN_QUIET: AtomicBool = AtomicBool::new(false);
 
+/// Whether the desktop compositor currently owns the framebuffer.
+///
+/// The display has exactly one owner at a time, and the two never draw
+/// at once:
+///
+/// - **Console** (boot, safe terminal, and any moment the desktop has
+///   no live window): the text console draws kernel logs and user-space
+///   output.
+/// - **Desktop** (at least one surface holds a buffer): the compositor
+///   paints everything — windows, cursor, all of it — and the console
+///   draws *nothing*: every log line goes to the serial port only, so a
+///   log line can never land on top of the desktop.
+///
+/// The compositor's present path flips this flag as the first window
+/// commits and as the last one dies.
+static DESKTOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Set or clear the quiet flag.
 pub fn set_quiet(quiet: bool) {
     SCREEN_QUIET.store(quiet, Ordering::Relaxed);
+}
+
+/// Give the framebuffer to the desktop (`true`) or back to the text
+/// console (`false`).
+///
+/// Called only from the compositor's present path, which is the one
+/// place that knows whether any window holds a buffer. The store is
+/// relaxed: it orders two writers that already serialise through the
+/// console lock and the compositor's state lock respectively, and a
+/// line racing the handover lands on one side or the other of a
+/// transition that repaints the whole screen anyway.
+pub fn set_desktop_active(active: bool) {
+    DESKTOP_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Whether the desktop owns the framebuffer right now.
+pub fn desktop_active() -> bool {
+    DESKTOP_ACTIVE.load(Ordering::Relaxed)
 }
 
 /// Send bytes to the on-screen console.
@@ -384,11 +421,12 @@ pub fn set_quiet(quiet: bool) {
 /// [`on_display_ready`]; lines after that are drawn immediately. Errors are
 /// swallowed by design — a console must never turn a log line into a fault.
 ///
-/// When the quiet flag is set the line is dropped on the floor rather than
-/// drawn. Everything after `set_quiet(true)` is kernel log output, and a
-/// safe-terminal session must show only the user's own output.
+/// Two flags can silence it: the quiet flag (a safe-terminal boot that
+/// wants only its own logo) and the desktop flag (a live desktop that
+/// wants no log lines at all). Either way the serial console still
+/// receives the line — the logger sends it there first.
 pub fn push_bytes(bytes: &[u8]) {
-    if SCREEN_QUIET.load(Ordering::Relaxed) {
+    if SCREEN_QUIET.load(Ordering::Relaxed) || DESKTOP_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
     push_bytes_always(bytes);
@@ -397,8 +435,31 @@ pub fn push_bytes(bytes: &[u8]) {
 /// Send bytes to the on-screen console regardless of the quiet flag.
 ///
 /// Used by the `WRITE` syscall path so user programs' bytes reach the
-/// screen even after `set_quiet(true)` has silenced kernel logs.
+/// screen even after `set_quiet(true)` has silenced kernel logs — in a
+/// safe terminal. The desktop flag still applies: a user program's
+/// stdout is not allowed to print over the desktop either; during a
+/// desktop session these bytes go to the serial port only (the `WRITE`
+/// syscall sends them there before calling here).
 pub fn push_bytes_always(bytes: &[u8]) {
+    if DESKTOP_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut console = CONSOLE.lock();
+    if display::mode().is_none() {
+        console.buffer_pending(bytes);
+        return;
+    }
+    for &byte in bytes {
+        console.feed(byte);
+    }
+}
+
+/// Send bytes to the on-screen console with no flag at all.
+///
+/// Only the panic path uses this: a panic must be visible even over a
+/// live desktop, because the desktop is exactly what just died. Quiet
+/// and desktop ownership are both ignored here.
+pub fn push_bytes_panic(bytes: &[u8]) {
     let mut console = CONSOLE.lock();
     if display::mode().is_none() {
         console.buffer_pending(bytes);

@@ -510,6 +510,16 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **诊断过程的两条硬结论**（三版交叉验证）：① **`present()` 热路径上打内核日志会诱发用户进程控制流损坏**（`ip=0x0` / 野跳转 `ip=0xff40…` 崩溃循环、服务重启耗尽任务槽）——present 内联日志 11 faults、改到 syscall 路径日志 2 faults、完全无日志 0 faults；机制未完全查明（疑似 UART 轮询延迟扰动 PS/2/定时器时序暴露既有竞态），但结论可靠：**帧呈现路径不得打日志**，诊断只能事后用静态手段或采样式钩子。② QMP `screendump` 会与 present 风暴竞争，抓到"升序绘制中途"的撕裂帧（窗口先画、桌面后画），曾被误判为 z 序错误——去掉日志后的最终验证表明 raise→遮盖→新窗口置顶的行为全部正确。
 - **备注**：host clippy 若包含 `nova-apps` 会因 no_std 二进制的 unwinding 结构性失败——`gates.sh` 按其文档排除 `nova-apps`/`nova-kernel`/`nova-rt`/`nova-boot-menu`；本轮顺手清掉了 `graphics.rs` 中无调用者的 `fill_word`/`fill_rect` 死代码，并把 `Records::next` 改为真正的 `Iterator` 实现。
 
+### 13.9 显示所有权分离：日志/桌面分屏、闪烁、Safe Terminal 无鼠标（2026-11-10）〔已修复〕**High**
+
+- **背景**（用户验收反馈）：桌面运行时屏幕"一半桌面一半 Log"、鼠标一动就剧烈闪烁、Safe Terminal 阶段出现鼠标指针、质疑 ExitBootServices 后仍使用 UEFI GOP。逐条排查后定位四个根因并修复：
+- **根因 1 —— 日志与桌面双写 framebuffer**：桌面模式下 `SCREEN_QUIET` 只在 SafeTerminal 启动时置位，内核 `klog` 每行都画上屏；更严重的是用户 WRITE syscall 走 `push_bytes_always`（无视 quiet），应用的 `ready`/`launch` 输出直接画在桌面上。**修复（显示器所有权模型）**：`screen.rs` 新增 `DESKTOP_ACTIVE` 标志——compositor 的 `present()` 每次先判定"是否有 surface 持有 buffer"：有 → 桌面拥有屏幕，控制台对内核日志与用户输出**一律静默**（仅串口输出）；无 → 控制台收回屏幕并 `clear_for_userland()` 拿到干净画布。panic 路径新增 `push_bytes_panic` 绕过一切静音（panic 必须可见）。`clear_for_userland` 在桌面活跃时变为 no-op，文本 shell 的 `clear` 命令不再能抹掉桌面。
+- **根因 2 —— 鼠标移动触发整屏重绘**：`on_pointer` 原先对每个指针事件无条件返回 dirty → 每个鼠标包都整面 damage + 全屏 region 重绘（6 个 surface 拷贝），叠加日志双写即为"闪个不停"。**修复**：`on_pointer` 改为**只在视觉真的变化时置脏**——纯移动（无 hover 变化、无 tooltip 显隐变化）不重绘；光标本身由 compositor 的小区域（12×12 新旧 cell）重绘负责。通知投递/过期也补了脏标记。保留的功能性重绘：按下沿、拖动移动、选择变化、菜单开合、气泡消失。
+- **根因 3 —— Safe Terminal 出现鼠标**：无任何窗口时 `present()` 仍走 cursor 绘制路径。**修复**：`present()` 开头的 `!gui` 分支直接消费帧触发并返回——不 clear、不画光标、不碰显示；文本控制台完整拥有屏幕。实测：Safe Terminal 下移动鼠标前后截屏**逐像素零差异**。
+- **根因 4 —— GOP 审计**：逐行核查 `nova-boot-menu`：全部 GOP 调用（`locate_handle_buffer`/`set_mode`/`frame_buffer`/`Blt`）都发生在 `exit_boot_services` 之前的闭包内；`BootHandoff` 只携带 pml4/栈顶/快照/入口四个地址；内核侧 `novaboot`/`drivers/display` 对 GOP 零引用——只把启动协议快照里的物理 framebuffer 地址映射后用 CPU 直写。**结论：ExitBootServices 之后不存在任何 GOP 协议调用**，并在 `exit_boot_services` 调用点写入了不可违规的契约注释。
+- **事件验证**（回应"没有实现桌面 events"）：QMP 注入实测全链路——按下沿开菜单、`t/e/r` 实时过滤、Enter 启动（串口 `ede-shell: launch terminal`，屏幕无日志残留）、Escape 关菜单、Nova 按钮开合、空白处点击关菜单、任务栏芯片 Activate/Minimize、右键（本轮新增：选中图标 / 关菜单清选择）。指针按下/释放边沿、按键（含 Shift 状态的 Decoder）、hover/tooltip 均在 `desktop-shell` 的 `on_pointer`/`on_key` 中实现。
+- **验收**：`./scripts/gates.sh` 全绿（fmt、host clippy、UEFI clippy、host 79/612、裸机构建、QEMU 70/251）；QEMU+VNC 实测桌面模式全程屏幕无任何日志文本、Safe Terminal 无鼠标且移动鼠标零像素变化。遗留说明：多 surface 并发 present 与 shell 绘制之间存在微小撕裂窗口（另一 surface 的 commit 恰逢 shell 重绘中途时，截屏可捕获混合帧）——彻底解决需要双缓冲/提交同步协议，记为后续工作。
+
 ### 13.6 nova-desktop + desktop-shell（2026-11-09）〔已完成〕**Medium**
 
 - **crate `nova-desktop`**（no_std，host 可测，7 个测试）：壁纸（深海渐变 + 确定性 xorshift 星空 + 地平线光带 + NovaOS 信标星，纯数学绘制零贴图）、图标列（Terminal/Files/Editor/Widgets，矢量原语绘制 + 标签 + 按压内缩反馈）、底部面板（`NovaOS` 词标 + Terminal/Files/Editor/Widgets 启动芯片 + 右侧 `novaos://desktop`）。`DesktopShell` 状态机：按压武装、释放触发 `DesktopCommand::Launch(name)`（`process::exec`），release 离开图标格取消。

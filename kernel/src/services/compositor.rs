@@ -185,6 +185,9 @@ pub struct CompositorService {
     /// The x origin the next cascaded surface is placed at. 48 by default;
     /// the desktop boot mode moves it right of the icon column.
     spawn_origin_x: i64,
+    /// Whether the last present found a window on screen — the state the
+    /// framebuffer-ownership handover (console vs desktop) reacts to.
+    desktop_active: bool,
 }
 
 impl CompositorService {
@@ -199,6 +202,7 @@ impl CompositorService {
             pointer_moved: false,
             last_cursor: None,
             spawn_origin_x: DEFAULT_X,
+            desktop_active: false,
         }
     }
 
@@ -212,6 +216,7 @@ impl CompositorService {
         self.pointer_moved = false;
         self.last_cursor = None;
         self.spawn_origin_x = DEFAULT_X;
+        self.desktop_active = false;
     }
 
     /// Ask future surfaces to cascade from a different x origin.
@@ -706,7 +711,35 @@ impl CompositorService {
     /// Returns how many surfaces were drawn. A compositor with nothing dirty
     /// returns `0` without touching the display, which is what lets an idle
     /// desktop stop drawing.
+    ///
+    /// The first thing present does is settle *who owns the screen*.
+    /// With at least one window holding a buffer the desktop owns it and
+    /// the text console is silenced; with none — boot, safe terminal, or
+    /// a desktop that just died — the console takes it back, gets a
+    /// clean canvas, and this function draws *nothing*, not even the
+    /// cursor: a safe terminal has no pointer.
     pub fn present(&mut self) -> Result<usize, DisplayError> {
+        let gui = self
+            .surfaces
+            .iter()
+            .flatten()
+            .any(|surface| surface.has_buffer());
+        if gui != self.desktop_active {
+            self.desktop_active = gui;
+            crate::drivers::screen::set_desktop_active(gui);
+            if !gui {
+                // The last window is gone: hand a clean black canvas back
+                // to the console so the next log line starts at the top.
+                crate::drivers::screen::clear_for_userland();
+            }
+        }
+        if !gui {
+            // The console owns the screen. Consume the frame trigger
+            // without touching the display — no clear, no cursor, no
+            // repaint: the text on screen is the console's, and it stays.
+            self.pointer_moved = false;
+            return Ok(0);
+        }
         if !self.frame_pending() {
             return Ok(0);
         }

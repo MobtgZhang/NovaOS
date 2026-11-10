@@ -384,6 +384,18 @@ fn main(_handle: Handle, mut system_table: SystemTable<Boot>) -> Status {
 
     // The `bs` borrow ended with the closure. Consume `system_table` to leave
     // UEFI boot services, then jump into the kernel.
+    //
+    // # No UEFI, and no GOP, past this line
+    //
+    // Everything the firmware owns — every protocol call, GOP included:
+    // `locate_handle_buffer`, `set_mode`, `frame_buffer`, `Blt` — happened
+    // inside the closure above, while boot services were still alive.
+    // `exit_boot_services` tears the firmware down; a protocol call after
+    // it is undefined behaviour on real hardware even where an emulator
+    // tolerates it. What crosses the boundary is plain data: the physical
+    // address of the linear framebuffer, snapshotted into the boot
+    // protocol. The kernel maps that address and writes pixels with the
+    // CPU, and never speaks to GOP again.
     let (_rt, _memory_map) = unsafe { system_table.exit_boot_services(MemoryType::LOADER_DATA) };
 
     // cli, switch rsp to the bootstrap stack, and jump to the kernel entry

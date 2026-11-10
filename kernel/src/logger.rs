@@ -111,11 +111,14 @@ pub fn log(level: Level, args: core::fmt::Arguments<'_>) {
 /// Write a line with no level prefix and no filtering.
 ///
 /// Used on the panic path, where re-entering the level filter could recurse.
+/// The screen copy bypasses both the quiet flag and desktop ownership: a
+/// panic must be visible even over a live desktop, because the desktop is
+/// exactly what may have just died.
 pub fn panic_report(message: &str) {
     crate::arch::console().send_bytes(message.as_bytes());
     crate::arch::console().send_bytes(b"\r\n");
-    crate::drivers::screen::push_bytes(message.as_bytes());
-    crate::drivers::screen::push_bytes(b"\r\n");
+    crate::drivers::screen::push_bytes_panic(message.as_bytes());
+    crate::drivers::screen::push_bytes_panic(b"\r\n");
 }
 
 /// Render a [`core::panic::PanicInfo`] into `sink`.
