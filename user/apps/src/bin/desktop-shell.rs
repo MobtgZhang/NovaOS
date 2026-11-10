@@ -117,6 +117,39 @@ struct Drag {
     moved: bool,
 }
 
+/// Which popup the shell currently owns.
+///
+/// A popup is a small surface above every other window; the desktop
+/// underneath stays interactive where the popup does not reach. Menus
+/// and modal dialogs are drawn into it instead of into the desktop
+/// surface, which is pinned below the windows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopupKind {
+    StartMenu,
+    ContextMenu,
+    RunDialog,
+    LauncherDialog,
+    About,
+}
+
+/// A small surface that sits above every other window.
+///
+/// The desktop background is pinned below the windows, so a menu or
+/// dialog drawn into it can be covered by whatever is on top. A popup
+/// is created with the compositor's ordinary window path — hence the
+/// highest z-order at the moment it is made — and destroyed when it is
+/// no longer needed, so the desktop beneath keeps its place without
+/// needing to be un-pinned.
+struct Popup {
+    /// The popup surface.
+    window: graphics::Window,
+    /// The popup's top-left corner on the display.
+    x: i32,
+    y: i32,
+    /// Which popup this is.
+    kind: PopupKind,
+}
+
 /// The desktop shell's mutable state.
 struct Shell {
     /// The icon column, built from `.desktop` files at boot.
@@ -200,6 +233,9 @@ struct Shell {
     context_open: bool,
     context_x: i32,
     context_y: i32,
+    /// The topmost visible popup, if any. Exactly one may exist at a time;
+    /// it is drawn above every window and destroyed when closed.
+    popup: Option<Popup>,
     /// The launcher creation dialog: Name and Command fields and their
     /// focus. `launcher_focus` is `0` for Name, `1` for Command.
     launcher_open: bool,
@@ -293,6 +329,7 @@ impl Shell {
                 "Cancel",
             ),
             context_open: false,
+            popup: None,
             context_x: 0,
             context_y: 0,
             launcher_open: false,
@@ -702,6 +739,135 @@ impl Shell {
         self.run_cursor = 0;
     }
 
+    /// Create the popup surface for `kind`, if it does not exist yet.
+    ///
+    /// The popup starts at `(x, y)` with size `w * h`; an ordinary
+    /// compositor-created surface is given the highest z-order at the
+    /// moment it is made, so the popup sits above every window.
+    fn open_popup(&mut self, x: i32, y: i32, w: u32, h: u32, kind: PopupKind) -> bool {
+        self.close_popup();
+        let Ok(window) = graphics::Window::open(w, h) else {
+            return false;
+        };
+        let _ = graphics::compositor_move(window.surface, x, y);
+        self.popup = Some(Popup { window, x, y, kind });
+        true
+    }
+
+    /// Destroy the popup surface, if one exists.
+    fn close_popup(&mut self) {
+        if let Some(popup) = self.popup.take() {
+            let _ = graphics::surface_destroy(popup.window.surface);
+        }
+    }
+
+    /// The popup the current state wants, if any, and where it goes.
+    fn wanted_popup(&self) -> Option<(i32, i32, u32, u32, PopupKind)> {
+        if self.start_menu {
+            let height = self.menu_height() + MENU_FLOOR;
+            Some((
+                MENU_X,
+                self.menu_top(),
+                MENU_WIDTH as u32,
+                height as u32,
+                PopupKind::StartMenu,
+            ))
+        } else if self.run_open {
+            Some((
+                self.run_dialog_x(),
+                self.run_dialog_y(),
+                RUN_DIALOG_W as u32,
+                RUN_DIALOG_H as u32,
+                PopupKind::RunDialog,
+            ))
+        } else if self.launcher_open {
+            Some((
+                (self.width as i32 - LAUNCHER_DIALOG_W) / 2,
+                (self.height as i32 - LAUNCHER_DIALOG_H) / 2,
+                LAUNCHER_DIALOG_W as u32,
+                LAUNCHER_DIALOG_H as u32,
+                PopupKind::LauncherDialog,
+            ))
+        } else if self.about {
+            let bx = (self.width as i32 - 360) / 2;
+            let by = (self.height as i32 - 280) / 2;
+            Some((bx, by, 360, 280, PopupKind::About))
+        } else if self.context_open {
+            let height =
+                Self::CONTEXT_ROWS as u32 * CONTEXT_ROW_PITCH as u32 + CONTEXT_FLOOR as u32;
+            Some((
+                self.context_x,
+                self.context_y,
+                CONTEXT_WIDTH as u32,
+                height,
+                PopupKind::ContextMenu,
+            ))
+        } else {
+            None
+        }
+    }
+
+    /// Open, resize or destroy the popup so it matches what the state
+    /// currently wants. Called at the end of `draw`.
+    fn sync_popup(&mut self) {
+        match (
+            self.wanted_popup(),
+            self.popup.as_ref().map(|popup| popup.kind),
+        ) {
+            (Some((x, y, w, h, kind)), Some(current)) if kind == current => {
+                // Same popup; reposition only if the state moved it
+                // (the menu follows the panel height, dialogs are
+                // static and therefore never need this).
+                let popup = self.popup.as_mut().expect("checked above");
+                if popup.x != x
+                    || popup.y != y
+                    || popup.window.width != w
+                    || popup.window.height != h
+                {
+                    let _ = graphics::compositor_move(popup.window.surface, x, y);
+                    popup.x = x;
+                    popup.y = y;
+                    popup.window.width = w;
+                    popup.window.height = h;
+                }
+            }
+            (Some((x, y, w, h, kind)), _) => {
+                let _ = self.open_popup(x, y, w, h, kind);
+            }
+            (None, Some(_)) => self.close_popup(),
+            (None, None) => {}
+        }
+    }
+
+    /// Draw the popup's content into its own buffer and present it.
+    fn present_popup(&mut self) {
+        let (buffer, width, height, kind) = match self.popup.as_mut() {
+            Some(popup) => (
+                popup.window.buffer,
+                popup.window.width,
+                popup.window.height,
+                popup.kind,
+            ),
+            None => return,
+        };
+        let mut canvas = Canvas::new(buffer, width, height);
+        match kind {
+            PopupKind::StartMenu => self.draw_ede_menu(&mut canvas, 0, 0),
+            PopupKind::ContextMenu => self.draw_context_menu(&mut canvas, 0, 0),
+            PopupKind::RunDialog => self.draw_run_dialog(&mut canvas, 0, 0),
+            PopupKind::LauncherDialog => self.draw_launcher_dialog(&mut canvas, 0, 0),
+            PopupKind::About => self.draw_about(&mut canvas, 0, 0),
+        }
+        if let Some(popup) = &mut self.popup
+            && let Err(error) = popup.window.present()
+        {
+            let _ = console::write_fmt(format_args!(
+                "desktop-shell: popup present failed {}\r\n",
+                error.name()
+            ));
+        }
+    }
+
     fn draw(&mut self, canvas: &mut Canvas) {
         // The wallpaper: the named image when `desktop.conf` asks for
         // it, the configured background colour otherwise.
@@ -775,11 +941,6 @@ impl Shell {
         self.panel
             .draw(canvas, panel_top, self.notify.pending() > 0, clock);
 
-        // The EDE menu, if open.
-        if self.start_menu {
-            self.draw_ede_menu(canvas);
-        }
-
         // The notification balloon, if any.
         if let Some(note) = self.notify.current() {
             let bx = self.width as i32 - 280;
@@ -797,32 +958,16 @@ impl Shell {
             canvas.draw_text(bx + 10, by + 52, note.body(), 0x008A93A4, Some(0x00172028));
         }
 
-        // The About dialog, if open.
-        if self.about {
-            self.draw_about(canvas);
-        }
-
-        // The desktop context menu, if open — above windows, below the
-        // launcher dialog.
-        if self.context_open {
-            self.draw_context_menu(canvas);
-        }
-
-        // The Run dialog, if open — topmost of all.
-        if self.run_open {
-            self.draw_run_dialog(canvas);
-        }
-
-        // The launcher creation dialog, if open — topmost of all.
-        if self.launcher_open {
-            self.draw_launcher_dialog(canvas);
-        }
+        // Popup overlays (menus, dialogs) live in their own surface,
+        // above every window. Sync and present it.
+        self.sync_popup();
+        self.present_popup();
     }
 
-    fn draw_about(&self, canvas: &mut Canvas) {
+    fn draw_about(&self, canvas: &mut Canvas, x: i32, y: i32) {
         let about = AboutContent::novaos();
-        let bx = (self.width as i32 - 360) / 2;
-        let by = (self.height as i32 - 280) / 2;
+        let bx = x;
+        let by = y;
         let rect = Rect::new(bx, by, 360, 280);
         canvas.fill_rect(rect, palette::SURFACE);
         canvas.stroke_rect(rect, palette::BORDER);
@@ -868,11 +1013,11 @@ impl Shell {
 
     /// Draw the EDE menu: a header bar over a page of rows, in the
     /// theme's near-white body with the title blue as the selection.
-    fn draw_ede_menu(&mut self, canvas: &mut Canvas) {
+    fn draw_ede_menu(&mut self, canvas: &mut Canvas, x: i32, y: i32) {
         let rows = self.menu_row_count();
         let height = self.menu_height();
-        let by = self.menu_top();
-        let bx = MENU_X;
+        let by = y;
+        let bx = x;
         let width = MENU_WIDTH as u32;
 
         // Body and border.
@@ -934,38 +1079,21 @@ impl Shell {
 
     /// Draw the Run dialog: an EDE window with one text field and
     /// OK/Cancel buttons.
-    fn draw_run_dialog(&mut self, canvas: &mut Canvas) {
-        let rect = Rect::new(
-            self.run_dialog_x(),
-            self.run_dialog_y(),
-            RUN_DIALOG_W as u32,
-            RUN_DIALOG_H as u32,
-        );
+    fn draw_run_dialog(&mut self, canvas: &mut Canvas, x: i32, y: i32) {
+        let rect = Rect::new(x, y, RUN_DIALOG_W as u32, RUN_DIALOG_H as u32);
         canvas.fill_rect(rect, palette::SURFACE);
         canvas.stroke_rect(rect, palette::BORDER);
-        nova_ui::draw_titlebar_at(
-            canvas,
-            self.run_dialog_x(),
-            self.run_dialog_y(),
-            RUN_DIALOG_W,
-            "Run...",
-            true,
-        );
+        nova_ui::draw_titlebar_at(canvas, x, y, RUN_DIALOG_W, "Run...", true);
         canvas.draw_text(
-            self.run_dialog_x() + 16,
-            self.run_dialog_y() + 34,
+            x + 16,
+            y + 34,
             "Command:",
             palette::TEXT,
             Some(palette::SURFACE),
         );
         // The field: white with the theme's border, caret at the end
         // of what has been typed.
-        let field = Rect::new(
-            self.run_dialog_x() + 16,
-            self.run_dialog_y() + 54,
-            (RUN_DIALOG_W - 32) as u32,
-            22,
-        );
+        let field = Rect::new(x + 16, y + 54, (RUN_DIALOG_W - 32) as u32, 22);
         canvas.fill_rect(field, palette::FIELD);
         canvas.stroke_rect(field, palette::BORDER);
         let typed = core::str::from_utf8(&self.run_input[..self.run_len]).unwrap_or("");
@@ -984,14 +1112,9 @@ impl Shell {
 
     /// Draw the desktop context menu: EDE's `ede-desktop` menu, one row
     /// per action, in the theme's near-white body with a border.
-    fn draw_context_menu(&self, canvas: &mut Canvas) {
+    fn draw_context_menu(&self, canvas: &mut Canvas, x: i32, y: i32) {
         let height = Self::CONTEXT_ROWS as i32 * CONTEXT_ROW_PITCH + CONTEXT_FLOOR;
-        let rect = Rect::new(
-            self.context_x,
-            self.context_y,
-            CONTEXT_WIDTH as u32,
-            height as u32,
-        );
+        let rect = Rect::new(x, y, CONTEXT_WIDTH as u32, height as u32);
         canvas.fill_rect(rect, palette::MENU_FACE);
         canvas.stroke_rect(rect, palette::BORDER);
 
@@ -1003,19 +1126,19 @@ impl Shell {
             "Background...",
         ];
         for (row, label) in ITEMS.iter().enumerate() {
-            let y = self.context_y + row as i32 * CONTEXT_ROW_PITCH + CONTEXT_MARGIN;
+            let row_y = y + row as i32 * CONTEXT_ROW_PITCH + CONTEXT_MARGIN;
             canvas.fill_rect(
                 Rect::new(
-                    self.context_x + 1,
-                    y,
+                    x + 1,
+                    row_y,
                     (CONTEXT_WIDTH - 2) as u32,
                     (CONTEXT_ROW_PITCH - CONTEXT_MARGIN * 2) as u32,
                 ),
                 palette::MENU_FACE,
             );
             canvas.draw_text(
-                self.context_x + 10,
-                y + 4,
+                x + 10,
+                row_y + 4,
                 label,
                 palette::TEXT,
                 Some(palette::MENU_FACE),
@@ -1025,9 +1148,7 @@ impl Shell {
 
     /// Draw the launcher creation dialog: two labelled text fields and
     /// OK/Cancel buttons, styled like the Run dialog.
-    fn draw_launcher_dialog(&mut self, canvas: &mut Canvas) {
-        let x = (self.width as i32 - LAUNCHER_DIALOG_W) / 2;
-        let y = (self.height as i32 - LAUNCHER_DIALOG_H) / 2;
+    fn draw_launcher_dialog(&mut self, canvas: &mut Canvas, x: i32, y: i32) {
         let rect = Rect::new(x, y, LAUNCHER_DIALOG_W as u32, LAUNCHER_DIALOG_H as u32);
         canvas.fill_rect(rect, palette::SURFACE);
         canvas.stroke_rect(rect, palette::BORDER);
@@ -1035,7 +1156,7 @@ impl Shell {
 
         // The two fields.
         for (index, label) in ["Name:", "Command:"].iter().enumerate() {
-            let field_y = self.launcher_field_y(index);
+            let field_y = 40 + index as i32 * 44;
             canvas.draw_text(
                 x + 16,
                 field_y - 18,
@@ -1972,6 +2093,33 @@ pub extern "C" fn main() -> i64 {
                     dirty |= shell.on_key(event);
                 }
                 _ => {}
+            }
+        }
+
+        // The popup, if one is open, is above every other window and is
+        // where the user's pointer actually is. Drain its queue too and
+        // make its events absolute for the handler.
+        let popup_geometry = shell.popup.as_ref().map(|popup| (popup.x, popup.y));
+        if let Some((popup_x, popup_y)) = popup_geometry {
+            let popup_count = match shell.popup.as_mut() {
+                Some(popup) => popup.window.drain(&mut events).unwrap_or(0),
+                None => 0,
+            };
+            for event in &events[..popup_count] {
+                match event.kind {
+                    INPUT_EVENT_POINTER => {
+                        let absolute = InputEvent {
+                            x: event.x + popup_x,
+                            y: event.y + popup_y,
+                            ..*event
+                        };
+                        dirty |= shell.on_pointer(&absolute);
+                    }
+                    INPUT_EVENT_KEY => {
+                        dirty |= shell.on_key(event);
+                    }
+                    _ => {}
+                }
             }
         }
         shell.ticks = shell.ticks.saturating_add(1);
