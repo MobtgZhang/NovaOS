@@ -304,14 +304,15 @@ pub fn mode() -> Option<DisplayMode> {
 /// per tick would move a whole surface 15,000 times a second: megabytes of
 /// DMA per frame for a screen that has not changed, and a host main loop
 /// so busy copying that the guest's other devices starve. The limiter caps
-/// the device's frame rate instead — roughly 100 Hz on a 1 GHz
+/// the device's frame rate instead — roughly 144 Hz on a 1 GHz
 /// time-stamp counter, faster on a higher rate, which the display
 /// requirement takes as a floor rather than a ceiling.
 static LAST_FLUSH: AtomicU64 = AtomicU64::new(0);
 
-/// The interval between device flushes: 10 million cycles — about 10 ms
-/// at a 1 GHz counter rate, and never below ~3 ms at any faster rate.
-const FLUSH_INTERVAL_CYCLES: u64 = 10_000_000;
+/// The interval between device flushes: about 6.9 million cycles —
+/// ~6.9 ms at a 1 GHz counter rate, i.e. roughly a 144 Hz panel's
+/// refresh interval, and never below ~2 ms at any faster counter rate.
+const FLUSH_INTERVAL_CYCLES: u64 = 6_900_000;
 
 /// Push the composed frame to the display device.
 ///

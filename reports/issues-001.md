@@ -536,9 +536,9 @@ NovaOS 目前是一个**轮询驱动、全静态池**的 Symbian 风格微内核
 - **背景**：§13.5/§13.9 起的桌面输出走 CPU framebuffer + GOP（`exit_boot_services` 前）直写；验收要求"桌面显示必须实现显卡驱动、用显卡去绘制、不要用 CPU 绘制、刷新频率 60~144 FPS 甚至更高"。
 - **修复**：
   - **显卡架构**：新增 virtio-gpu driver（`kernel/src/drivers/virtio/gpu.rs`：DmaWindow、SG 合并、rdtsc 硬截止、polled control queue、`POLL_CYCLES=50_000_000`/`ATTEMPTS=2` cycle-deadline polling）；QEMU 设备 `virtio-vga,xres=1024,yres=768`（`tools/xtask/src/run.rs`、`scripts/qemu.sh` —— VGA 前端供 OVMF GOP、virtio-gpu backend 供本 driver，单 console）；`kernel/src/drivers/pci.rs` `DEVICE_VIRTIO_GPU=0x1050` + `is_virtio_gpu()`；`display::init` GPU-first、失败回退 GOP。
-  - **flush**：`display::flush()` = 整表面 `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`；rate limiter 由 TSC `FLUSH_INTERVAL_CYCLES=10_000_000`（≈10 ms @1 GHz，帧率硬下限 ≥100 FPS）守护；仅在 `screen::console_take_dirty()` 标脏时 flush（console-only 路径不再为全桌面 flush）。
+  - **flush**：`display::flush()` = 整表面 `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`；rate limiter 由 TSC `FLUSH_INTERVAL_CYCLES=6_900_000`（≈6.9 ms @1 GHz，帧率硬上限 ≈144 FPS）守护；仅在 `screen::console_take_dirty()` 标脏时 flush（console-only 路径不再为全桌面 flush）。
   - **页表 offset bug**：`kernel/src/mm/page_table.rs` 的 `translate`/`translate_user` 漏接 page offset（低 12 位）→ user 虚拟地址按 4K 页对齐、高 12 位取错 → 桌面/用户进程地址空间错乱。已修复 + 回归测试 `an_offset_address_translates_exactly`（`kernel/src/test/m2.rs`）。
-- **刷新率**：flush 走 TSC deadline 节流，`FLUSH_INTERVAL_CYCLES≈10 ms` → 单帧周期 ≥100 FPS，满足 60~144 FPS 需求的下限；present 热路径零日志（`§13.8` 的"present 不得打日志"结论继续有效）。
+- **刷新率**：flush 走 TSC deadline 节流，`FLUSH_INTERVAL_CYCLES≈6.9 ms` → 上限 ≈144 FPS；QEMU `-trace enable=virtio_gpu_cmd_res_flush` 实测——连续鼠标事件下 **~124 次 `res_flush`/秒 ≈124 FPS**；桌面空闲时 0 FPS（按需合成、按需 DMA，无刷屏）。present 热路径零日志（`§13.8` 的"present 不得打日志"结论继续有效）。
 - **验收**：`./scripts/gates.sh` 全绿；串口 `display: virtio-gpu scanout 1024x768 pitch 4096 at virt … — the device owns the scanout`；VNC/QMP 截图实测桌面/窗口/菜单/光标/bottom-pin 全部正确。
 
 ### 13.12 NovaOS EDE 窗口拖动：pointer-driven title bar move（2026-11-10）〔已完成〕**Medium**
