@@ -2,9 +2,17 @@
 
 **An experimental Rust-based desktop operating system featuring a lightweight microkernel, capability-based security, and modular user-space services.**
 
-> ✅ **Status: bootable in QEMU (M0–M8).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop, network, and SMP paths. It is still an experimental system, not a production desktop: IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network. SMP has a verified per-CPU foundation, but user processes, services, and drivers remain owned by the bootstrap processor, so concurrent service scheduling is not claimed. The roadmap below marks what is actually built.
+> ✅ **Status: bootable in QEMU (M0–M8).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop, network, and SMP paths. The desktop is a port of [EDE, the Equinox Desktop Environment](https://github.com/edeproject/ede), to Rust — it renders through a GPU-driven scanout at 1024x768 (and adapts to the mode the virtio-gpu reports), with the real EDE look and feel: the start menu, panel, window chrome, and interaction model. It is still an experimental system, not a production desktop: IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network. SMP has a verified per-CPU foundation, but user processes, services, and drivers remain owned by the bootstrap processor, so concurrent service scheduling is not claimed. The roadmap below marks what is actually built.
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
+
+## Screenshots
+
+| NovaOS Desktop | Safe Terminal |
+| --- | --- |
+| ![NovaOS Desktop — a Rust port of EDE (the Equinox Desktop Environment)](assets/image1.png) | ![NovaOS Safe Terminal — the minimal fallback shell](assets/image2.png) |
+
+The desktop is a port of [EDE, the Equinox Desktop Environment](https://github.com/edeproject/ede), to Rust — its widgets, menus, panel, icons, and interaction model, on NovaOS's own GPU-driven display stack. The Safe Terminal remains available as a fallback boot mode for when no graphics are wanted or the display path is being brought up.
 
 ## Design Principles
 
@@ -48,13 +56,13 @@ flowchart TB
 | **Service Manager** | Service startup, dependencies, supervision, and recovery |
 | **File Server** | In-memory filesystem first; virtual filesystems and persistent storage later |
 | **Device Manager** | Controlled MMIO, IRQ, PCI, and virtual device access |
-| **Nova Desktop** | Display service, compositing, input routing, windows, and UI components |
+| **Nova Desktop** | GPU-driven display stack (virtio-gpu), compositing, input routing, windows, and the EDE-derived shell: panel, start menu, taskbar, icon column, notifications |
 
 ## Boot workflow chain
 
 ```mermaid
 sequenceDiagram
-    participant B as UEFI + Limine
+    participant B as UEFI + NovaBoot
     participant K as NovaKernel
     participant I as init / ServiceManager
     participant F as FileServer
@@ -74,9 +82,9 @@ sequenceDiagram
 | Area | Initial choice |
 | --- | --- |
 | Main language | **Rust** (`no_std` in the kernel, plus minimal assembly where needed) |
-| CPU architecture | **x86-64** first; AArch64 in the future |
+| CPU architecture | **x86-64**; RISC-V 64 and LoongArch 64 are bring-up ports (see the RISC-V/LoongArch section) |
 | Development platform | **QEMU** with UEFI/OVMF |
-| Boot protocol | **Limine** (`make run`, current); **NovaBoot** UEFI menu layer (protocol crate implemented, kernel hand-off planned) |
+| Boot protocol | **NovaBoot** UEFI boot menu (`make run`, current); the kernel parses the NovaBoot hand-off |
 | Executable format | **ELF64** and a NovaOS-specific ABI |
 | Initial device targets | Serial, timers, framebuffer, and VirtIO |
 | Tooling | Cargo, `make`, QEMU, GDB, and the `xtask` workflow |
@@ -91,7 +99,7 @@ All listed milestones are engineering gates. M0–M8 are implemented in the repo
 - [x] **M3 — Microkernel:** Capability tables, IPC, an `init` process, and an IPC echo service.
 - [x] **M4 — Command line:** Service Manager, RAMFS, File Server, console, and shell.
 - [x] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
-- [x] **M6 — Desktop Alpha:** Input system, window compositor, terminal, editor, and file manager.
+- [x] **M6 — Desktop:** Input system, window compositor, terminal, editor, and file manager — now including the EDE port: GPU-driven scanout, the EDE panel/menus/look and interaction, real edeneu icons, and an About EDE dialog.
 - [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, TCP, ICMP, DHCP, and a versioned bounded socket API. IPv6 and real-hardware networking are not implemented.
 - [x] **M8 — SMP foundation:** per-CPU schedulers, thread pools and stacks, GDT/TSS pairs, local APIC timers, AP startup, and kernel-only AP idle threads. CPU identity is taken from CPUID leaf 1 `EBX[31:24]`. The bootstrap processor still owns user processes, services, and drivers; concurrent service/driver SMP scheduling is not claimed.
 - [ ] **M9+ — Expansion:** concurrent multi-CPU service scheduling, package management, audio, user accounts, security hardening, and selected real hardware.
@@ -150,9 +158,6 @@ make test
 The lower-level commands remain available:
 
 ```bash
-# Fetch and verify the pinned Limine release (needed once per checkout)
-cargo xtask fetch-limine
-
 # Build the kernel and the user-space runtime for x86_64-unknown-none
 cargo nova-build-bare
 
@@ -186,7 +191,7 @@ Deliberately not implemented or not asserted: IPv6, a blocking socket API, concu
 
 The SMP phase is a tested foundation, not a claim that the whole system is concurrently scheduled:
 
-- Limine's MP handover captures the processor IDs; each AP waits on `SMP_READY` before entering its startup path.
+- The NovaBoot hand-off carries a CPU table captured by the boot manager at boot; each AP waits on `SMP_READY` before entering its startup path.
 - Each AP gets its own kernel stack, fault stack, GDT/TSS pair, local APIC timer, scheduler, thread pool, and one kernel-only idle thread.
 - The bootstrap processor remains the only owner of user processes, services, and drivers. APs never enter ring 3 and never touch the network, file, or display service state.
 - CPU identity is read from CPUID leaf 1 `EBX[31:24]`, not from the xAPIC ID register. On QEMU the ID register reads as zero for every processor, while CPUID reports the captured IDs.
@@ -194,20 +199,40 @@ The SMP phase is a tested foundation, not a claim that the whole system is concu
 - The timer's no-current-thread path restores the saved `r15..rax` register file before returning, rather than resuming through the frame alone.
 - `make run` and `cargo xtask run` both boot with `-smp 4`; the `smp_cpu_state` suite checks processor capture, AP online state, separate idle pools, per-CPU stacks/TSS, and per-AP scheduler ticks.
 
-### UEFI boot menu (NovaBoot protocol) — implemented, not yet a boot path
+### UEFI boot menu (NovaBoot protocol) — the current boot path
 
-A separate UEFI boot-menu layer is implemented on top of the [`nova-boot`] protocol crate. It is **not** yet wired to hand control to the kernel, so `make run` (Limine) remains the only verified boot path; this section documents the design boundary rather than a shipped feature.
+The NovaBoot boot-menu layer on top of the [`nova-boot`] protocol crate **is** the boot path `make run` uses: `cargo xtask image` stages the menu at the fixed removable-media path plus the kernel, and OVMF boots it. Choosing an entry hands the kernel a validated `BootProtocol` snapshot instead of any external loader symbols.
 
 - `crates/nova-boot` defines the architecture-neutral [`BootProtocol`] snapshot (magic, version, target architecture, kernel entry/load address, CPU table, memory map, framebuffer) and a bounded [`BootMenu`] model, all validated on the host.
-- `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that renders a **graphical** boot menu through the UEFI GOP (Graphics Output Protocol) framebuffer — no text console involved: a centered panel, a highlighted selection bar, and a hint row drawn with an embedded 5x7 bitmap font at 1024x768 (other modes fall back). Two entries ship compiled in: `1. Desktop (default)` and `2. Safe Terminal`. The keyboard is read through *every* `SimpleTextIn` handle the firmware exposes (OVMF surfaces several; the real keyboard may be any of them), so selection works on real firmware as well as under QEMU.
-- The menu covers four target families (`x86_64`, aarch64, riscv64, loongarch64) in the protocol model, but only x86-64 has a kernel backend today; the other entries are placeholders.
-- The missing piece to actually boot through the menu is the kernel-side consumer: reading and validating the `BootProtocol` snapshot (instead of Limine's exported symbols) and transferring control at the entry point. That hand-off is deliberately not claimed here.
+- `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that renders a **graphical** boot menu through the UEFI GOP (Graphics Output Protocol) framebuffer — no text console involved: a centered panel, a highlighted selection bar, and a hint row drawn with an embedded 5x7 bitmap font at 1024x768 (other modes fall back). Entries ship compiled in: `1. Desktop (default)` and `2. Safe Terminal`. The keyboard is read through *every* `SimpleTextIn` handle the firmware exposes (OVMF surfaces several; the real keyboard may be any of them), so selection works on real firmware as well as under QEMU.
+- The menu covers four target families (`x86_64`, aarch64, riscv64, loongarch64) in the protocol model; x86-64 has a full kernel backend, RISC-V 64 and LoongArch 64 have bring-up backends (see the RISC-V 64 / LoongArch 64 section), and aarch64 is planned.
+- The kernel validates the `BootProtocol` snapshot it is handed and transfers control at the recorded entry point.
 
 [`nova-boot`]: crates/nova-boot
 [`BootProtocol`]: crates/nova-boot#the-snapshot-a-bootloader-publishes-to-the-kernel
 [`BootMenu`]: crates/nova-boot#a-bounded-menu-model
 
-### Quality gates
+### NovaOS Desktop (an EDE port)
+
+NovaOS Desktop is a port of [EDE, the Equinox Desktop Environment](https://github.com/edeproject/ede), to Rust. EDE is small, fast, GPL-2.0, and the project NovaOS draws its desktop from — same goal, same look, same interaction model, different implementation language and a different kernel underneath.
+
+- **GPU-driven display, not CPU-painted pixels.** A virtio-gpu driver (`kernel/src/drivers/virtio/gpu.rs`) owns the scanout; the GPU composites the framebuffer over DMA, and the display service presents it. Refresh rate is not a hard number but a rate limiter on the present path (~144 Hz ceiling); measured via QEMU's `virtio_gpu_cmd_res_flush` trace at ~124 FPS under continuous input, with 0 FPS when the desktop is idle.
+- **The real EDE theme.** Panel with EDE applets (start menu, quick launch, clock, taskbar, systray), EDE start menu (Programs / Window List / Run… / About EDE), EDE desktop icons rendered from the edeneu theme rasterized to 64x64 (not hand-drawn lookalikes), EDE bevel buttons, EDE titlebar (close / maximize / iconify), EDE notification balloons, EDE wallpaper.
+- **EDE interaction.** Right-click on the desktop opens the EDE context menu (Create Launcher…, Create Folder…, Arrange Icons, Icons Settings…, Background… — persisted to `~/.ede/desktop.conf`), window move by titlebar drag, minimize to taskbar chips (click to restore), iconify/close on titlebar buttons, double-click launch with drag-to-move.
+- **EDE components ported as crates.** The EDE stack (`nova-edelib`, `nova-ede-panel`, `nova-ede-desktop`, `nova-ede-launch`, `nova-ede-tip`, `nova-ede-notifyd`, …) is a set of `no_std` crates mirroring the upstream component layout — 24 crates in the desktop's dependency closure, all host-tested.
+- **VFS backs the desktop honestly.** The file manager can create directories (`New Folder` button), `.desktop` files are parsed and shown, `~/Desktop` is scanned at shell startup, launchers created from the context menu work end-to-end.
+
+The About dialog (`ede-about`) ships in the desktop and reports the port honestly: NovaOS Desktop 0.1.0, a Rust-written desktop, port of EDE (Equinox Desktop Environment), licensed under GPL-2.0; edelib is LGPL-2.0.
+
+### RISC-V 64 and LoongArch 64 (bring-up)
+
+NovaOS is ported to two additional bare-metal targets. Both are **bring-up only** — far from the x86-64 completion level:
+
+- `riscv64gc-unknown-none-elf` and `loongarch64-unknown-none` build; on QEMU's `virt` machines both boot the kernel and print the banner over the memory-mapped 16550 console, install an exception vector, and park the CPU.
+- Not implemented (honestly): paging, memory management, SMP, timer interrupts, initramfs, user space, services, and the desktop. The full kernel's x86-64-specific modules are gated out of these builds rather than stubbed with lies.
+- See `reports/issues-001.md` §14 for the verified boot logs and the porting order.
+
+## Quality gates
 
 `scripts/gates.sh` runs the four gates the plan requires, in cheapest-first order:
 
