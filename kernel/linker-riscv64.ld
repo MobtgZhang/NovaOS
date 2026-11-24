@@ -23,6 +23,13 @@ SECTIONS
         __text_end = .;
     }
 
+    .nova_user_text ALIGN(4K) :
+    {
+        __nova_user_text_start = .;
+        *(.nova_user_text)
+    }
+    ASSERT(SIZEOF(.nova_user_text) <= 4K, "RISC-V boot trampoline exceeds one page")
+
     .rodata ALIGN(4K) :
     {
         __rodata_start = .;
@@ -46,6 +53,13 @@ SECTIONS
         *(.bss .bss.*)
         . = ALIGN(8);
         __bss_end = .;
+    }
+
+    .nova_user_stack ALIGN(4K) (NOLOAD) :
+    {
+        __nova_user_stack_start = .;
+        . += 4K;
+        __nova_user_stack_end = .;
     }
 
     . = ALIGN(4K);

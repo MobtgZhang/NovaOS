@@ -18,18 +18,14 @@
 //! | Backend | Target | Boot path | Console | Exit |
 //! | --- | --- | --- | --- | --- |
 //! | [`x86_64`] | `x86_64-unknown-none` | NovaBoot UEFI → long mode | 16550 @ 0x3f8 | `isa-debug-exit` @ 0xf4 |
-//! | [`aarch64`] | `aarch64-unknown-none` | NovaBoot UEFI → EL1 (planned) | PL011 @ 0x0900_0000 | PSCI `SYSTEM_OFF` |
+//! | [`aarch64`] | `aarch64-unknown-none` | QEMU `virt` → EL1 | PL011 @ 0x0900_0000 | park the CPU |
 //! | [`riscv64`] | `riscv64gc-unknown-none-elf` | QEMU `virt` + OpenSBI → S-mode | 16550 @ 0x1000_0000 | SBI `SRST` ecall |
 //! | [`loongarch64`] | `loongarch64-unknown-none` | QEMU `virt` → direct `_start` | 16550 @ 0x1fe0_01e0 | park the CPU |
 //!
 //! # Porting status
 //!
-//! Only x86-64 has the complete kernel: paging, memory management, SMP,
-//! services, and the desktop. The two newest ports bring their machines up
-//! as far as the banner — the console is programmed and prints, an exception
-//! vector is installed, and the CPU parks. Everything the boot sequence
-//! *does* after those points is x86-64-only, and `arch/mod.rs` gates it out
-//! rather than promising a half-ported machine.
+//! x86-64 runs the kernel, services, and desktop. The other ports use
+//! `arch_bringup` to launch user processes and verify traps and scheduling.
 //!
 //! # Adding a target
 //!
@@ -40,6 +36,8 @@
 //!    being added is not architecture-neutral yet — fix that first.
 
 pub mod shared;
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) mod virt_smp;
 
 use shared::console::Console;
 use shared::cpu::InterruptControl;
@@ -91,8 +89,8 @@ compile_error!(
 /// The executing processor's kernel slot index.
 ///
 /// High-level code must ask the facade rather than name a backend module.
-/// x86-64 reads the per-CPU data block the processor's `GS` base points at;
-/// aarch64 currently runs single-processor builds and names slot 0.
+/// x86-64 reads the per-CPU data block the processor's `GS` base points at.
+/// The early ports use the firmware CPU identifier.
 #[cfg(target_arch = "x86_64")]
 pub fn current_cpu() -> usize {
     x86_64::percpu::cpu_index()
@@ -100,7 +98,7 @@ pub fn current_cpu() -> usize {
 
 #[cfg(not(target_arch = "x86_64"))]
 pub fn current_cpu() -> usize {
-    0
+    virt_smp::cpu_id()
 }
 
 /// Geometry of this target's address space.
@@ -123,6 +121,21 @@ pub const ADDRESS_SPACE: AddressSpace = BACKEND_ADDRESS_SPACE;
 pub unsafe fn init() {
     // SAFETY: delegated to this function's contract.
     unsafe { arch_init() };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn verify_privilege_transition(
+    frames: &mut crate::arch_bringup::EarlyFrames,
+    stack_pages: Option<[usize; 2]>, init: &[crate::early_init::Image],
+) -> Result<(), &'static str> {
+    #[cfg(target_arch = "aarch64")]
+    use aarch64 as backend;
+    #[cfg(target_arch = "loongarch64")]
+    use loongarch64 as backend;
+    #[cfg(target_arch = "riscv64")]
+    use riscv64 as backend;
+
+    backend::verify_privilege_transition(frames, stack_pages, init)
 }
 
 /// Bring up per-CPU table state on an application processor.
@@ -233,19 +246,7 @@ pub unsafe fn switch_to_kernel_stack() {
 /// Does not return.
 #[cfg(not(target_arch = "x86_64"))]
 pub unsafe fn switch_to_kernel_stack_and_continue() -> ! {
-    // Unreached by the RISC-V 64 and LoongArch 64 bring-up; the assembly
-    // stub enters directly into `bringup_entry` with no x86-style boot flow.
-    loop {
-        // SAFETY: `wfi`/`idle` are hints with no operands or side effects.
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("wfi");
-        }
-        #[cfg(target_arch = "loongarch64")]
-        unsafe {
-            core::arch::asm!("idle 0");
-        }
-    }
+    unsafe { exit(crate::EXIT_PANIC) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -284,10 +285,7 @@ pub const fn arch_name() -> &'static str {
 /// A monotonic cycle counter for bounding how long a wait has run.
 ///
 /// The rate is the backend's own — callers derive a deadline from it
-/// and never present it as time to anyone. As with `init_cpu` and the
-/// other machine helpers above, this names the x86 backend directly:
-/// the aarch64 backend is still the stub [`aarch64`] describes, and
-/// giving it an arm is part of giving it an implementation.
+/// and never present it as time to anyone.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn cycles() -> u64 {
@@ -307,7 +305,7 @@ pub fn cycles() -> u64 {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        return 0;
+        return aarch64::cycles();
     }
     #[allow(unreachable_code)]
     0

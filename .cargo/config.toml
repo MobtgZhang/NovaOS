@@ -105,6 +105,13 @@ rustflags = [
 # Host builds (xtask, unit tests) use std and the default panic strategy.
 rustflags = []
 
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "link-arg=--gc-sections",
+    "-C", "relocation-model=static",
+]
+
 [target.riscv64gc-unknown-none-elf]
 # RISC-V 64 bare metal. The linker script is named per package by
 # `kernel/build.rs` (see `linker-riscv64.ld`), so this block carries only

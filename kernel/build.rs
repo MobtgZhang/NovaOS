@@ -48,6 +48,7 @@ fn main() {
     // low load address, which are wrong for the `virt` machines the two
     // new ports run on.
     let script = match std::env::var("TARGET").as_deref() {
+        Ok("aarch64-unknown-none") => manifest.join("linker-aarch64.ld"),
         Ok("riscv64gc-unknown-none-elf") => manifest.join("linker-riscv64.ld"),
         Ok("loongarch64-unknown-none") => manifest.join("linker-loongarch64.ld"),
         _ => manifest.join("linker.ld"),

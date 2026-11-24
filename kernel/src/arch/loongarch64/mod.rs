@@ -10,11 +10,10 @@
 //!
 //! The boot sequence, as far as it is implemented today, is:
 //!
-//! 1. `_start` (see `entry.rs`) switches onto the kernel stack and clears
-//!    `.bss`; the bootloader then calls [`bring_up`].
-//! 2. `bring_up` programs the console so the banner is visible, installs
-//!    the exception entry (`eentry`) pointing at a handler that reports the
-//!    trap and halts, and hands control back to the kernel facade.
+//! 1. `_start` switches onto the kernel stack and enters the Rust boot path.
+//! 2. [`arch_init`] installs the normal exception and TLB refill vectors.
+//! 3. [`verify_privilege_transition`] exercises PLV0 → PLV3 → PLV0 using a
+//!    boot-only address space, a controlled syscall, and a one-shot timer.
 //!
 //! The kernel's full boot sequence (paging, memory map, SMP, services, the
 //! desktop) is not yet ported; see the module docs in `arch/mod.rs` and the
@@ -23,13 +22,17 @@
 pub mod console;
 pub mod entry;
 pub mod exit;
+mod user;
 
 pub use console::ConsoleImpl;
 pub use exit::ExitImpl;
 
-use crate::arch::shared::console::Console;
 use crate::arch::shared::cpu::InterruptControl;
 use crate::arch::shared::hw::AddressSpace;
+
+unsafe extern "C" {
+    fn loongarch64_install_trap_vectors();
+}
 
 /// Architecture name used in the boot banner and log tags.
 pub const NAME: &str = "loongarch64";
@@ -55,46 +58,68 @@ pub fn cycles() -> u64 {
     0
 }
 
-/// LoongArch interrupts, backed by the `ie` bit in `prmd`.
-///
-/// The interpreter's interrupt-enable bit is `PRMD.IE` (bit 0). Clearing it
-/// and restoring it is a CSR read-modify-write; the bits being saved and
-/// cleared are only the enable bit, so the mask is a single bit and the
-/// previous state is its inverse captured before the clear.
+/// The boot kernel runs with `CRMD.IE` clear. The timer probe enables it only
+/// during its controlled PLV3 loop and returns with it masked again.
 pub struct Interrupts;
+
+const CRMD_IE: usize = 1 << 2;
 
 impl InterruptControl for Interrupts {
     fn mask(&self) -> bool {
-        // At reset the boa interpreter has interrupts masked; the mask here
-        // tracks that fact rather than reprogramming a CSR whose address is
-        // not yet validated against the machine.
-        true
+        let previous: usize;
+        unsafe {
+            core::arch::asm!("csrxchg {value}, {mask}, 0x0",
+                value = inout(reg) 0_usize => previous, mask = in(reg) CRMD_IE, options(nostack));
+        }
+        previous & CRMD_IE == 0
     }
 
-    fn restore(&self, _was_masked: bool) {
-        // Nothing to restore until a real interrupt source exists.
+    fn restore(&self, was_masked: bool) {
+        let bits = if was_masked { 0 } else { CRMD_IE };
+        unsafe {
+            core::arch::asm!("csrxchg {value}, {mask}, 0x0",
+                value = inout(reg) bits => _, mask = in(reg) CRMD_IE, options(nostack));
+        }
     }
 
     fn is_masked(&self) -> bool {
-        true
+        let mode: usize;
+        unsafe {
+            core::arch::asm!("csrrd {mode}, 0x0", mode = out(reg) mode, options(nostack, nomem));
+        }
+        mode & CRMD_IE == 0
     }
 }
 
-/// The trap entry point.
-///
-/// LoongArch's `eentry` is a single address; on a fault, the machine
-/// vectors to it. The handler prints a one-line marker and parks the CPU —
-/// there is no exception table yet, and an unexpected trap is a bug, not a
-/// recoverable condition. CSR contents are not printed because the CSR
-/// addresses of `estat`/`badi` are not validated against the machine yet,
-/// and a wrong CSR read faults into this same handler.
 #[unsafe(no_mangle)]
-pub extern "C" fn trap_entry() -> ! {
-    crate::arch::console().send_bytes(b"[NOVA] ERR   | trap: fault\r\n");
+extern "C" fn loongarch64_fatal_trap(estat: u64, era: u64, badv: u64, refill: u64) -> ! {
+    crate::klog!(
+        crate::logger::Level::Error,
+        "trap: fault refill={} estat={:#x} era={:#x} badv={:#x}",
+        refill,
+        estat,
+        era,
+        badv
+    );
     loop {
-        // SAFETY: `idle 0` is a hint with no operands or side effects.
         unsafe { core::arch::asm!("idle 0", options(nostack, nomem, preserves_flags)) };
     }
+}
+
+/// Run the single-CPU boot probe after the exception vectors are installed.
+///
+/// A temporary PLV0-only direct window keeps kernel code and the trusted trap
+/// stack accessible in paged mode. PLV3 gets one paired TLB entry for an RX
+/// trampoline and an RW/NX stack. This address space exists for the probe only.
+///
+/// The initial syscall returns the cookie written and read by PLV3. Two
+/// contexts then use different private stack pages at the same user address.
+/// A CPU timer preempts the first context and the second yields back to it.
+pub(super) fn verify_privilege_transition(
+    frames: &mut crate::arch_bringup::EarlyFrames,
+    stack_pages: Option<[usize; 2]>, init: &[crate::early_init::Image],
+) -> Result<(), &'static str> {
+    user::verify(frames, stack_pages, init)
 }
 
 /// Bring the machine into the state the rest of the kernel assumes.
@@ -103,24 +128,7 @@ pub extern "C" fn trap_entry() -> ! {
 ///
 /// Must run once, from the boot entry, with interrupts masked.
 pub unsafe fn arch_init() {
-    // Install the exception entry.
-    //
-    // SAFETY: `eentry` is the machine's exception entry; writing it is a
-    // CSR write, and the handler is a `#[unsafe(no_mangle)]` `extern "C"`
-    // function whose ABI matches the exception handler contract.
-    unsafe {
-        core::arch::asm!(
-            "csrwr {0}, 0x8b",
-            in(reg) trap_entry as usize,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
-
-    // Mask interrupts at the source.
-    // SAFETY: `csrwr` with `0x0` (PRMD) and IE=0 writes the pre-mask
-    // interrupt state to the interpreter's privilege register.
-    // No CSR writes are performed until the machine's CSR map is validated;
-    // interrupts are masked by the power-on state.
+    unsafe { loongarch64_install_trap_vectors() };
 }
 
 /// The stack pointer privilege transitions to this CPU use.

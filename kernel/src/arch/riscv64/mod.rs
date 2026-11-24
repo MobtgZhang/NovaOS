@@ -7,21 +7,16 @@
 //!
 //! # Machine bring-up
 //!
-//! The boot sequence, as far as it is implemented today, is:
-//!
-//! 1. `_start` (see [`entry`]) switches onto the kernel stack and clears
-//!    `.bss`; the bootloader then calls [`bring_up`].
-//! 2. `bring_up` programs the console so the banner is visible, installs
-//!    the trap vector (`stvec`) pointing at a handler that reports the trap
-//!    and halts, and hands control back to the kernel facade.
-//!
-//! The kernel's full boot sequence (paging, memory map, SMP, services, the
-//! desktop) is not yet ported; see the module docs in `arch/mod.rs` and the
-//! report for the honest status.
+//! `_start` (see [`entry`]) switches onto the kernel stack and enters the
+//! shared bring-up. [`arch_init`] installs the fatal trap vector and masks
+//! supervisor interrupts. [`verify_privilege_transition`] can then run a
+//! user-mode syscalls and timer preemption in four-level Sv48 address spaces.
 
 pub mod console;
 pub mod entry;
 pub mod exit;
+mod privilege;
+mod user;
 
 pub use console::ConsoleImpl;
 pub use exit::ExitImpl;
@@ -33,7 +28,7 @@ use crate::arch::shared::hw::AddressSpace;
 /// Architecture name used in the boot banner and log tags.
 pub const NAME: &str = "riscv64";
 
-/// RISC-V 64 with Sv48 paging.
+/// Address-space geometry reported for RISC-V `virt` with Sv48 support.
 ///
 /// The `virt` machine (QEMU's `hw/riscv/virt.c`) can run with `sv48`,
 /// giving 56 physical bits and 48 virtual bits; the kernel reports the
@@ -85,8 +80,7 @@ impl InterruptControl for Interrupts {
                 options(nostack, nomem, preserves_flags),
             );
         }
-        // `csrrc` returns the previous value; the SIE bit is what we want.
-        previous & SSTATUS_SIE != 0
+        previous & SSTATUS_SIE == 0
     }
 
     fn restore(&self, was_masked: bool) {
@@ -127,56 +121,69 @@ impl InterruptControl for Interrupts {
     }
 }
 
-/// The exception report a trap prints.
-///
-/// Kept as a plain function rather than inlined into the vector so the
-/// `stvec` handler stays tiny: on RISC-V the trap handler runs on the
-/// trapped stack, and a stack fault inside the handler has nowhere to go.
+/// Report an unexpected trap and park the hart.
 #[unsafe(no_mangle)]
 pub extern "C" fn trap_entry() -> ! {
-    crate::arch::console().send_bytes(b"[NOVA] ERR   | trap\r\n");
-
-    loop {
-        // SAFETY: `wfi` is a hint with no operands or side effects.
-        unsafe { core::arch::asm!("wfi") };
+    let (cause, pc, address): (usize, usize, usize);
+    unsafe {
+        core::arch::asm!(
+            "csrr {cause}, scause",
+            "csrr {pc}, sepc",
+            "csrr {address}, stval",
+            cause = out(reg) cause,
+            pc = out(reg) pc,
+            address = out(reg) address,
+            options(nostack, nomem),
+        );
     }
+    panic!("RISC-V trap at {pc:#x}: scause={cause:#x}, stval={address:#x}");
+}
+
+core::arch::global_asm!(
+    ".pushsection .text.nova_riscv64_fatal_vector, \"ax\", @progbits",
+    ".balign 4",
+    ".global nova_riscv64_fatal_vector",
+    "nova_riscv64_fatal_vector:",
+    "tail {fatal}",
+    ".popsection",
+    fatal = sym trap_entry,
+);
+
+unsafe extern "C" {
+    fn nova_riscv64_fatal_vector();
 }
 
 /// Bring the machine into the state the rest of the kernel assumes.
 ///
-/// The x86-64 backend does a GDT, IDT and interrupt routing pass here; the
-/// RISC-V backend has no segments and no local APIC, so its job is shorter:
-/// install the trap vector and make sure interrupts start masked. The
-/// traps point at [`trap_entry`], which reports and parks the CPU — there
-/// is no exception table yet (no page faults to handle until paging is
-/// ported), and an unexpected trap is a bug, not a recoverable condition.
+/// Keep supervisor interrupts masked at the source and install the direct
+/// fatal vector for supervisor boot code.
 ///
 /// # Safety
 ///
 /// Must run once, from the boot entry, with interrupts masked.
 pub unsafe fn arch_init() {
-    // Install the trap vector with MODE = Direct (the base is already 4-byte
-    // aligned, which is all Direct mode requires).
-    //
-    // SAFETY: `stvec` is the machine's trap vector; writing it is a CSR write,
-    // and the handler it names is a `#[unsafe(no_mangle)]` extern "C" function
-    // whose ABI matches the trap handler contract.
+    // SAFETY: Boot runs in S-mode on the kernel stack. The assembly vector
+    // is four-byte aligned for direct mode and tails into the fatal handler.
     unsafe {
         core::arch::asm!(
-            "csrw stvec, {0}",
-            in(reg) trap_entry as usize,
+            "csrc sstatus, {sie_bit}",
+            "csrw sie, zero",
+            "csrw stvec, {vector}",
+            sie_bit = in(reg) SSTATUS_SIE,
+            vector = in(reg) nova_riscv64_fatal_vector as *const (),
             options(nostack, nomem, preserves_flags),
         );
     }
+}
 
-    // Disable all interrupts at the source.
-    // SAFETY: `csrci` clears the bits named in its immediate; `0x9` covers
-    // every meaningful SIE bit (SSIE/STIE/SEIE at 1,3,5 and the reserved
-    // low bits at 0,2,4,6). The reserved bits are cleared alongside, which
-    // is what a full mask means.
-    unsafe {
-        core::arch::asm!("csrci sie, 0x9", options(nostack, nomem, preserves_flags),);
-    }
+/// Exercise U-mode syscalls, timer preemption and context resume on QEMU `virt`.
+///
+/// Run after [`arch_init`] on the boot stack with paging disabled.
+pub(super) fn verify_privilege_transition(
+    frames: &mut crate::arch_bringup::EarlyFrames,
+    stack_pages: Option<[usize; 2]>, init: &[crate::early_init::Image],
+) -> Result<(), &'static str> {
+    privilege::verify(frames, stack_pages, init)
 }
 
 /// The stack pointer privilege transitions to this CPU use.

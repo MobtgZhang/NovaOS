@@ -1,27 +1,26 @@
-//! LoongArch 64 exit: park the CPU forever.
-//!
-//! The `virt` machine has no `isa-debug-exit` device and no SBI, and a bare
-//! `-kernel` boot gives the kernel no firmware call that means "terminate
-//! the machine". The honest answer to "the run is over" is to stop
-//! executing new work and wait; the test harness terminates the emulator
-//! and treats the log's `[NOVA-TEST] RESULT` line as the source of truth.
+//! QEMU virt powers off through the ACPI GED after a successful test.
+//! The serial result remains authoritative. The GED cannot encode failure
+//! statuses, so failures park for the harness to collect the diagnostic.
 #![allow(dead_code)]
 
-use crate::arch::shared::exit::MachineExit;
+use crate::arch::shared::exit::{EXIT_SUCCESS, MachineExit};
+
+const GED_SLEEP_CONTROL: *mut u8 = 0x100e_001c as *mut u8;
+const GED_REQUEST_S5: u8 = (5 << 2) | (1 << 5);
 
 /// Terminate the machine, or park it forever if there is no better way.
 ///
 /// # Safety
 ///
-/// Only appropriate once the run is over. The `idle` loop is a hint; the
-/// machine cannot reach any further work from here, so the harness owns
-/// termination.
+/// The boot probe restores the QEMU virt direct address space before exit.
 pub struct ExitImpl;
 
 impl MachineExit for ExitImpl {
-    unsafe fn exit(_status: u32) -> ! {
+    unsafe fn exit(status: u32) -> ! {
+        if status == EXIT_SUCCESS {
+            unsafe { GED_SLEEP_CONTROL.write_volatile(GED_REQUEST_S5) };
+        }
         loop {
-            // SAFETY: `idle 0` is a hint with no operands or side effects.
             unsafe { core::arch::asm!("idle 0", options(nostack, nomem, preserves_flags)) };
         }
     }
