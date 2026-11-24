@@ -275,6 +275,13 @@ name = "nova-net"
 version = "0.1.0"
 
 [[package]]
+name = "nova-port-init"
+version = "0.1.0"
+dependencies = [
+ "nova-abi",
+]
+
+[[package]]
 name = "nova-protocols"
 version = "0.1.0"
 dependencies = [

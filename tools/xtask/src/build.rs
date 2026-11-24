@@ -114,6 +114,8 @@ fn build_applications(profile: &str) -> Result<(), String> {
             "build".to_string(),
             "--package".to_string(),
             APP_PACKAGE.to_string(),
+            "--package".to_string(),
+            "nova-port-init".to_string(),
             "--target".to_string(),
             KERNEL_TARGET.to_string(),
             "--profile".to_string(),

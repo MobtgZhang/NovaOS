@@ -49,6 +49,7 @@ members = [
     "crates/nova-desktop-server",
     "tools/xtask",
     "user/nova-rt",
+    "user/port-init",
     "user/apps",
 ]
 

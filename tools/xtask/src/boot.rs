@@ -61,37 +61,38 @@ pub const APP_NAMES: &[&str] = &[
     "file-manager",
     "widgets-demo",
     "desktop-shell",
+    "nova-port-init",
 ];
 
 /// Build a bounded `NOVAFS1` archive from named ELF files.
 pub fn build_initramfs(directory: &Path) -> Result<Vec<u8>, String> {
+    let mut archive = Vec::new();
+    for name in APP_NAMES {
+        append_initramfs_file(&mut archive, name, &directory.join(name))?;
+    }
+    Ok(archive)
+}
+
+pub fn append_initramfs_file(archive: &mut Vec<u8>, name: &str, path: &Path) -> Result<(), String> {
     const HEADER_SIZE: usize = 64;
     const NAME_LIMIT: usize = 31;
     const MAX_FILES: usize = 16;
+    const _: () = assert!(APP_NAMES.len() <= MAX_FILES);
 
-    if APP_NAMES.len() > MAX_FILES {
-        return Err(format!("too many initramfs entries: {}", APP_NAMES.len()));
+    if name.is_empty() || name.len() > NAME_LIMIT || name.as_bytes().contains(&0) {
+        return Err(format!("invalid initramfs entry name {name:?}"));
     }
-
-    let mut archive = Vec::new();
-    for name in APP_NAMES {
-        let path = directory.join(name);
-        let data = fs::read(&path)
-            .map_err(|error| format!("cannot read app {}: {error}", path.display()))?;
-        if name.len() > NAME_LIMIT {
-            return Err(format!("app name {name:?} exceeds the initramfs limit"));
-        }
-        let size = u64::try_from(data.len())
-            .map_err(|_| format!("app {name:?} is too large for the initramfs"))?;
-
-        let mut header = [0u8; HEADER_SIZE];
-        header[..8].copy_from_slice(b"NOVAFS1\0");
-        header[8..8 + name.len()].copy_from_slice(name.as_bytes());
-        header[40..48].copy_from_slice(&size.to_le_bytes());
-        archive.extend_from_slice(&header);
-        archive.extend_from_slice(&data);
-    }
-    Ok(archive)
+    let data = fs::read(path)
+        .map_err(|error| format!("cannot read app {}: {error}", path.display()))?;
+    let size = u64::try_from(data.len())
+        .map_err(|_| format!("app {name:?} is too large for the initramfs"))?;
+    let mut header = [0u8; HEADER_SIZE];
+    header[..8].copy_from_slice(b"NOVAFS1\0");
+    header[8..8 + name.len()].copy_from_slice(name.as_bytes());
+    header[40..48].copy_from_slice(&size.to_le_bytes());
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(&data);
+    Ok(())
 }
 
 /// The ESP directory name for the boot manager.
