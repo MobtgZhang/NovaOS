@@ -164,6 +164,8 @@ pub struct VirtioBlk {
     flush_supported: bool,
 }
 
+unsafe impl Send for VirtioBlk {}
+
 impl VirtioBlk {
     /// Take over a block device: negotiate, allocate the queue, and go live.
     pub fn open(device: &pci::Device) -> Result<Self, BlockError> {

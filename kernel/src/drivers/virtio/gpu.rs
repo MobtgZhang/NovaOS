@@ -211,6 +211,8 @@ pub struct VirtioGpu {
 /// `virt` machine can realistically ask for, including 3840x2160.
 const MAX_BACKING_PAGES: usize = 16384;
 
+unsafe impl Send for VirtioGpu {}
+
 impl VirtioGpu {
     /// Find the GPU, negotiate, create the scanout, and claim the
     /// mode. Returns the driver ready to [`VirtioGpu::flush`].

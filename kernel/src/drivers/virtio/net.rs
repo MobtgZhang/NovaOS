@@ -291,6 +291,8 @@ pub struct VirtioNet {
     msix: bool,
 }
 
+unsafe impl Send for VirtioNet {}
+
 impl VirtioNet {
     /// Take over a network device: negotiate, allocate both queues, and go live.
     pub fn open(device: &pci::Device) -> Result<Self, NetError> {
@@ -1360,11 +1362,18 @@ impl VirtioNet {
             if destination_port != 0 && datagram.destination_port != destination_port {
                 continue;
             }
-            if datagram.payload.len() > out.len() {
-                return Err(NetError::BufferSmall);
-            }
-            out[..datagram.payload.len()].copy_from_slice(datagram.payload);
-            return Ok(datagram.payload.len());
+            // A datagram wider than the caller's buffer delivers its first
+            // `out.len()` bytes — POSIX `recv` semantics — rather than being
+            // refused. The refusal was the old behaviour, and it is strictly
+            // worse: the poll has already consumed the datagram from the
+            // receive ring, so an error loses the whole payload, while the
+            // truncation keeps its leading bytes. A DNS answer that grew past
+            // the inline budget on the host side is exactly the case the
+            // refusal turned from "extra records dropped" into "no reply at
+            // all".
+            let copied = datagram.payload.len().min(out.len());
+            out[..copied].copy_from_slice(&datagram.payload[..copied]);
+            return Ok(copied);
         }
         Err(NetError::Timeout)
     }

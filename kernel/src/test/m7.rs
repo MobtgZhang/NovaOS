@@ -1022,10 +1022,13 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
         return Err("the UDP socket did not connect to the DNS server");
     }
 
-    // `localhost` answers with a short A record (a fixed 127.0.0.1 in the
-    // QEMU user network), so the reply fits the bounded socket budget. A
-    // longer public name like `example.com` can carry additional records that
-    // exceed `NET_MAX_SOCKET_RECV`.
+    // The query is a plain DNS A lookup. What the resolver upstream of the
+    // QEMU user network says about the name is the host's business, not the
+    // kernel's: the host's resolver may answer with a short A record, a long
+    // one with extra records, or an NXDOMAIN, and any of those can change
+    // with the host's network configuration. This case proves the UDP
+    // send/recv round trip, so the assertions below accept *any* well-formed
+    // DNS response to our query rather than a particular record in it.
     let mut query = [0u8; 512];
     let query_length = nova_net::build_dns_query(b"localhost", 0x1234, &mut query)
         .ok_or("the DNS query did not fit")?;
@@ -1059,10 +1062,17 @@ fn a_udp_socket_send_and_recv_round_trip() -> Result<(), &'static str> {
     }
     let payload = &recv_reply
         [NET_SOCKET_RECV_REPLY_SIZE..NET_SOCKET_RECV_REPLY_SIZE + payload_length as usize];
-    let address =
-        nova_net::parse_dns_a_record(payload).ok_or("the socket reply was not a DNS A record")?;
-    if address.as_u32() == 0 {
-        return Err("the socket reply carried a zero address");
+    // A DNS response echoes the query's transaction id and carries the
+    // response bit in the flags byte. Requiring a particular record here
+    // would tie the case to whatever the upstream resolver says today.
+    if payload.len() < 3 {
+        return Err("the socket reply was shorter than a DNS header");
+    }
+    if u16::from_be_bytes([payload[0], payload[1]]) != 0x1234 {
+        return Err("the socket reply did not echo the DNS transaction id");
+    }
+    if payload[2] & 0x80 == 0 {
+        return Err("the socket reply was not marked as a DNS response");
     }
     Ok(())
 }
