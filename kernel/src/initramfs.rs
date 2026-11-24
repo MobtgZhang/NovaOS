@@ -43,6 +43,9 @@ impl Archive {
 
         while offset + HEADER_SIZE <= bytes.len() {
             let header = &bytes[offset..offset + HEADER_SIZE];
+            if &header[..8] != MAGIC {
+                return Err("bad-initramfs-magic");
+            }
             let name_end = header[8..40]
                 .iter()
                 .position(|byte| *byte == 0)

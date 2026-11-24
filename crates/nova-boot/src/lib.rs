@@ -35,6 +35,9 @@ pub mod menu_config;
 /// Page-layout math shared by the boot manager and the kernel.
 pub mod layout;
 
+/// Memory discovery from a flattened device tree.
+pub mod fdt;
+
 /// The protocol's four-byte magic.
 pub const MAGIC: [u8; 4] = *b"NVBP";
 

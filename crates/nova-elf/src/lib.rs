@@ -46,9 +46,19 @@ pub const ET_DYN: u16 = 3;
 
 /// `e_machine`: x86-64.
 pub const EM_X86_64: u16 = 62;
+/// `e_machine`: AArch64.
+pub const EM_AARCH64: u16 = 183;
+/// `e_machine`: RISC-V.
+pub const EM_RISCV: u16 = 243;
+/// `e_machine`: LoongArch.
+pub const EM_LOONGARCH: u16 = 258;
 
 /// `p_type`: a segment loaded into memory.
 pub const PT_LOAD: u32 = 1;
+/// `p_type`: dynamic linking information.
+pub const PT_DYNAMIC: u32 = 2;
+/// `p_type`: the path to the program interpreter.
+pub const PT_INTERP: u32 = 3;
 
 /// `p_flags`: executable.
 pub const PF_X: u32 = 1;
@@ -279,6 +289,11 @@ impl<'a> Elf<'a> {
     /// file are all distinguished, because the kernel's log is the only place
     /// that information exists.
     pub fn parse(data: &'a [u8]) -> Result<Self, ElfError> {
+        Self::parse_for_machine(data, EM_X86_64)
+    }
+
+    /// Parse an ELF64 image for the caller's expected ELF machine identifier.
+    pub fn parse_for_machine(data: &'a [u8], machine: u16) -> Result<Self, ElfError> {
         if data.len() < ELF_HEADER_SIZE {
             return Err(ElfError::TruncatedHeader);
         }
@@ -323,7 +338,7 @@ impl<'a> Elf<'a> {
             return Err(ElfError::UnsupportedType);
         }
 
-        if e_machine != EM_X86_64 {
+        if e_machine != machine {
             return Err(ElfError::WrongMachine);
         }
 
