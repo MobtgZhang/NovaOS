@@ -19,7 +19,7 @@ pub extern "C" fn main() -> i64 {
     }
 
     loop {
-        let Some((_opcode, payload, _caps)) = ipc::recv(endpoint) else {
+        let Some((_opcode, payload, token)) = ipc::recv(endpoint) else {
             continue;
         };
         let text = payload
@@ -28,6 +28,8 @@ pub extern "C" fn main() -> i64 {
             .take_while(|byte| *byte != 0)
             .count();
         let _ = console::write_bytes(&payload[..text]);
-        let _ = ipc::reply(endpoint, 0, b"ok");
+        if let Some(token) = token {
+            let _ = ipc::reply(endpoint, token, b"ok");
+        }
     }
 }

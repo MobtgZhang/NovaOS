@@ -18,6 +18,7 @@ pub mod direct_map;
 pub mod frame;
 pub mod heap;
 pub mod page_table;
+pub mod percpu;
 
 use core::cell::UnsafeCell;
 

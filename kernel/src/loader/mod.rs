@@ -218,10 +218,7 @@ fn map_segment(
         let frame_index = allocate_frame()?;
         let phys = frame_index as u64 * page_size;
 
-        address_space::map(space, virt, phys, protection).map_err(|error| match error {
-            nova_core::address_space::VmmError::OutOfMemory => LoadError::OutOfMemory,
-            _ => LoadError::TableWalkFailed,
-        })?;
+        map_owned_frame(space, virt, frame_index, protection)?;
 
         // Zero the frame first. A segment's tail page is only partly covered
         // by the file's contents, and the rest must read as zero rather than
@@ -277,14 +274,7 @@ fn map_user_stack(space: &AddressSpace, _boot_info: &'static BootInfo) -> Result
     let mut virt = stack_base;
     while virt < stack_top {
         let frame_index = allocate_frame()?;
-        let phys = frame_index as u64 * page_size;
-
-        address_space::map(space, virt, phys, Protection::UserReadWrite).map_err(|error| {
-            match error {
-                nova_core::address_space::VmmError::OutOfMemory => LoadError::OutOfMemory,
-                _ => LoadError::TableWalkFailed,
-            }
-        })?;
+        map_owned_frame(space, virt, frame_index, Protection::UserReadWrite)?;
 
         zero_frame(frame_index, page_size);
 
@@ -294,11 +284,22 @@ fn map_user_stack(space: &AddressSpace, _boot_info: &'static BootInfo) -> Result
     Ok(stack_top)
 }
 
+fn map_owned_frame(
+    space: &AddressSpace, virt: u64, frame: usize, protection: Protection,
+) -> Result<(), LoadError> {
+    let phys = frame as u64 * ADDRESS_SPACE.page_size;
+    address_space::map(space, virt, phys, protection).map_err(|error| {
+        unsafe { crate::mm::frame_allocator().dealloc(frame) };
+        match error {
+            nova_core::address_space::VmmError::OutOfMemory => LoadError::OutOfMemory,
+            _ => LoadError::TableWalkFailed,
+        }
+    })
+}
+
 /// Allocate one physical frame.
 fn allocate_frame() -> Result<usize, LoadError> {
-    // SAFETY: the allocator is installed by `mm::init` before any loader runs,
-    // and the kernel's single-CPU discipline means no other allocation is in
-    // flight.
+    // SAFETY: the allocator is installed by `mm::init` before any loader runs.
     let allocator = unsafe { crate::mm::frame_allocator() };
     allocator.alloc().map_err(|_| LoadError::OutOfMemory)
 }
@@ -329,41 +330,6 @@ pub fn is_mapped(space: &AddressSpace, virt: u64) -> bool {
 /// The physical frame mapped at `virt` in `space`, if any.
 pub fn translate(space: &AddressSpace, virt: u64) -> Option<u64> {
     page_table::translate(&space.pml4(), virt)
-}
-
-/// Free the frames a loaded image occupies.
-///
-/// # Safety
-///
-/// Must only be called for an address space that is being torn down, and the
-/// caller must not use the space afterwards.
-pub unsafe fn unload(space: &AddressSpace, image: &[u8]) {
-    let Ok(elf) = Elf::parse(image) else {
-        return;
-    };
-
-    let page_size = ADDRESS_SPACE.page_size;
-
-    for segment in elf.loadable_segments() {
-        let base = segment.p_vaddr & !(page_size - 1);
-        let end = segment.vaddr_end();
-        let last = (end - 1) & !(page_size - 1);
-
-        let mut virt = base;
-        while virt <= last {
-            if let Some(phys) = translate(space, virt) {
-                let _ = address_space::unmap(space, virt);
-                // SAFETY: the frame was allocated by this loader for this
-                // space and is being torn down, so it is not referenced
-                // anywhere else.
-                unsafe {
-                    let allocator = crate::mm::frame_allocator();
-                    allocator.dealloc((phys / page_size) as usize);
-                }
-            }
-            virt += page_size;
-        }
-    }
 }
 
 /// Report the loader's view of the image, for the boot log.

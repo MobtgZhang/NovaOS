@@ -86,9 +86,7 @@ const DMA_FRAME_LIMIT: usize = 0x10_0000;
 /// The bitmap sits behind a [`SpinLock`]: two processors can allocate frames
 /// at overlapping times once user threads run on application processors, and
 /// the hint-then-rescan sequence only stays correct if the whole of it is
-/// serialized. The lock is the same recursive, interrupt-safe one the service
-/// layer uses, so a dispatch path that allocates while already holding a
-/// kernel lock re-enters rather than deadlocks.
+/// serialized. The lock masks local interrupts and cannot be re-entered.
 ///
 /// # Reserved floor
 ///

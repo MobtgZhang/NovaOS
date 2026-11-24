@@ -34,6 +34,8 @@ use crate::arch::ADDRESS_SPACE;
 use crate::arch::x86_64::paging::{
     ENTRIES_PER_TABLE, PageFlags, decode_entry, encode_entry, entry_flags, entry_is_present,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::mm::direct_map;
 use nova_core::address_space::VmmError;
 
@@ -49,6 +51,8 @@ use nova_core::address_space::VmmError;
 /// one is defined only in the presence of `NXE`. Folding it in would make every
 /// `from_bits` call reject a perfectly good entry.
 pub const NO_EXECUTE: u64 = 1 << 63;
+
+static MUTATION: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
 
 /// A page table occupying exactly one physical frame.
 ///
@@ -80,8 +84,8 @@ impl PageTable {
     /// space the kernel installs — which is exactly the property the kernel
     /// needs when it edits one process's tables while another address space is
     /// loaded.
-    fn entries(&self) -> *mut u64 {
-        direct_map::phys_to_virt(self.phys).cast::<u64>()
+    fn entries(&self) -> *mut AtomicU64 {
+        direct_map::phys_to_virt(self.phys).cast::<AtomicU64>()
     }
 
     /// Read entry `index`.
@@ -95,7 +99,7 @@ impl PageTable {
         }
         // SAFETY: `entries` points at `ENTRIES_PER_TABLE` eight-byte slots in
         // the direct map, and `index` was just checked to be within them.
-        unsafe { *self.entries().add(index) }
+        unsafe { (*self.entries().add(index)).load(Ordering::Acquire) }
     }
 
     /// Write entry `index`.
@@ -107,7 +111,7 @@ impl PageTable {
             return;
         }
         // SAFETY: as `read`.
-        unsafe { *self.entries().add(index) = value };
+        unsafe { (*self.entries().add(index)).store(value, Ordering::Release) };
     }
 
     /// Whether entry `index` is present.
@@ -138,10 +142,9 @@ impl PageTable {
 /// [`VmmError::OutOfMemory`] when the frame allocator is exhausted.
 pub fn allocate_table() -> Result<PageTable, VmmError> {
     // SAFETY: `mm::init` has run by the time any address space exists, and the
-    // allocator is single-CPU with interrupts masked during construction.
-    let allocator = unsafe { crate::mm::frame_allocator() };
-
-    let frame = allocator.alloc().map_err(|_| VmmError::OutOfMemory)?;
+    // per-CPU cache layer is read-only after boot.
+    let frame =
+        unsafe { crate::mm::percpu::alloc_frame_fast() }.map_err(|_| VmmError::OutOfMemory)?;
     let phys = (frame as u64) * ADDRESS_SPACE.page_size;
 
     // A table must start out empty. The allocator hands back recycled frames
@@ -160,6 +163,40 @@ pub fn allocate_table() -> Result<PageTable, VmmError> {
     }
 
     Ok(PageTable::at(phys))
+}
+
+/// Release an inactive process root, its private tables, and their owned leaves.
+///
+/// # Safety
+/// No CPU or kernel operation may still use `root`. Its lower half may only
+/// contain uniquely owned 4 KiB user frames; all shared aliases must be gone.
+pub(crate) unsafe fn release_process_root(root: PageTable) -> usize {
+    fn release(table: PageTable, entries: usize, levels: usize) -> usize {
+        let allocator = unsafe { crate::mm::frame_allocator() };
+        let mut reclaimed = 1;
+        for index in 0..entries {
+            let entry = table.read(index);
+            if !entry_is_present(entry) {
+                continue;
+            }
+            let phys = decode_entry(entry);
+            let flags = entry_flags(entry);
+            if levels == 1 {
+                assert!(flags.contains(PageFlags::USER) && !flags.contains(PageFlags::GLOBAL));
+                unsafe { allocator.dealloc((phys / ADDRESS_SPACE.page_size) as usize) };
+                reclaimed += 1;
+            } else {
+                assert!(!flags.contains(PageFlags::HUGE));
+                reclaimed += release(PageTable::at(phys), ENTRIES_PER_TABLE, levels - 1);
+            }
+        }
+        unsafe { allocator.dealloc((table.phys() / ADDRESS_SPACE.page_size) as usize) };
+        reclaimed
+    }
+
+    assert_ne!(root.phys(), crate::arch::x86_64::paging::current_page_directory());
+    assert_ne!(root.phys(), super::address_space::kernel_space().pml4_phys());
+    release(root, super::address_space::KERNEL_HALF_FIRST_ENTRY, 4)
 }
 
 /// The flags an intermediate (non-leaf) entry needs.
@@ -250,7 +287,7 @@ fn leaf_physical(entry: u64, virt: u64, size: u64) -> u64 {
 /// directory leaf at the third. The returned [`Leaf`]'s `size` field tells the
 /// caller which level it stopped at, and every write through the leaf goes to
 /// that entry rather than to a fourth-level entry that does not exist.
-fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmError> {
+fn walk_to_leaf(root: &PageTable, address: u64, create: Option<bool>) -> Result<Leaf, VmmError> {
     let mut table = *root;
 
     for (level, size) in [
@@ -278,6 +315,7 @@ fn walk_to_leaf(root: &PageTable, address: u64, user: bool) -> Result<Leaf, VmmE
         let child = match table.target(index) {
             Some(phys) => PageTable::at(phys),
             None => {
+                let user = create.ok_or(VmmError::NotMapped)?;
                 let child = allocate_table()?;
                 let mut flags = if user {
                     INTERMEDIATE_FLAGS.union(PageFlags::USER)
@@ -336,7 +374,8 @@ pub fn map(
     flags: PageFlags,
     no_execute: bool,
 ) -> Result<(), VmmError> {
-    let leaf = walk_to_leaf(root, virt, flags.contains(PageFlags::USER))?;
+    let _mutation = MUTATION.lock();
+    let leaf = walk_to_leaf(root, virt, Some(flags.contains(PageFlags::USER)))?;
 
     if leaf.size != P1_PAGE_BYTES {
         let entry = leaf.table.read(leaf.index);
@@ -351,6 +390,15 @@ pub fn map(
         entry |= NO_EXECUTE;
     }
 
+    let previous = leaf.table.read(leaf.index);
+    if entry_is_present(previous) {
+        let hardware_bits = PageFlags::ACCESSED.union(PageFlags::DIRTY).bits();
+        return if (previous ^ entry) & !hardware_bits == 0 {
+            Ok(())
+        } else {
+            Err(VmmError::AlreadyMapped)
+        };
+    }
     leaf.table.write(leaf.index, entry);
 
     Ok(())
@@ -375,6 +423,7 @@ fn map_huge(
     flags: PageFlags,
     no_execute: bool,
 ) -> Result<(), VmmError> {
+    let _mutation = MUTATION.lock();
     // The tables *above* the leaf level: the PML4 for a 1 GiB leaf, and the
     // PML4 plus the directory-pointer table for a 2 MiB one.
     let above: &[WalkLevel] = if size == P3_PAGE_BYTES {
@@ -482,21 +531,24 @@ pub fn map_range(
 /// # Errors
 ///
 /// [`VmmError::NotMapped`] when the address has no leaf entry.
-pub fn unmap(root: &PageTable, virt: u64) -> Result<(), VmmError> {
-    let leaf = walk_to_leaf(root, virt, false)?;
+pub fn unmap(root: &PageTable, virt: u64) -> Result<u64, VmmError> {
+    let _mutation = MUTATION.lock();
+    let leaf = walk_to_leaf(root, virt, None)?;
+    if leaf.size != P1_PAGE_BYTES {
+        return Err(VmmError::ProtectionNotAllowed);
+    }
 
-    if !leaf.table.is_present(leaf.index) {
+    let entry = unsafe { &*leaf.table.entries().add(leaf.index) }.swap(0, Ordering::AcqRel);
+    if !entry_is_present(entry) {
         return Err(VmmError::NotMapped);
     }
 
-    leaf.table.write(leaf.index, 0);
-
-    Ok(())
+    Ok(decode_entry(entry))
 }
 
 /// The raw leaf entry for `virt`, if the walk reaches one.
 pub fn leaf_entry(root: &PageTable, virt: u64) -> Option<u64> {
-    let leaf = walk_to_leaf(root, virt, false).ok()?;
+    let leaf = walk_to_leaf(root, virt, None).ok()?;
     if leaf.table.is_present(leaf.index) {
         Some(leaf.table.read(leaf.index))
     } else {
@@ -504,21 +556,28 @@ pub fn leaf_entry(root: &PageTable, virt: u64) -> Option<u64> {
     }
 }
 
-/// Overwrite the raw leaf entry for `virt`.
-///
-/// # Errors
-///
-/// [`VmmError::NotMapped`] when the walk reaches no leaf entry.
-pub fn write_leaf(root: &PageTable, virt: u64, entry: u64) -> Result<(), VmmError> {
-    let leaf = walk_to_leaf(root, virt, false)?;
-
-    if !leaf.table.is_present(leaf.index) {
-        return Err(VmmError::NotMapped);
+pub fn set_leaf_writable(root: &PageTable, virt: u64, writable: bool) -> Result<bool, VmmError> {
+    let _mutation = MUTATION.lock();
+    let leaf = walk_to_leaf(root, virt, None)?;
+    if leaf.size != P1_PAGE_BYTES {
+        return Err(VmmError::ProtectionNotAllowed);
     }
 
-    leaf.table.write(leaf.index, entry);
-
-    Ok(())
+    let entry = unsafe { &*leaf.table.entries().add(leaf.index) };
+    let previous = entry.load(Ordering::Acquire);
+    if !entry_is_present(previous) {
+        return Err(VmmError::NotMapped);
+    }
+    if writable && entry_flags(previous).contains(PageFlags::USER) && previous & NO_EXECUTE == 0 {
+        return Err(VmmError::ProtectionNotAllowed);
+    }
+    let bit = PageFlags::WRITABLE.bits();
+    if writable {
+        entry.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        entry.fetch_and(!bit, Ordering::AcqRel);
+    }
+    Ok((previous & bit != 0) != writable)
 }
 
 /// The physical address of `virt`, if it is mapped.
@@ -571,6 +630,14 @@ pub fn translate(root: &PageTable, virt: u64) -> Option<u64> {
 /// Process spaces share the kernel half with ring 0, so a plain translation can
 /// resolve a supervisor page. User-pointer copies must not use that result.
 pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
+    translate_user_access(root, virt, PageFlags::USER)
+}
+
+pub(crate) fn translate_user_write(root: &PageTable, virt: u64) -> Option<u64> {
+    translate_user_access(root, virt, PageFlags::USER.union(PageFlags::WRITABLE))
+}
+
+fn translate_user_access(root: &PageTable, virt: u64, required: PageFlags) -> Option<u64> {
     let mut table = *root;
 
     for (level, size) in [
@@ -580,7 +647,7 @@ pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
     ] {
         let index = level.index_of(virt);
         let entry = table.read(index);
-        if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
+        if !entry_is_present(entry) || !entry_flags(entry).contains(required) {
             return None;
         }
         // A huge leaf in a user space would make the descent below read the
@@ -596,7 +663,7 @@ pub fn translate_user(root: &PageTable, virt: u64) -> Option<u64> {
 
     let index = WalkLevel::Pt.index_of(virt);
     let entry = table.read(index);
-    if !entry_is_present(entry) || !entry_flags(entry).contains(PageFlags::USER) {
+    if !entry_is_present(entry) || !entry_flags(entry).contains(required) {
         return None;
     }
     // Exact address, not frame base — the contract [`translate`] documents

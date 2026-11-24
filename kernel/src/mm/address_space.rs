@@ -44,7 +44,7 @@ use crate::arch::x86_64::paging::{
 use crate::boot::BootInfo;
 use crate::klog;
 use crate::logger::Level;
-use crate::mm::page_table::{self, NO_EXECUTE, PageTable};
+use crate::mm::page_table::{self, PageTable};
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -374,6 +374,10 @@ pub fn map(
     phys: u64,
     protection: Protection,
 ) -> Result<(), VmmError> {
+    check_leaf_address(virt)?;
+    if phys & (ADDRESS_SPACE.page_size - 1) != 0 {
+        return Err(VmmError::UnalignedPhysical);
+    }
     let window = user_window();
 
     if protection.is_user() {
@@ -388,18 +392,50 @@ pub fn map(
     }
 
     let flags = protection.page_flags();
-    let no_execute = false;
+    let no_execute = !protection.is_executable();
 
     page_table::map(&space.pml4(), virt, phys, flags, no_execute)
 }
 
-/// Unmap `virt` from `space`.
+/// Unmap a 4 KiB leaf and return its physical frame after TLB invalidation.
 ///
 /// # Errors
 ///
 /// [`VmmError::NotMapped`] when the address has no leaf entry.
-pub fn unmap(space: &AddressSpace, virt: u64) -> Result<(), VmmError> {
-    page_table::unmap(&space.pml4(), virt)
+pub fn unmap(space: &AddressSpace, virt: u64) -> Result<u64, VmmError> {
+    check_leaf_address(virt)?;
+    let frame = page_table::unmap(&space.pml4(), virt)?;
+    crate::arch::x86_64::tlb::invalidate(virt);
+    Ok(frame)
+}
+
+static USER_ACCESS: crate::sync::SpinLock<()> = crate::sync::SpinLock::new(());
+
+pub(crate) fn user_access() -> crate::sync::SpinLockGuard<'static, ()> {
+    USER_ACCESS.lock()
+}
+
+pub(crate) fn revoke_user_range(space: &AddressSpace, start: u64, length: u64, base: u64) {
+    if length == 0 {
+        return;
+    }
+    let root = space.pml4();
+    let window = user_window();
+    assert!(start >= window.start && start + length <= window.end);
+    for offset in (0..length).step_by(ADDRESS_SPACE.page_size as usize) {
+        assert_eq!(page_table::unmap(&root, start + offset), Ok(base + offset));
+    }
+    crate::arch::x86_64::tlb::flush_user();
+}
+
+fn check_leaf_address(virt: u64) -> Result<(), VmmError> {
+    if !crate::arch::x86_64::paging::is_canonical(virt) {
+        return Err(VmmError::NonCanonical);
+    }
+    if virt & (ADDRESS_SPACE.page_size - 1) != 0 {
+        return Err(VmmError::UnalignedVirtual);
+    }
+    Ok(())
 }
 
 /// The physical frame mapped at `virt` in `space`, if any.
@@ -410,6 +446,10 @@ pub fn translate(space: &AddressSpace, virt: u64) -> Option<u64> {
 /// Translate a user-owned page, refusing the shared kernel half.
 pub fn translate_user(space: &AddressSpace, virt: u64) -> Option<u64> {
     page_table::translate_user(&space.pml4(), virt)
+}
+
+pub(crate) fn translate_user_write(space: &AddressSpace, virt: u64) -> Option<u64> {
+    page_table::translate_user_write(&space.pml4(), virt)
 }
 
 pub fn map_kernel_mmio(virt: u64, phys: u64) -> Result<(), VmmError> {
@@ -434,11 +474,6 @@ pub unsafe fn activate(space: &AddressSpace) {
     unsafe {
         crate::arch::x86_64::paging::load_page_directory(space.pml4_phys());
     }
-    // Invalidate all TLB entries and flush caches after loading a new page
-    // directory, so every CPU sees consistent page-table contents. Without
-    // this an application processor can walk stale entries cached from a
-    // previous address space.
-    unsafe { core::arch::asm!("wbinvd", options(nostack)) };
 }
 
 /// Whether the address space at `pml4_phys` has the kernel half mapped.
@@ -488,18 +523,9 @@ pub fn kernel_half_entry_count(pml4_phys: u64) -> usize {
 ///
 /// [`VmmError::NotMapped`] when the address is not mapped.
 pub fn set_writable(space: &AddressSpace, virt: u64, writable: bool) -> Result<(), VmmError> {
-    let leaf = page_table::leaf_entry(&space.pml4(), virt).ok_or(VmmError::NotMapped)?;
-
-    let mut flags =
-        PageFlags::from_bits(leaf & PageFlags::RESERVED_MASK.bits()).unwrap_or(PageFlags::NONE);
-    if writable {
-        flags = flags.union(PageFlags::WRITABLE);
-    } else {
-        flags = flags.without(PageFlags::WRITABLE);
+    check_leaf_address(virt)?;
+    if page_table::set_leaf_writable(&space.pml4(), virt, writable)? {
+        crate::arch::x86_64::tlb::invalidate(virt);
     }
-
-    let entry = encode_entry(decode_entry(leaf), flags) | (leaf & NO_EXECUTE);
-    page_table::write_leaf(&space.pml4(), virt, entry);
-
     Ok(())
 }

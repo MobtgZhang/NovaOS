@@ -307,10 +307,20 @@ pub unsafe fn exit_current_thread_for_cpu(cpu: usize) {
         let mut thread = thread;
         thread.state = ThreadState::Exited;
         thread.exit_status = task::take_exit_status();
+        let reclaimed = if core::mem::take(&mut thread.owns_image) {
+            let _access = address_space::user_access();
+            let old_space = thread.space;
+            thread.space = address_space::kernel_space();
+            address_space::activate(&thread.space);
+            crate::mm::page_table::release_process_root(old_space.pml4())
+        } else {
+            0
+        };
         task::update_thread_for_cpu(cpu, slot, thread);
 
         // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
         let _ = state_for_cpu(cpu).scheduler.exit(thread.id);
+        crate::test::harness::record_user_exit(&thread, reclaimed);
     }
 }
 
@@ -323,9 +333,9 @@ pub unsafe fn exit_current_thread_for_cpu(cpu: usize) {
 /// thread. The faulting CPU is the one whose scheduler state is updated: a
 /// user thread is owned by the CPU that resumed it, which is not necessarily
 /// the bootstrap processor.
-pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
+pub unsafe fn fault_current_user_and_switch(fault_address: u64, fault_code: u64) -> ! {
     let cpu = crate::task::current_cpu();
-    unsafe { fault_current_user_and_switch_for_cpu(cpu, fault_address) }
+    unsafe { fault_current_user_and_switch_for_cpu(cpu, fault_address, fault_code) }
 }
 
 /// Kill the current user thread on one CPU after an unhandled ring-3 fault.
@@ -335,7 +345,7 @@ pub unsafe fn fault_current_user_and_switch(fault_address: u64) -> ! {
 /// Must only be called on that CPU from the exception dispatch path, with
 /// interrupts masked, while the faulting user thread is still the scheduler's
 /// current thread.
-pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u64) -> ! {
+pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u64, fault_code: u64) -> ! {
     // SAFETY: exception entry masks interrupts and this is the scheduler path.
     unsafe {
         let Some(slot) = state_for_cpu(cpu).current_slot else {
@@ -349,6 +359,7 @@ pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u
         };
 
         thread.fault_address = fault_address;
+        thread.fault_code = fault_code;
         task::update_thread_for_cpu(cpu, slot, thread);
         klog!(
             Level::Info,
@@ -360,8 +371,9 @@ pub unsafe fn fault_current_user_and_switch_for_cpu(cpu: usize, fault_address: u
         );
 
         let process = thread.process;
-        exit_current_thread_for_cpu(cpu);
+        crate::services::sync::abandon_thread(thread.id);
         crate::services::process::retire_task(process);
+        exit_current_thread_for_cpu(cpu);
         switch_to_next_for_cpu(cpu)
     }
 }
@@ -433,33 +445,6 @@ pub unsafe fn tick_for_cpu(cpu: usize) -> bool {
         state_for_cpu(cpu).tick_count += 1;
         if cpu > 0 {
             crate::boot::smp::record_scheduler_tick(cpu);
-        }
-
-        // A syscall may have asked for a state change that the scheduler has
-        // to honour before the timeslice is even consulted. An exit is the
-        // obvious case: the thread is gone, so asking whether its timeslice
-        // expired is meaningless.
-        match task::take_syscall_effect() {
-            task::ThreadEffect::Exit => {
-                exit_current_thread_for_cpu(cpu);
-                return true;
-            }
-            task::ThreadEffect::Yield => {
-                // The thread gave up the rest of its quantum. It goes back to
-                // the queue and the next thread runs.
-                // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
-                let _ = state_for_cpu(cpu).scheduler.yield_current();
-                return true;
-            }
-            task::ThreadEffect::Block => {
-                // A blocked thread cannot run. It leaves the queue.
-                // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
-                if let Some(id) = state_for_cpu(cpu).scheduler.current() {
-                    let _ = state_for_cpu(cpu).scheduler.block(id);
-                }
-                return true;
-            }
-            task::ThreadEffect::Continue => {}
         }
 
         // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
@@ -593,50 +578,15 @@ pub unsafe fn switch_to_next() -> ! {
 pub unsafe fn switch_to_next_for_cpu(cpu: usize) -> ! {
     // SAFETY: this CPU's scheduler is only mutated with interrupts masked.
     unsafe { reap_exited_threads_for_cpu(cpu) };
+    drain_pending_wakes_for_cpu(cpu);
     let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
     let Some(next_id) = next_id else {
-        // No runnable thread: every user thread is blocked (on IPC, a timer,
-        // or similar). As a last resort, scan every thread record for one
-        // that is not exited and make it runnable — this covers the case
-        // where the policy state machine and the thread pool disagree about
-        // who is runnable. Failing that, halt and wait for an interrupt.
-        let fallback = unsafe { state_for_cpu(cpu).scheduler.any_non_exited() };
-        if let Some(id) = fallback {
-            // The policy queue is empty but a live thread exists (the
-            // scheduler's `current` slot was cleared by a earlier block and
-            // never restored). Put it back on the runnable queue and let the
-            // scheduler pick it normally.
-            let _ = unsafe { state_for_cpu(cpu).scheduler.unblock(id) };
-            let next_id = unsafe { state_for_cpu(cpu).scheduler.schedule() };
-            if let Some(next_id) = next_id {
-                unsafe { resume_thread_for_cpu(cpu, next_id) };
-            } else {
-                // Every thread on this CPU is blocked and the policy state
-                // machine cannot find anyone to run. `hlt` never wakes with
-                // interrupts masked — `switch_to_next_for_cpu` runs with
-                // interrupts masked, so unmask them here, or the loop never
-                // observes work becoming runnable.
-                klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
-                loop {
-                    unsafe {
-                        core::arch::asm!("sti", options(nomem, nostack));
-                        core::arch::asm!("hlt", options(nostack));
-                    }
-                    if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
-                        unsafe { resume_thread_for_cpu(cpu, id) };
-                    }
-                }
-            }
-        } else {
-            klog!(Level::Info, "sched: cpu {cpu} idle, no runnable thread");
-            loop {
-                unsafe {
-                    core::arch::asm!("sti", options(nomem, nostack));
-                    core::arch::asm!("hlt", options(nostack));
-                }
-                if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.next_runnable() } {
-                    unsafe { resume_thread_for_cpu(cpu, id) };
-                }
+        unsafe { state_for_cpu(cpu).current_slot = None };
+        loop {
+            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
+            drain_pending_wakes_for_cpu(cpu);
+            if let Some(id) = unsafe { state_for_cpu(cpu).scheduler.schedule() } {
+                unsafe { resume_thread_for_cpu(cpu, id) };
             }
         }
     };
@@ -671,6 +621,7 @@ unsafe fn resume_thread_for_cpu(cpu: usize, next_id: u32) -> ! {
             crate::arch::exit(crate::EXIT_PANIC)
         };
 
+        crate::syscall::ipc::finish_wait(&mut next);
         next.state = ThreadState::Running;
         task::update_thread_for_cpu(cpu, slot, next);
 
@@ -802,7 +753,12 @@ pub unsafe fn block_current_and_switch_for_cpu(cpu: usize) -> ! {
             crate::arch::exit(crate::EXIT_PANIC)
         };
         let _ = state_for_cpu(cpu).scheduler.block(current);
-        klog!(Level::Info, "debug: cpu {cpu} block current={current}");
+        if let Some(slot) = state_for_cpu(cpu).current_slot
+            && let Some(mut thread) = task::thread_in_slot_for_cpu(cpu, slot)
+        {
+            thread.state = ThreadState::Blocked;
+            task::update_thread_for_cpu(cpu, slot, thread);
+        }
         switch_to_next_for_cpu(cpu)
     }
 }
@@ -851,6 +807,15 @@ pub unsafe fn handle_timer_interrupt(registers: *const UserRegisters) -> ! {
 /// masked. The register pointer must address fifteen valid words and the frame
 /// pointer must address the CPU's five-word interrupt frame.
 pub unsafe fn handle_timer_interrupt_for_cpu(cpu: usize, registers: *const UserRegisters) -> ! {
+    task::admit_incoming(cpu);
+    // Drain wake requests addressed to this CPU first: an idle CPU (no
+    // current slot) returns through `resume_from_block` below without ever
+    // reaching `tick_for_cpu`, and a futex or condition-variable wake that
+    // arrived while it idled would otherwise never be observed. The drain
+    // puts a woken thread back on this CPU's queue, which is exactly what
+    // the idle loop's `next_runnable` poll below is waiting to see.
+    drain_pending_wakes_for_cpu(cpu);
+
     // A timer can fire while the boot thread is still running, before the
     // scheduler has switched to any pool thread. In that window there is no
     // current slot to save or resume, so the interrupt must return to the
@@ -912,6 +877,7 @@ pub unsafe fn spawn(thread: &mut Thread) {
 /// must own a stack.
 pub unsafe fn spawn_for_cpu(cpu: usize, thread: &mut Thread) {
     assert_eq!(thread.cpu, cpu, "thread belongs to a different CPU");
+    assert_eq!(task::current_cpu(), cpu, "only the owner can mutate its scheduler");
 
     // SAFETY: delegated to this function's contract. The thread owns a kernel
     // stack, and the entry describes a valid destination.
@@ -949,4 +915,85 @@ pub fn kernel_entry(function: u64) -> Entry {
 /// The context a user thread starts with, for the tests.
 pub fn user_entry(rip: u64, rsp: u64) -> Entry {
     Entry::User { rip, rsp }
+}
+
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy)]
+struct WakeSlot {
+    thread: u32,
+    pending: bool,
+}
+
+static WAKE_SLOTS: [crate::sync::SpinLock<[Option<WakeSlot>; task::MAX_THREADS]>; MAX_CPUS] =
+    [const { crate::sync::SpinLock::new([None; task::MAX_THREADS]) }; MAX_CPUS];
+
+pub(crate) fn register_wake_slot(cpu: usize, slot: usize, thread: u32) {
+    assert_eq!(cpu, task::current_cpu());
+    let old = WAKE_SLOTS[cpu].lock()[slot].replace(WakeSlot { thread, pending: false });
+    assert!(old.is_none(), "wake slot already registered");
+}
+
+pub(crate) fn clear_wake_slot(cpu: usize, slot: usize) {
+    assert_eq!(cpu, task::current_cpu());
+    WAKE_SLOTS[cpu].lock()[slot] = None;
+}
+
+pub fn request_wake(thread: u32, home_cpu: usize) {
+    {
+        let Some(slots) = WAKE_SLOTS.get(home_cpu) else { return };
+        let mut slots = slots.lock();
+        let Some(slot) = slots.iter_mut().flatten().find(|slot| slot.thread == thread) else {
+            return;
+        };
+        if core::mem::replace(&mut slot.pending, true) {
+            return;
+        }
+    }
+    crate::arch::x86_64::apic::notify_work(home_cpu);
+}
+
+pub(crate) fn drain_pending_wakes_for_cpu(cpu: usize) {
+    assert_eq!(cpu, task::current_cpu());
+    for index in 0..task::MAX_THREADS {
+        let wake = {
+            let mut slots = WAKE_SLOTS[cpu].lock();
+            slots[index].as_mut().filter(|slot| slot.pending).map(|slot| {
+                slot.pending = false;
+                slot.thread
+            })
+        };
+        if let Some(thread) = wake {
+            make_runnable_now(cpu, thread);
+        }
+    }
+}
+
+/// Make one thread on this CPU runnable again.
+///
+/// A no-op when the thread is not parked in this CPU's pool: a wake request
+/// can name a thread that has since exited, and a stale wake must not
+/// resurrect an unknown identifier.
+fn make_runnable_now(cpu: usize, thread_id: u32) {
+    // SAFETY: this runs on the CPU that owns the pool, with interrupts
+    // masked (the timer path).
+    let Some(slot) = (unsafe { crate::task::slot_of_thread_for_cpu(cpu, thread_id) }) else {
+        return;
+    };
+    // SAFETY: same contract as above.
+    let Some(mut thread) = (unsafe { crate::task::thread_in_slot_for_cpu(cpu, slot) }) else {
+        return;
+    };
+    if thread.state != crate::task::ThreadState::Blocked {
+        // Already runnable or gone: the scheduler's `unblock` is idempotent,
+        // but a state change here would rewrite a record another path just
+        // updated, so leave it alone.
+        return;
+    }
+    thread.state = crate::task::ThreadState::Runnable;
+    // SAFETY: this CPU's pool, mutated only from this CPU with interrupts
+    // masked.
+    unsafe { crate::task::update_thread_for_cpu(cpu, slot, thread) };
+    // SAFETY: this CPU's scheduler, mutated only from this CPU with
+    // interrupts masked.
+    let _ = unsafe { state_for_cpu(cpu).scheduler.unblock(thread_id) };
 }

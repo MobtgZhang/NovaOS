@@ -34,10 +34,8 @@
 //! # State discipline
 //!
 //! Every case starts from a fresh test state. The state is a fixed-size static;
-//! resetting it clears surface and object metadata but does not itself return
-//! frames, so each case destroys the surfaces it creates. The lifecycle case
-//! additionally snapshots the frame allocator's free count and checks it is
-//! unchanged at the end.
+//! resetting it drops surface references and returns memory-object frames.
+//! The lifecycle case additionally checks that explicit cleanup is balanced.
 
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
@@ -166,6 +164,7 @@ pub static M6_SUITES: &[TestSuite] = &[
                 "the_surface_and_object_pools_return_to_empty",
                 the_surface_and_object_pools_return_to_empty,
             ),
+            ("shared_memory_revokes_aliases_before_reuse", shared_memory_revokes_aliases_before_reuse),
         ],
     },
     TestSuite {
@@ -288,13 +287,13 @@ fn attach_surface(
         })
 }
 
-/// Destroy a surface, releasing its buffer.
-fn destroy_surface(state: &mut KernelState, slot: usize, id: u32) -> Result<(), &'static str> {
-    let parts = state.split();
-    parts
-        .compositor
-        .destroy(id, slot, parts.objects)
-        .map_err(|_| "the surface destroy was refused")
+fn close_window(
+    state: &mut KernelState, slot: usize, id: u32, buffer: CapHandle,
+) -> Result<(), &'static str> {
+    state.compositor.destroy(id, slot).map_err(|_| "the surface destroy was refused")?;
+    let context = SyscallContext::new(slot, 0);
+    let result = dispatch_syscall_in(state, &context, nr::OBJECT_DESTROY.raw(), [buffer.raw(), 0, 0, 0, 0, 0]);
+    result.is_ok().then_some(()).ok_or("the buffer destroy was refused")
 }
 
 /// Paint a whole surface buffer with one colour.
@@ -960,7 +959,7 @@ fn one_hundred_cycles_release_every_frame() -> Result<(), &'static str> {
             .compositor
             .commit(id, slot, serial)
             .map_err(|_| "commit refused")?;
-        destroy_surface(&mut state, slot, id)?;
+        close_window(&mut state, slot, id, buffer)?;
     }
 
     let free_after = allocator.free_count();
@@ -984,17 +983,72 @@ fn the_surface_and_object_pools_return_to_empty() -> Result<(), &'static str> {
             .compositor
             .commit(id, slot, serial)
             .map_err(|_| "commit refused")?;
-        destroy_surface(&mut state, slot, id)?;
+        close_window(&mut state, slot, id, buffer)?;
     }
 
     if state.compositor.surface_count() != 0 {
         return Err("surfaces remained after every destroy");
     }
-    // The compositor destroys each buffer object when its surface is destroyed.
     // The task's root capability names a TaskFactory object, which surface
     // lifecycle does not touch, so exactly that one object remains.
     if state.objects.count() != 1 {
         return Err("buffer objects remained in the registry");
+    }
+    Ok(())
+}
+
+fn shared_memory_revokes_aliases_before_reuse() -> Result<(), &'static str> {
+    use crate::mm::address_space::{self, AddressSpace};
+    use crate::mm::page_table;
+    use nova_abi::layout::{PAGE_SIZE, USER_HEAP_BASE};
+    use nova_core::address_space::Protection;
+
+    let mut state = fresh_state();
+    let owner = new_task(&mut state)?;
+    let peer = new_task(&mut state)?;
+    let handle_rights = Rights::MAP | Rights::CONTROL;
+    let (handle, base, _) = create_memory_object(&mut state, owner, 2 * PAGE_SIZE, handle_rights)?;
+    let object = state.caps[owner].object_ref(handle).ok_or("memory cap missing")?;
+    let duplicate = state.caps[peer].create(object, Rights::MAP).map_err(|_| "peer mint failed")?;
+    let owner_space = AddressSpace::at(page_table::allocate_table().map_err(|_| "owner root allocation failed")?.phys());
+    let peer_space = AddressSpace::at(page_table::allocate_table().map_err(|_| "peer root allocation failed")?.phys());
+    let protection = Protection::UserReadWrite;
+    let owner_address = USER_HEAP_BASE;
+    let peer_address = USER_HEAP_BASE + 8 * PAGE_SIZE;
+    if state.map_memory(owner, object, owner_space, owner_address + PAGE_SIZE, PAGE_SIZE, protection) != Ok(1)
+        || state.map_memory(owner, object, owner_space, owner_address, 2 * PAGE_SIZE, protection) != Err(ErrorCode::Busy)
+        || address_space::translate_user(&owner_space, owner_address).is_some()
+        || state.map_memory(owner, object, owner_space, 0, 2 * PAGE_SIZE, protection) != Ok(owner_address + 2 * PAGE_SIZE)
+        || state.map_memory(peer, object, peer_space, peer_address, 2 * PAGE_SIZE, protection) != Ok(2)
+    {
+        return Err("overlap handling or heap placement is incorrect");
+    }
+    let surface = create_surface(&mut state, owner, 16, 16)?;
+    attach_surface(&mut state, owner, surface, handle, 64)?;
+    if !state.retire_task(peer) || address_space::translate_user(&peer_space, peer_address).is_some()
+        || address_space::translate_user(&owner_space, owner_address + PAGE_SIZE) != Some(base)
+        || state.caps[peer].is_live(duplicate)
+    {
+        return Err("peer exit damaged surviving mappings or left a dead alias");
+    }
+    let peer = new_task(&mut state)?;
+    let duplicate = state.caps[peer].create(object, Rights::MAP).map_err(|_| "peer remint failed")?;
+    state.map_memory(peer, object, peer_space, peer_address, PAGE_SIZE, protection).map_err(|_| "remap failed")?;
+    crate::services::sync::register_wait(base, u32::MAX, 0).map_err(|_| "futex wait failed")?;
+    let result = dispatch_syscall_in(&mut state, &SyscallContext::new(owner, 0), nr::OBJECT_DESTROY.raw(), [handle.raw(), 0, 0, 0, 0, 0]);
+    let allocator = unsafe { crate::mm::frame_allocator() };
+    if !result.is_ok() || state.caps[peer].entry(duplicate).is_some()
+        || state.compositor.surface(surface).and_then(|surface| surface.buffer).is_some()
+        || (1..=3).any(|page| address_space::translate_user(&owner_space, owner_address + page * PAGE_SIZE).is_some())
+        || address_space::translate_user(&peer_space, peer_address).is_some()
+        || allocator.is_allocated((base / PAGE_SIZE) as usize)
+        || crate::services::sync::futex_wake(base, 1) != 0
+    {
+        return Err("destroy returned with a stale memory alias, reference or futex");
+    }
+    unsafe {
+        page_table::release_process_root(owner_space.pml4());
+        page_table::release_process_root(peer_space.pml4());
     }
     Ok(())
 }

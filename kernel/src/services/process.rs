@@ -1,5 +1,6 @@
 //! Loading and starting processes from the initramfs.
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
 
@@ -7,24 +8,16 @@ use crate::boot::BootInfo;
 use crate::klog;
 use crate::loader;
 use crate::logger::Level;
-use crate::mm::address_space;
+use crate::mm::{address_space, page_table};
 use crate::services::{KernelState, MAX_SERVICE_NAME, MAX_TASKS};
 use crate::task::{self, Entry};
 
 /// A unique identifier for each thread created by the process layer.
-struct ThreadIds(UnsafeCell<u32>);
-unsafe impl Sync for ThreadIds {}
-
-static NEXT_THREAD_ID: ThreadIds = ThreadIds(UnsafeCell::new(1));
+static NEXT_THREAD_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Allocate a unique thread identifier.
 fn next_thread_id() -> u32 {
-    // SAFETY: the kernel is single-CPU and syscall entry runs with interrupts
-    // masked, so this counter has no concurrent access.
-    let next = unsafe { &mut *NEXT_THREAD_ID.0.get() };
-    let id = *next;
-    *next = next.wrapping_add(1);
-    id
+    NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Execute `name` from the initramfs as a child of the current task.
@@ -159,12 +152,50 @@ pub(crate) fn exec_image_in_state_with_grant(
         return Err(ErrorCode::NoMemory);
     };
 
-    let space = address_space::create_process_space(boot_info).map_err(|_| ErrorCode::NoMemory)?;
+    let space = match address_space::create_process_space(boot_info) {
+        Ok(space) => space,
+        Err(_) => {
+            kernel.retire_task(child_slot);
+            return Err(ErrorCode::NoMemory);
+        }
+    };
+
+    let result = start_child(kernel, parent_slot, child_slot, name, image, space, boot_info, grant);
+    if result.is_err() {
+        kernel.retire_task(child_slot);
+        unsafe { page_table::release_process_root(space.pml4()) };
+    }
+    result
+}
+
+fn start_child(
+    kernel: &mut KernelState,
+    parent_slot: usize,
+    child_slot: usize,
+    name: &[u8],
+    image: &[u8],
+    space: address_space::AddressSpace,
+    boot_info: &'static BootInfo,
+    grant: Option<(&[u8], Rights)>,
+) -> Result<CapHandle, ErrorCode> {
 
     let loaded = loader::load(&space, image, boot_info).map_err(|error| {
         klog!(Level::Error, "process: load failed {error}");
         ErrorCode::NoMemory
     })?;
+
+    // The parent's path scope, minted into the child's table and scope pool
+    // as one pair. This is the only place a scope is created outside the
+    // kernel's own `grant_file_scope` callers, and it runs only when the
+    // caller was already authorised to pass the scope down.
+    if let Some((path, rights)) = grant {
+        kernel
+            .grant_file_scope(child_slot, path, rights)
+            .map_err(|error| {
+                klog!(Level::Error, "process: child grant failed {}", error as i64);
+                error
+            })?;
+    }
 
     let Some((parent_endpoint, child_endpoint)) = kernel.create_endpoint_pair(
         parent_slot,
@@ -180,19 +211,6 @@ pub(crate) fn exec_image_in_state_with_grant(
         child.management_endpoint = child_endpoint;
         child.service_name[..name.len()].copy_from_slice(name);
         child.service_name_len = name.len();
-    }
-
-    // The parent's path scope, minted into the child's table and scope pool
-    // as one pair. This is the only place a scope is created outside the
-    // kernel's own `grant_file_scope` callers, and it runs only when the
-    // caller was already authorised to pass the scope down.
-    if let Some((path, rights)) = grant {
-        kernel
-            .grant_file_scope(child_slot, path, rights)
-            .map_err(|error| {
-                klog!(Level::Error, "process: child grant failed {}", error as i64);
-                error
-            })?;
     }
 
     let dbg_space = space;
@@ -211,7 +229,7 @@ pub(crate) fn exec_image_in_state_with_grant(
         dbg_stack_phys,
     );
 
-    let Some(mut thread) = task::create_thread(
+    if !task::launch_image(
         next_thread_id(),
         child_slot,
         space,
@@ -219,15 +237,10 @@ pub(crate) fn exec_image_in_state_with_grant(
             rip: loaded.entry,
             rsp: loaded.stack_pointer,
         },
-    ) else {
+    ) {
         klog!(Level::Error, "process: no thread slot");
+        let _ = kernel.caps[parent_slot].destroy(parent_endpoint);
         return Err(ErrorCode::NoMemory);
-    };
-
-    // SAFETY: the thread owns a kernel stack from `create_thread`, and the
-    // scheduler is only mutated with interrupts masked.
-    unsafe {
-        crate::sched::spawn(&mut thread);
     }
 
     Ok(parent_endpoint)
@@ -270,23 +283,19 @@ pub fn start_init_image(name: &[u8]) -> Result<CapHandle, ErrorCode> {
 }
 
 /// The number of tasks that are still alive.
-pub fn live_task_count() -> usize {
-    // SAFETY: the syscall path is the only reader here and runs serialised.
-    unsafe {
-        crate::services::state()
-            .tasks
-            .iter()
-            .flatten()
-            .filter(|task| task.alive)
-            .count()
-    }
+pub fn live_task_count(kernel: &KernelState) -> usize {
+    kernel.tasks.iter().flatten().filter(|task| task.alive).count()
 }
 
 /// Remove a dead task and release its slot.
 pub fn retire_task(slot: usize) -> bool {
     // SAFETY: syscall path is serialised; exiting thread cannot return.
     let mut kernel = crate::services::state();
-    kernel.retire_task(slot)
+    let retired = kernel.retire_task(slot);
+    if retired {
+        crate::syscall::ipc::collect_after_exit(&mut kernel, slot);
+    }
+    retired
 }
 
 /// Whether a live task was started from the named initramfs image.
@@ -297,11 +306,7 @@ pub fn service_is_alive(name: &[u8]) -> bool {
 }
 
 /// Create both sides of an endpoint pair in the calling task.
-pub fn create_endpoint_pair() -> Result<CapHandle, ErrorCode> {
-    // SAFETY: service state is installed before user processes can run.
-    let mut kernel = crate::services::state();
-    let context = task::current_syscall_context();
-    let slot = context.task_slot;
+pub fn create_endpoint_pair(kernel: &mut KernelState, slot: usize) -> Result<CapHandle, ErrorCode> {
     if slot >= MAX_TASKS {
         return Err(ErrorCode::BadHandle);
     }
@@ -316,11 +321,8 @@ pub fn create_endpoint_pair() -> Result<CapHandle, ErrorCode> {
 }
 
 /// Return the side of a pair created by [`create_endpoint_pair`].
-pub fn take_pending_endpoint() -> Result<CapHandle, ErrorCode> {
-    // SAFETY: service state is installed before user processes can run.
-    let mut kernel = crate::services::state();
-    let context = task::current_syscall_context();
-    let Some(task) = kernel.task_at_slot_mut(context.task_slot) else {
+pub fn take_pending_endpoint(kernel: &mut KernelState, slot: usize) -> Result<CapHandle, ErrorCode> {
+    let Some(task) = kernel.task_at_slot_mut(slot) else {
         return Err(ErrorCode::BadHandle);
     };
     let handle = task.pending_endpoint;
@@ -333,11 +335,8 @@ pub fn take_pending_endpoint() -> Result<CapHandle, ErrorCode> {
 }
 
 /// Return the management endpoint this process received at spawn.
-pub fn management_endpoint() -> Result<CapHandle, ErrorCode> {
-    // SAFETY: service state is installed before user processes can run.
-    let mut kernel = crate::services::state();
-    let context = task::current_syscall_context();
-    let Some(task) = kernel.task_at_slot(context.task_slot) else {
+pub fn management_endpoint(kernel: &KernelState, slot: usize) -> Result<CapHandle, ErrorCode> {
+    let Some(task) = kernel.task_at_slot(slot) else {
         return Err(ErrorCode::BadHandle);
     };
     let handle = task.management_endpoint;
@@ -347,4 +346,3 @@ pub fn management_endpoint() -> Result<CapHandle, ErrorCode> {
         Ok(handle)
     }
 }
-use core::cell::UnsafeCell;

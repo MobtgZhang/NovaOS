@@ -325,6 +325,7 @@ pub struct Thread {
     pub process: usize,
     /// The address space the thread runs in.
     pub space: AddressSpace,
+    pub(crate) owns_image: bool,
     /// The CPU that owns this thread's pool and stack.
     pub cpu: usize,
     /// The low address of the thread's kernel stack, allocated from the
@@ -344,6 +345,7 @@ pub struct Thread {
     pub preemptions: u64,
     /// The address a user thread faulted at, if it was killed by a fault.
     pub fault_address: u64,
+    pub(crate) fault_code: u64,
 }
 
 /// The kernel's thread pool.
@@ -372,21 +374,6 @@ unsafe impl Sync for ThreadPoolCell {}
 static THREADS: [ThreadPoolCell; MAX_CPUS] =
     [const { ThreadPoolCell(UnsafeCell::new([None; MAX_THREADS])) }; MAX_CPUS];
 
-/// What the current syscall did to the calling thread.
-///
-/// The dispatcher reports this so the *scheduler* can act on it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ThreadEffect {
-    /// The thread continues.
-    Continue,
-    /// The thread yielded; schedule another one.
-    Yield,
-    /// The thread exited; it must be reaped.
-    Exit,
-    /// The thread blocked; wake it when the awaited event happens.
-    Block,
-}
-
 /// The thread pool of one CPU, as a raw slice.
 ///
 /// # Safety
@@ -394,7 +381,7 @@ pub enum ThreadEffect {
 /// Must only be accessed with interrupts masked, and `cpu` must be the CPU that
 /// owns the pool.
 unsafe fn thread_pool(cpu: usize) -> &'static mut [Option<Thread>; MAX_THREADS] {
-    assert!(cpu < MAX_CPUS, "CPU index exceeds the static thread table");
+    assert_eq!(cpu, current_cpu(), "only the owner can access its thread pool");
     // SAFETY: delegated to this function's contract. The pool is a static
     // whose only writer is the kernel, and every access is made with
     // interrupts masked.
@@ -409,47 +396,8 @@ pub fn current_cpu() -> usize {
     crate::arch::current_cpu()
 }
 
-/// The effect the most recent syscall on *this* CPU asked for.
-///
-/// One slot per CPU rather than one per thread: within a CPU only one syscall
-/// can be in flight at a time, because the entry path runs with interrupts
-/// masked. The per-CPU split is what lets two processors dispatch syscalls
-/// concurrently without one CPU's effect being consumed by the other's
-/// scheduler tick (§ "global single-slot" tension from the issues report).
-static mut PENDING_EFFECT: [ThreadEffect; MAX_CPUS] = [const { ThreadEffect::Continue }; MAX_CPUS];
-
 /// The exit status the most recent `THREAD_EXIT` on *this* CPU carried.
 static mut PENDING_EXIT_STATUS: [i64; MAX_CPUS] = [const { 0 }; MAX_CPUS];
-
-/// Record what a syscall did to the calling thread.
-///
-/// # Safety
-///
-/// Must only be called from the syscall entry path, with interrupts masked.
-/// The value is consumed by the scheduler before the next syscall can be
-/// dispatched.
-pub unsafe fn note_syscall_effect(effect: ThreadEffect) {
-    // SAFETY: delegated to this function's contract. The slot is written by
-    // the entry path and read by the scheduler — both on the CPU that entered
-    // the syscall, both with interrupts masked.
-    unsafe {
-        PENDING_EFFECT[current_cpu()] = effect;
-    }
-}
-
-/// Take the pending syscall effect, clearing it.
-///
-/// # Safety
-///
-/// Must only be called by the scheduler, with interrupts masked.
-pub unsafe fn take_syscall_effect() -> ThreadEffect {
-    // SAFETY: delegated to this function's contract.
-    unsafe {
-        let effect = PENDING_EFFECT[current_cpu()];
-        PENDING_EFFECT[current_cpu()] = ThreadEffect::Continue;
-        effect
-    }
-}
 
 /// Record the exit status a `THREAD_EXIT` carried.
 ///
@@ -531,28 +479,85 @@ pub fn current_thread_space() -> Option<AddressSpace> {
 /// counter is shared, so concurrent creations on two CPUs interleave — an
 /// approximate balance is the goal, not an exact one.
 static DISPATCH_CURSOR: AtomicUsize = AtomicUsize::new(0);
+static SLOTS_IN_USE: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(0) }; MAX_CPUS];
+static INCOMING: [crate::sync::SpinLock<[Option<Thread>; MAX_THREADS]>; MAX_CPUS] =
+    [const { crate::sync::SpinLock::new([None; MAX_THREADS]) }; MAX_CPUS];
 
-/// Create a user thread, dispatching it round-robin across the online CPUs.
-///
-/// Every CPU whose startup has completed is a legal home: it has its own
-/// thread pool, its own kernel stack pool, its own scheduler, and its own
-/// per-CPU data, so a user thread's syscalls land on the creating CPU's
-/// tables by construction. The bootstrap processor is always online (this
-/// code is running on it).
-pub fn create_thread(id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
-    // Scan each slot at most once: `MAX_CPUS` probes cover every CPU. The
-    // fallback names the bootstrap processor explicitly, so a boot snapshot
-    // with no online APs (the single-processor configuration) still creates
-    // the thread rather than dropping it.
+pub(crate) fn dispatch_order() -> impl Iterator<Item = usize> {
     let start = DISPATCH_CURSOR.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
-    for step in 0..MAX_CPUS {
-        let cpu = (start + step) % MAX_CPUS;
-        let online = cpu == 0 || crate::boot::smp::is_online(cpu);
-        if online && let Some(thread) = create_thread_for_cpu(cpu, id, process, space, entry) {
-            return Some(thread);
-        }
+    (0..MAX_CPUS).map(move |step| (start + step) % MAX_CPUS)
+        .filter(|&cpu| cpu == 0 || crate::boot::smp::is_online(cpu))
+}
+
+/// Publish a new thread without mutating another CPU's run queue or pool.
+/// The caller must keep IRQs masked until its task/capability state is ready.
+pub fn launch_image(id: u32, process: usize, space: AddressSpace, entry: Entry) -> bool {
+    dispatch_order().any(|cpu| launch_image_on(cpu, id, process, space, entry, [0; 2]))
+}
+
+pub(crate) fn launch_image_on(
+    cpu: usize,
+    id: u32,
+    process: usize,
+    space: AddressSpace,
+    entry: Entry,
+    args: [u64; 2],
+) -> bool {
+    assert!(matches!(entry, Entry::User { .. }));
+    enqueue_thread(cpu, id, process, space, entry, args, true)
+}
+
+pub(crate) fn launch_thread_on(
+    cpu: usize,
+    id: u32,
+    process: usize,
+    space: AddressSpace,
+    entry: Entry,
+    args: [u64; 2],
+) -> bool {
+    enqueue_thread(cpu, id, process, space, entry, args, false)
+}
+
+fn enqueue_thread(
+    cpu: usize,
+    id: u32,
+    process: usize,
+    space: AddressSpace,
+    entry: Entry,
+    args: [u64; 2],
+    owns_image: bool,
+) -> bool {
+    if cpu != current_cpu() && cpu != 0 && !crate::boot::smp::is_online(cpu) {
+        return false;
     }
-    create_thread_for_cpu(0, id, process, space, entry)
+    let Some(mut thread) = allocate_thread(cpu, id, process, space, entry) else {
+        return false;
+    };
+    thread.owns_image = owns_image;
+    if matches!(entry, Entry::User { .. }) {
+        [thread.context.rdi, thread.context.rsi] = args;
+    }
+    if cpu == current_cpu() {
+        install_thread(thread);
+        unsafe { crate::sched::spawn_for_cpu(cpu, &mut thread) };
+    } else {
+        let mut pending = INCOMING[cpu].lock();
+        *pending.iter_mut().find(|slot| slot.is_none()).expect("reserved incoming thread slot") = Some(thread);
+        drop(pending);
+        crate::arch::x86_64::apic::notify_work(cpu);
+    }
+    true
+}
+
+/// Admit work from other CPUs on the owner CPU's timer path.
+pub(crate) fn admit_incoming(cpu: usize) {
+    assert_eq!(cpu, current_cpu());
+    loop {
+        let next = INCOMING[cpu].lock().iter_mut().find_map(Option::take);
+        let Some(mut thread) = next else { return };
+        install_thread(thread);
+        unsafe { crate::sched::spawn_for_cpu(cpu, &mut thread) };
+    }
 }
 
 /// Create a thread on a specific CPU.
@@ -568,17 +573,15 @@ pub fn create_thread_for_cpu(
     space: AddressSpace,
     entry: Entry,
 ) -> Option<Thread> {
-    assert!(cpu < MAX_CPUS, "CPU index exceeds the static thread table");
+    assert_eq!(cpu, current_cpu());
+    let thread = allocate_thread(cpu, id, process, space, entry)?;
+    install_thread(thread);
+    Some(thread)
+}
 
-    // Claim the table slot first: the stack is allocated from the kernel heap
-    // below, and a `None` after that point would have to give the stack back.
-    // Creation runs with interrupts masked on the owning CPU, and it is the
-    // only writer of that CPU's thread pool.
-    let slot = unsafe {
-        (unsafe { thread_pool(cpu) })
-            .iter()
-            .position(|entry| entry.is_none())?
-    };
+fn allocate_thread(cpu: usize, id: u32, process: usize, space: AddressSpace, entry: Entry) -> Option<Thread> {
+    SLOTS_IN_USE[cpu].fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+        |used| (used < MAX_THREADS).then_some(used + 1)).ok()?;
 
     // The stack comes from the kernel heap: the heap's own lock is irq-safe,
     // so claiming one here cannot deadlock against an interrupt that also
@@ -590,13 +593,15 @@ pub fn create_thread_for_cpu(
     // returned pointer is live until this thread is reaped.
     let base = unsafe { alloc::alloc::alloc(stack_layout) } as u64;
     if base == 0 {
+        SLOTS_IN_USE[cpu].fetch_sub(1, Ordering::Relaxed);
         return None;
     }
 
-    let thread = Thread {
+    Some(Thread {
         id,
         process,
         space,
+        owns_image: false,
         cpu,
         stack_base: base,
         context: Context::default(),
@@ -606,12 +611,15 @@ pub fn create_thread_for_cpu(
         runs: 0,
         preemptions: 0,
         fault_address: 0,
-    };
+        fault_code: 0,
+    })
+}
 
-    // SAFETY: creation runs with interrupts masked on the owning CPU, and it
-    // is the only writer of that CPU's thread pool.
-    unsafe { (unsafe { thread_pool(cpu) })[slot] = Some(thread) };
-    Some(thread)
+fn install_thread(thread: Thread) {
+    let pool = unsafe { thread_pool(thread.cpu) };
+    let slot = pool.iter().position(Option::is_none).expect("reserved local thread slot");
+    pool[slot] = Some(thread);
+    crate::sched::register_wake_slot(thread.cpu, slot, thread.id);
 }
 
 /// Look up a thread by identifier on the bootstrap processor.
@@ -744,7 +752,9 @@ pub unsafe fn reap_thread_for_cpu(cpu: usize, slot: usize) {
             // leave the table, so this is the one dealloc for a stack that
             // exactly one creation allocated.
             unsafe { alloc::alloc::dealloc(thread.stack_base as *mut u8, stack_layout) };
+            crate::sched::clear_wake_slot(cpu, slot);
             (unsafe { thread_pool(cpu) })[slot] = None;
+            SLOTS_IN_USE[cpu].fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -940,7 +950,11 @@ pub unsafe fn prepare_initial_context(thread: &mut Thread) {
             thread.context = Context::kernel_start(entry_point, stack_pointer);
         }
         Entry::User { rip, rsp } => {
+            let rdi = thread.context.rdi;
+            let rsi = thread.context.rsi;
             thread.context = Context::user_start(rip, rsp);
+            thread.context.rdi = rdi;
+            thread.context.rsi = rsi;
         }
     }
 }

@@ -69,7 +69,7 @@ fn suite_is_runnable(suite: &TestSuite) -> bool {
 }
 
 /// Running totals across every suite.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct Totals {
     suites: usize,
     cases: usize,
@@ -130,6 +130,37 @@ pub fn run_all() -> ! {
         }
     }
 
+    if totals.failed == 0 {
+        match prepare_user_ipc(totals) {
+            Ok(()) => unsafe { crate::sched::switch_to_next() },
+            Err(mut totals) => {
+                totals.record_user_cases([false; USER_CASES]);
+                finish(totals);
+            }
+        }
+    }
+    finish(totals)
+}
+
+impl Totals {
+    fn record_user_cases(&mut self, passed: [bool; USER_CASES]) {
+        self.suites += 1;
+        report(format_args!("SUITE ring3_ipc"));
+        for (name, passed) in ["futex_and_ipc_client", "futex_and_ipc_server", "rx_write_fault", "data_execute_fault", "remote_write_after_downgrade"].into_iter().zip(passed) {
+            self.cases += 1;
+            if passed {
+                self.passed += 1;
+                report(format_args!("  case {name} ... ok"));
+            } else {
+                self.failed += 1;
+                report(format_args!("  case {name} ... FAIL: ring-3 probe failed"));
+            }
+        }
+        report(format_args!("END   ring3_ipc"));
+    }
+}
+
+fn finish(totals: Totals) -> ! {
     report(format_args!(
         "RESULT suites={} cases={} passed={} failed={}",
         totals.suites, totals.cases, totals.passed, totals.failed
@@ -137,14 +168,167 @@ pub fn run_all() -> ! {
 
     if totals.failed == 0 {
         report(format_args!("SUMMARY all suites passed"));
-        // Test mode terminates the machine directly: user threads (init and
-        // its services) are not part of the test harness, so there is nothing
-        // to switch to.
         unsafe { crate::arch::exit(crate::EXIT_SUCCESS) }
     } else {
         report(format_args!("SUMMARY failures detected"));
         // SAFETY: as above.
         unsafe { crate::arch::exit(crate::EXIT_TEST_FAILURE) }
+    }
+}
+
+struct UserIpcSuite {
+    totals: Totals,
+    results: [Option<bool>; USER_CASES],
+    entry: u64,
+    server_cpu: usize,
+}
+
+const IPC_THREAD_BASE: u32 = 0x4950_4300;
+const IPC_SERVER_CPU: usize = 1;
+const USER_CASES: usize = 5;
+const DOWNGRADE_ROLE: usize = 6;
+const DOWNGRADE_ADDRESS: u64 = 0x15000;
+static USER_IPC: crate::sync::SpinLock<Option<UserIpcSuite>> = crate::sync::SpinLock::new(None);
+
+struct UserProbe {
+    process: usize,
+    role: usize,
+    handle: u64,
+    space: crate::mm::address_space::AddressSpace,
+    entry: crate::task::Entry,
+}
+
+fn prepare_user_ipc(totals: Totals) -> Result<(), Totals> {
+    if !crate::boot::smp::is_online(IPC_SERVER_CPU) {
+        report(format_args!("ring3_ipc requires CPU {IPC_SERVER_CPU} online"));
+        return Err(totals);
+    }
+    let server_cpu = IPC_SERVER_CPU;
+    match load_user_ipc() {
+        Ok((entry, probes)) => {
+            *USER_IPC.lock() = Some(UserIpcSuite { totals, results: [None; USER_CASES], entry, server_cpu });
+            for (index, probe) in probes.into_iter().enumerate().rev() {
+                let cpu = if matches!(probe.role, 1 | DOWNGRADE_ROLE) { server_cpu } else { 0 };
+                let _access = (probe.role == DOWNGRADE_ROLE).then(crate::mm::address_space::user_access);
+                let id = IPC_THREAD_BASE + index as u32;
+                if !crate::task::launch_image_on(cpu, id, probe.process, probe.space, probe.entry, [probe.role as u64, probe.handle]) {
+                    report(format_args!("ring3_ipc could not launch role {} on CPU {cpu}", probe.role));
+                    return Err(totals);
+                }
+                if probe.role == DOWNGRADE_ROLE && let Err(reason) = downgrade_remote_page(&probe.space) {
+                    report(format_args!("ring3_ipc permission downgrade failed: {reason}"));
+                    return Err(totals);
+                }
+            }
+            Ok(())
+        }
+        Err(reason) => {
+            report(format_args!("ring3_ipc setup failed: {reason}"));
+            Err(totals)
+        }
+    }
+}
+
+fn downgrade_remote_page(space: &crate::mm::address_space::AddressSpace) -> Result<(), &'static str> {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use crate::mm::{address_space, direct_map};
+
+    let phys = address_space::translate_user(space, DOWNGRADE_ADDRESS).ok_or("missing user page")?;
+    let words = direct_map::phys_to_virt(phys).cast::<AtomicU64>();
+    let ready = unsafe { &*words.add(1) };
+    let resume = unsafe { &*words.add(2) };
+    let started = crate::arch::x86_64::cycles();
+    while ready.load(Ordering::Acquire) == 0 {
+        if crate::arch::x86_64::cycles().wrapping_sub(started) >= 5_000_000_000 {
+            return Err("remote user did not warm its writable translation");
+        }
+        core::hint::spin_loop();
+    }
+    address_space::set_writable(space, DOWNGRADE_ADDRESS, false).map_err(|_| "cannot downgrade user page")?;
+    resume.store(1, Ordering::Release);
+    Ok(())
+}
+
+fn load_user_ipc() -> Result<(u64, [UserProbe; USER_CASES]), &'static str> {
+    use crate::mm::address_space;
+    use crate::task::Entry;
+    use nova_abi::Rights;
+    use nova_core::address_space::Protection;
+
+    let archive = crate::boot::initramfs().ok_or("missing initramfs")?;
+    let archive = crate::initramfs::Archive::parse(archive)?;
+    let image = archive.get(b"nova-port-init").ok_or("missing IPC probe")?;
+    let boot = unsafe { crate::boot::read_boot_info() };
+    let mut kernel = crate::services::state();
+    let mut tasks = [0; USER_CASES];
+    for slot in &mut tasks {
+        let id = kernel.create_bare_task().ok_or("task pool is full")?;
+        *slot = kernel.slot_of_task(id).ok_or("task slot is absent")?;
+    }
+    let rights = Rights::SEND | Rights::RECEIVE | Rights::REPLY;
+    let (client, server) = kernel.create_endpoint_pair(tasks[0], tasks[1], rights, rights)
+        .ok_or("cannot grant IPC endpoints")?;
+    let page_size = crate::arch::ADDRESS_SPACE.page_size;
+    let shared = unsafe { crate::mm::frame_allocator() }.alloc()
+        .map_err(|_| "cannot allocate probe futex page")? as u64 * page_size;
+    unsafe { core::ptr::write_bytes(crate::mm::direct_map::phys_to_virt(shared), 0, page_size as usize) };
+    let object = kernel.objects.create(crate::services::object::ObjectKind::MemoryObject {
+        base: shared, size: page_size,
+    }).ok_or("cannot register probe futex page")?;
+    let mut entry = 0;
+    let mut probes = core::array::from_fn(|_| None);
+    for (index, ((process, handle), role)) in tasks.into_iter().zip([client.raw(), server.raw(), 0, 0, DOWNGRADE_ADDRESS]).zip([0, 1, 2, 5, DOWNGRADE_ROLE]).enumerate() {
+        let space = address_space::create_process_space(boot).map_err(|_| "cannot allocate user address space")?;
+        let loaded = crate::loader::load(&space, image, boot).map_err(|_| "cannot load IPC probe ELF")?;
+        if role < 2 {
+            kernel.map_memory(process, object, space, 0x14000, page_size, Protection::UserReadWrite)
+                .map_err(|_| "cannot map probe futex page")?;
+        }
+        if role == DOWNGRADE_ROLE {
+            let frame = unsafe { crate::mm::frame_allocator() }.alloc().map_err(|_| "cannot allocate downgrade page")?;
+            let phys = frame as u64 * page_size;
+            unsafe { crate::mm::direct_map::phys_to_virt(phys).write_bytes(0, page_size as usize) };
+            address_space::map(&space, DOWNGRADE_ADDRESS, phys, Protection::UserReadWrite)
+                .map_err(|_| "cannot map downgrade page")?;
+        }
+        entry = loaded.entry;
+        probes[index] = Some(UserProbe {
+            process,
+            role,
+            handle,
+            space,
+            entry: Entry::User { rip: entry, rsp: loaded.stack_pointer - 8 },
+        });
+    }
+    Ok((entry, probes.map(|probe| probe.expect("all user probes loaded"))))
+}
+
+pub(crate) fn record_user_exit(thread: &crate::task::Thread, reclaimed: usize) {
+    let Some(role) = thread.id.checked_sub(IPC_THREAD_BASE).filter(|role| *role < USER_CASES as u32) else {
+        return;
+    };
+    let mut state = USER_IPC.lock();
+    let Some(suite) = state.as_mut() else {
+        return;
+    };
+    let expected_min = (nova_abi::layout::USER_STACK_SIZE / nova_abi::layout::PAGE_SIZE) as usize + 5;
+    suite.results[role as usize] = Some(reclaimed >= expected_min && match role {
+        2 => thread.fault_address == suite.entry,
+        3 => thread.fault_address == 0x13000,
+        4 => thread.cpu == suite.server_cpu && thread.fault_address == DOWNGRADE_ADDRESS && thread.fault_code == 0b111,
+        _ => {
+            let expected_cpu = if role == 1 { suite.server_cpu } else { 0 };
+            thread.cpu == expected_cpu && thread.exit_status == 0 && thread.fault_address == 0
+                && (suite.server_cpu == 0 || crate::boot::smp::work_ipi_count(expected_cpu) != 0)
+        }
+    });
+    report(format_args!("ring3_ipc role={role} cpu={} exit={} fault={:#x} reclaimed={reclaimed}", thread.cpu, thread.exit_status, thread.fault_address));
+    if suite.results.iter().all(Option::is_some) {
+        let suite = state.take().unwrap();
+        drop(state);
+        let mut totals = suite.totals;
+        totals.record_user_cases(suite.results.map(|value| value == Some(true)));
+        finish(totals);
     }
 }
 
@@ -174,6 +358,7 @@ static SUITE_GROUPS: &[&[TestSuite]] = &[
     crate::test::smp::SMP_SUITES,
     crate::test::heap::HEAP_SUITES,
     crate::test::wallclock::WALLCLOCK_SUITES,
+    crate::test::sync::SYNC_SUITES,
 ];
 
 /// The M1 suites: the boot, memory, fault, and console gates.

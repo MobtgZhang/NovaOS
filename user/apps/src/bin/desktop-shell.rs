@@ -757,7 +757,7 @@ impl Shell {
     /// Destroy the popup surface, if one exists.
     fn close_popup(&mut self) {
         if let Some(popup) = self.popup.take() {
-            let _ = graphics::surface_destroy(popup.window.surface);
+            let _ = popup.window.close();
         }
     }
 

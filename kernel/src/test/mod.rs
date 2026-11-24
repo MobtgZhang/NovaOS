@@ -38,6 +38,7 @@ pub mod m5;
 pub mod m6;
 pub mod m7;
 pub mod smp;
+pub mod sync;
 pub mod wallclock;
 
 /// Every suite name the kernel runs, in order.
@@ -119,6 +120,9 @@ pub const SUITE_NAMES: &[&str] = &[
     "wall_clock",
     // M8: SMP bring-up.
     "smp_cpu_state",
+    // Synchronization services: the futex table and condition variables.
+    "futex_table",
+    "condvar",
 ];
 
 /// Whether `address` falls inside the kernel image's virtual range.

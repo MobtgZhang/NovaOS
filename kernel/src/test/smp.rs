@@ -14,6 +14,7 @@
 
 use super::harness::TestSuite;
 use crate::boot::info::MAX_CPUS;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// The SMP suites, in registration order.
 pub static SMP_SUITES: &[TestSuite] = &[TestSuite {
@@ -44,112 +45,115 @@ pub static SMP_SUITES: &[TestSuite] = &[TestSuite {
             "created_threads_dispatch_across_online_cpus",
             created_threads_dispatch_across_online_cpus,
         ),
+        ("revoked_global_translation_is_not_reused", revoked_global_translation_is_not_reused),
     ],
 }];
 
-/// Newly created user threads must not be pinned to the bootstrap processor.
-///
-/// §3.2's failure mode was structural: every creation path named CPU 0, so the
-/// application processors could never host user work no matter how online they
-/// were. This case creates threads through the round-robin dispatcher and
-/// checks they land on more than one CPU — and that every landing spot is a
-/// CPU whose startup completed.
-///
-/// The threads are created with a kernel entry they never reach: they are
-/// never spawned, so no scheduler picks them up. They are marked `Exited` and
-/// reaped before the case returns, leaving the pools as it found them.
+const OLD_CONTENTS: u64 = 0x1122_3344;
+const NEW_CONTENTS: u64 = 0x5566_7788;
+static PROBE_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static PROBE_COMMAND: AtomicU64 = AtomicU64::new(0);
+static PROBE_OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+fn wait_for_probe(word: &AtomicU64, value: u64) -> bool {
+    let started = crate::arch::x86_64::cycles();
+    while word.load(Ordering::Acquire) != value {
+        if crate::arch::x86_64::cycles().wrapping_sub(started) >= 5_000_000_000 {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+extern "C" fn read_global_translation_on_ap() -> ! {
+    let address = PROBE_ADDRESS.load(Ordering::Acquire) as *const u64;
+    PROBE_OBSERVED.store(unsafe { address.read_volatile() }, Ordering::Release);
+    if wait_for_probe(&PROBE_COMMAND, 1) {
+        PROBE_OBSERVED.store(unsafe { address.read_volatile() }, Ordering::Release);
+    }
+    crate::arch::x86_64::port_io::cli();
+    unsafe { crate::sched::exit_current_and_switch_for_cpu(crate::arch::current_cpu()) }
+}
+
+fn revoked_global_translation_is_not_reused() -> Result<(), &'static str> {
+    use crate::arch::x86_64::paging::PageFlags;
+    use crate::mm::{address_space, direct_map, page_table};
+
+    let allocator = unsafe { crate::mm::frame_allocator() };
+    let page_size = crate::arch::ADDRESS_SPACE.page_size;
+    let address = boot_info().direct_map_offset + 0x0070_0000_0000;
+    let space = address_space::kernel_space();
+    if address_space::translate(&space, address).is_some() {
+        return Err("the shootdown test slot is already mapped");
+    }
+    let old = allocator.alloc().map_err(|_| "no old test frame")?;
+    let new = allocator.alloc().map_err(|_| "no replacement test frame")?;
+    let old_phys = old as u64 * page_size;
+    let new_phys = new as u64 * page_size;
+    unsafe {
+        direct_map::phys_to_virt(old_phys).cast::<u64>().write(OLD_CONTENTS);
+        direct_map::phys_to_virt(new_phys).cast::<u64>().write(NEW_CONTENTS);
+    }
+    address_space::map_kernel_mmio(address, old_phys).map_err(|_| "cannot map old test frame")?;
+    PROBE_ADDRESS.store(address, Ordering::Release);
+    if !crate::task::launch_thread_on(
+        1,
+        0x2000,
+        0,
+        space,
+        crate::sched::kernel_entry(read_global_translation_on_ap as *const () as u64),
+        [0; 2],
+    ) {
+        return Err("cannot start the shootdown probe on CPU 1");
+    }
+    if !wait_for_probe(&PROBE_OBSERVED, OLD_CONTENTS) {
+        return Err("CPU 1 did not populate the old translation");
+    }
+    address_space::set_writable(&space, address, false).map_err(|_| "cannot revoke write access")?;
+    let read_only = page_table::leaf_entry(&space.pml4(), address).ok_or("test PTE disappeared")?;
+    if read_only & PageFlags::WRITABLE.bits() != 0 {
+        return Err("write permission remained set");
+    }
+    if address_space::unmap(&space, address) != Ok(old_phys) {
+        return Err("unmap did not return the revoked frame");
+    }
+    unsafe { allocator.dealloc(old) };
+    address_space::map_kernel_mmio(address, new_phys).map_err(|_| "cannot map replacement frame")?;
+    PROBE_COMMAND.store(1, Ordering::Release);
+    if !wait_for_probe(&PROBE_OBSERVED, NEW_CONTENTS) {
+        return Err("CPU 1 did not observe the replacement translation");
+    }
+    if address_space::unmap(&space, address) != Ok(new_phys) {
+        return Err("cannot unmap the replacement frame");
+    }
+    unsafe { allocator.dealloc(new) };
+    Ok(())
+}
+
 fn created_threads_dispatch_across_online_cpus() -> Result<(), &'static str> {
-    let info = boot_info();
-    if info.processor_count() < 2 {
+    let count = boot_info().processor_count();
+    if count < 2 {
         return Err("this case needs at least one application processor");
     }
-
-    const CREATED: usize = 4;
-    let space = crate::mm::address_space::kernel_space();
-    let mut landed = [false; MAX_CPUS];
-    let mut ids = [0u32; CREATED];
-    for (index, id_slot) in ids.iter_mut().enumerate() {
-        let id = 0x2000 + index as u32;
-        // The entry must be a real park loop, not a placeholder address: a
-        // thread created here is runnable, so the next tick on its CPU can
-        // dispatch it before the cleanup below marks it exited — and a
-        // dispatched kernel thread that jumps to address zero faults in low
-        // memory, where the trampoline's 16-bit bytes decode as garbage in
-        // 64-bit mode. The AP idle entry parks instead, so a thread that
-        // slips into the window simply idles until it is reaped.
-        let entry = crate::boot::smp::ap_idle_entry as *const () as u64;
-        let Some(thread) =
-            crate::task::create_thread(id, 0, space, crate::task::Entry::Kernel(entry))
-        else {
-            return Err("the round-robin dispatcher could not create a thread");
-        };
-        if thread.cpu != 0 && !crate::boot::smp::is_online(thread.cpu) {
-            return Err("a thread was dispatched to a CPU that never came online");
-        }
-        landed[thread.cpu] = true;
-        *id_slot = id;
-    }
-
-    let distinct = landed.iter().filter(|seen| **seen).count();
-    if distinct < 2 {
-        return Err("every created thread landed on the same CPU");
-    }
-
-    // Clean up: mark each created thread `Exited`, then let every CPU reap
-    // its own pool — the bootstrap processor reaps directly here, and an AP
-    // reaps from its scheduler path on its own tick. The reap contract skips
-    // the CPU's current slot, so a thread that was dispatched before the mark
-    // is first switched out (it is parked in the idle entry) and reaped on a
-    // later tick. The mark is repeated because a tick that dispatched a
-    // thread after the first mark writes `Running` back into the record; the
-    // loop converges once every slot is empty, and the assertion below turns
-    // a stuck cleanup into a test failure rather than a hung machine.
-    let cpus = info.processor_count();
-    let mut attempts = 0;
-    while attempts < 8 {
-        attempts += 1;
-        for id in ids {
-            for cpu in 0..cpus {
-                if let Some(slot) = crate::task::slot_of_for_cpu(cpu, id)
-                    && let Some(mut thread) =
-                        (unsafe { crate::task::thread_in_slot_for_cpu(cpu, slot) })
-                {
-                    thread.state = crate::task::ThreadState::Exited;
-                    unsafe { crate::task::update_thread_for_cpu(cpu, slot, thread) };
-                }
+    let mut first = [false; MAX_CPUS];
+    for _ in 0..MAX_CPUS {
+        let mut order = crate::task::dispatch_order();
+        let cpu = order.next().ok_or("no online CPU to dispatch to")?;
+        first[cpu] = true;
+        let mut seen = [false; MAX_CPUS];
+        seen[cpu] = true;
+        for cpu in order {
+            if core::mem::replace(&mut seen[cpu], true) {
+                return Err("dispatch visits one CPU more than once");
             }
         }
-        unsafe { crate::sched::reap_exited_threads_for_cpu(0) };
-
-        let all_reaped = ids
-            .iter()
-            .all(|id| (0..cpus).all(|cpu| crate::task::slot_of_for_cpu(cpu, *id).is_none()));
-        if all_reaped {
-            break;
-        }
-        if attempts >= 8 {
-            break;
-        }
-
-        // Bounded spin: give the APs' periodic ticks time to switch the
-        // parked threads out and reap them. Same bound as the other cases
-        // that wait for an AP tick.
-        let mut spins = 0u64;
-        while spins < 10_000_000 {
-            spins += 1;
-            // SAFETY: `pause` changes no memory state and is valid while the
-            // interrupts this CPU masked are still masked.
-            unsafe {
-                core::arch::asm!("pause", options(nomem, nostack));
-            }
+        if (0..MAX_CPUS).any(|cpu| seen[cpu] != (cpu < count)) {
+            return Err("dispatch did not cover exactly the online CPUs");
         }
     }
-    for id in ids {
-        for cpu in 0..info.processor_count() {
-            if crate::task::slot_of_for_cpu(cpu, id).is_some() {
-                return Err("a reaped test thread still occupies a pool slot");
-            }
-        }
+    if !first[..count].iter().all(|seen| *seen) {
+        return Err("not every online CPU was preferred at least once");
     }
     Ok(())
 }

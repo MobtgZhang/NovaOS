@@ -17,9 +17,8 @@ pub extern "C" fn main() -> i64 {
     }
 
     loop {
-        let Some((_opcode, _payload, _caps)) = ipc::recv(endpoint) else {
-            continue;
-        };
-        let _ = ipc::reply(endpoint, 0, b"unsupported");
+        if let Some((_opcode, _payload, Some(token))) = ipc::recv(endpoint) {
+            let _ = ipc::reply(endpoint, token, b"unsupported");
+        }
     }
 }

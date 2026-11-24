@@ -11,9 +11,8 @@ pub extern "C" fn main() -> i64 {
     let _ = console::write_str("[NOVA] echo-server ready\r\n");
 
     loop {
-        let Some((_opcode, _payload, _caps)) = ipc::recv(endpoint) else {
-            continue;
-        };
-        let _ = ipc::reply(endpoint, 0, b"echo");
+        if let Some((_opcode, _payload, Some(token))) = ipc::recv(endpoint) {
+            let _ = ipc::reply(endpoint, token, b"echo");
+        }
     }
 }

@@ -49,6 +49,8 @@ const TIMER_PERIODIC: u32 = 1 << 17;
 /// EOI is correct by construction, and the PIC range below carries only a
 /// spurious-interrupt acknowledgement (see `idt`).
 pub const TIMER_VECTOR: u32 = 0x30;
+pub const WORK_VECTOR: u32 = 0xf0;
+pub const TLB_VECTOR: u32 = 0xf1;
 
 /// The interrupt command register — the low half, written last to fire.
 const ICR_LOW: u32 = 0x300;
@@ -185,6 +187,22 @@ unsafe fn write_icr(lapic_id: u32, command: u32) {
             core::arch::asm!("pause", options(nomem, nostack));
         }
     }
+}
+
+pub fn notify_work(cpu: usize) {
+    if cpu == crate::task::current_cpu() || (cpu != 0 && !crate::boot::smp::is_online(cpu)) {
+        return;
+    }
+    if let Some(id) = unsafe { crate::boot::read_boot_info() }.processor_id(cpu) {
+        unsafe { write_icr(id, WORK_VECTOR) };
+    }
+}
+
+pub(crate) fn notify_tlb(cpu: usize) {
+    let id = unsafe { crate::boot::read_boot_info() }
+        .processor_id(cpu)
+        .expect("online CPU is missing its APIC ID");
+    unsafe { write_icr(id, TLB_VECTOR) };
 }
 
 /// Read the CPU's initial APIC identity from CPUID leaf 1.

@@ -31,6 +31,7 @@ pub mod pit;
 pub mod port_io;
 pub mod rtc;
 pub mod smp;
+pub(crate) mod tlb;
 
 pub mod console;
 pub mod exit;
@@ -128,7 +129,7 @@ impl InterruptControl for Interrupts {
     }
 
     fn is_masked(&self) -> bool {
-        Self::read_flag()
+        !Self::read_flag()
     }
 }
 
@@ -175,6 +176,8 @@ pub unsafe fn arch_init() {
         gdt::init();
 
         idt::init();
+        assert_eq!(port_io::read_cr4() & (1 << 17), 0, "PCID is not supported");
+        msr::set_efer(msr::EFER_NXE);
     }
 
     // Interrupt routing has no safety requirement of its own but must not run
@@ -202,6 +205,8 @@ pub unsafe fn init_cpu(cpu: usize, direct_map_offset: u64) {
         percpu::init_for_cpu(cpu);
         gdt::init_cpu(cpu);
         idt::load();
+        assert_eq!(port_io::read_cr4() & (1 << 17), 0, "PCID is not supported");
+        msr::set_efer(msr::EFER_NXE);
         apic::init_for_cpu(cpu, direct_map_offset);
         // The syscall MSRs are per-processor: an application processor
         // boots with them zeroed, which would land the first ring-3

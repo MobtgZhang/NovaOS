@@ -58,10 +58,12 @@ pub mod display;
 pub mod fs;
 pub mod input;
 pub mod ipc;
+mod memory;
 pub mod net;
 pub mod object;
 pub mod process;
 pub mod supervisor;
+pub mod sync;
 
 use crate::sync::{SpinLock, SpinLockGuard};
 
@@ -304,6 +306,7 @@ pub fn two_caps_mut(
 pub struct KernelState {
     /// The object registry: what a capability handle resolves to.
     pub objects: ObjectRegistry,
+    mappings: memory::Mappings,
     /// The tasks' metadata, indexed by slot.
     pub tasks: [Option<TaskState>; MAX_TASKS],
     /// The tasks' capability tables, indexed by the same slot.
@@ -362,6 +365,7 @@ impl KernelState {
     pub const fn new() -> Self {
         Self {
             objects: ObjectRegistry::new(),
+            mappings: memory::Mappings::new(),
             tasks: [None; MAX_TASKS],
             caps: [CapabilityTable::new(); MAX_TASKS],
             ipc: IpcRegistry::new(),
@@ -639,10 +643,9 @@ impl KernelState {
         // or a few crashed clients could drain the table for everyone.
         self.files.close_owner(slot);
 
-        // A crashed GUI process must not leave its surfaces, focus, or buffer
-        // frames behind. The compositor owns the placement and the buffer
-        // objects; the task owns only the capabilities it attached.
-        self.compositor.remove_owner(slot, &mut self.objects);
+        self.compositor.remove_owner(slot);
+        self.remove_task_mappings(slot);
+        self.collect_unused_memory();
 
         // Kill the task's side of every channel it was party to, which is what
         // wakes a blocked peer with `E_PEER_DIED`.
@@ -712,6 +715,7 @@ impl KernelState {
     /// suite that left state behind would make the next suite's counts
     /// meaningless. This is the reset between them.
     pub fn reset(&mut self) {
+        self.reset_memory();
         self.objects.reset();
         self.tasks = [None; MAX_TASKS];
         // `clear` rather than a fresh array: a capability table is tens of
@@ -743,11 +747,8 @@ impl Default for KernelState {
 
 /// Holds the kernel's service state.
 ///
-/// The state sits behind a recursive interrupt-safe spin lock
-/// ([`crate::sync::SpinLock`]): dispatch paths may reach for the state while
-/// already holding it, and two processors may dispatch syscalls at overlapping
-/// times once user threads run on application processors. The guard each
-/// accessor returns dereferences to the state and releases on drop.
+/// The state sits behind an interrupt-masking spin lock. Dispatch helpers
+/// borrow the state from the caller instead of acquiring the lock again.
 struct SingleState {
     inner: SpinLock<KernelState>,
 }
@@ -811,9 +812,7 @@ pub unsafe fn init() {
 /// The guard dereferences to [`KernelState`]; dropping it releases the lock.
 /// The service layer never holds two independent borrows at once — every
 /// helper takes `&KernelState` or `&mut KernelState` explicitly rather than
-/// reaching for the global — and re-entrant acquisition from a dispatch path
-/// that already holds the state is detected by the lock's CPU-keyed
-/// recursion rather than aliasing two `&mut`.
+/// reaching for the global. Recursive acquisition is rejected.
 #[inline]
 pub fn state() -> SpinLockGuard<'static, KernelState> {
     STATE.inner.lock()

@@ -62,13 +62,14 @@
 //! at an address the user chose, which is precisely the primitive a ring 3
 //! attacker needs.
 
-use core::arch::asm;
 
 use crate::arch::shared::console::Console;
 use crate::arch::x86_64::msr;
 use crate::klog;
 use crate::logger::Level;
 use nova_abi::ErrorCode;
+
+pub(crate) mod ipc;
 
 /// The `RFLAGS` bits cleared on entry to the syscall handler.
 ///
@@ -342,7 +343,7 @@ pub unsafe extern "C" fn nova_kernel_syscall_dispatch(registers: *mut UserRegist
     // SAFETY: the stub passes a pointer to the fifteen saved words, which are
     // laid out exactly as `UserRegisters` declares them. The region is on the
     // kernel stack and is writable.
-    let registers = unsafe { &*registers };
+    let registers = unsafe { &mut *registers };
 
     let number = registers.rax;
     let args = registers.args();
@@ -353,27 +354,6 @@ pub unsafe extern "C" fn nova_kernel_syscall_dispatch(registers: *mut UserRegist
     // the caller had. The service layer's dispatcher is used for everything
     // else, so the policy is not duplicated.
     let outcome = dispatch(number, args);
-
-    // The effect is the scheduler's business, not the dispatcher's: a yield
-    // or an exit changes *who runs next*, and the scheduler owns that.
-    //
-    // SAFETY: the entry path is strictly serialised — `SFMASK` cleared `IF` on
-    // entry — so this single slot is written by exactly one caller at a time.
-    unsafe {
-        crate::task::note_syscall_effect(match outcome.effect {
-            nova_core::syscall::ThreadEffect::Continue => crate::task::ThreadEffect::Continue,
-            nova_core::syscall::ThreadEffect::Yield => crate::task::ThreadEffect::Yield,
-            nova_core::syscall::ThreadEffect::Exit => crate::task::ThreadEffect::Exit,
-            nova_core::syscall::ThreadEffect::Block => crate::task::ThreadEffect::Block,
-        });
-    }
-
-    // The result goes back into the saved `RAX`.
-    //
-    // SAFETY: `rax` is at a fixed offset within the region `registers` points
-    // at — the fifteenth word — and the region is on the kernel stack and
-    // writable.
-    //
     // Interrupts stay masked through here. Every transition below ends in an
     // `iretq` that restores the thread's own `RFLAGS` — for a user thread
     // those carry `IF` — so preemption becomes possible again at exactly the
@@ -384,14 +364,7 @@ pub unsafe extern "C" fn nova_kernel_syscall_dispatch(registers: *mut UserRegist
     // three-word same-privilege interrupt frame. That context is resumed
     // later at a garbage stack pointer, and the machine dies a few faults
     // later with no report in the log.
-    unsafe {
-        asm!(
-            "mov qword ptr [{base} + 112], {result}",
-            base = in(reg) registers,
-            result = in(reg) outcome.result.to_raw() as u64,
-            options(nostack),
-        );
-    }
+    registers.rax = outcome.result.to_raw() as u64;
 
     // A syscall can end in any of four scheduler transitions. All four go
     // through the same two steps — save the exact machine state into the
@@ -496,7 +469,22 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
         return read_from_console(args);
     }
 
-    stage_outgoing_payload(number, args);
+    if number == nova_abi::nr::FUTEX_WAIT.number() as u64 {
+        return futex_wait(args);
+    }
+
+    if number == nova_abi::nr::FUTEX_WAKE.number() as u64 {
+        return futex_wake(args);
+    }
+
+    if let Ok(number) = u32::try_from(number) {
+        match nova_abi::Syscall(number) {
+            nova_abi::nr::SEND | nova_abi::nr::RECV | nova_abi::nr::CALL | nova_abi::nr::REPLY => {
+                return ipc::dispatch(nova_abi::Syscall(number), args);
+            }
+            _ => {}
+        }
+    }
 
     let context = crate::task::current_syscall_context();
 
@@ -505,19 +493,11 @@ fn dispatch(number: u64, args: [u64; 6]) -> Outcome {
     // borrow of it.
     let outcome = unsafe { crate::services::dispatch::dispatch_syscall(&context, number, args) };
 
-    if number == nova_abi::nr::RECV.number() as u64
-        && !matches!(
-            outcome,
-            crate::services::dispatch::SyscallOutcome::Failed(_)
-        )
-    {
-        copy_received_payload(context.thread as usize, args);
-    }
-
     let mut effect = nova_core::syscall::ThreadEffect::Continue;
     if number == nova_abi::nr::YIELD.number() as u64 {
         effect = nova_core::syscall::ThreadEffect::Yield;
     } else if number == nova_abi::nr::THREAD_EXIT.number() as u64 {
+        unsafe { crate::task::note_exit_status(args[0] as i64) };
         effect = nova_core::syscall::ThreadEffect::Exit;
     }
 
@@ -563,6 +543,7 @@ fn copy_from_user(buffer: &mut [u8], pointer: u64, length: u64) -> Result<(), Er
         return Err(ErrorCode::Invalid);
     }
     user_range(pointer, length)?;
+    let _access = crate::mm::address_space::user_access();
     let Some(space) = crate::task::current_thread_space() else {
         return Err(ErrorCode::BadHandle);
     };
@@ -594,10 +575,38 @@ fn copy_from_user(buffer: &mut [u8], pointer: u64, length: u64) -> Result<(), Er
 
 /// Copy bytes into the calling process's address space.
 fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
-    user_range(pointer, bytes.len() as u64)?;
     let Some(space) = crate::task::current_thread_space() else {
         return Err(ErrorCode::BadHandle);
     };
+    copy_to_space(&space, pointer, bytes)
+}
+
+fn writable_range(
+    space: &crate::mm::address_space::AddressSpace,
+    pointer: u64,
+    length: u64,
+) -> Result<(), ErrorCode> {
+    user_range(pointer, length)?;
+    let page_size = crate::arch::ADDRESS_SPACE.page_size;
+    let start = pointer & !(page_size - 1);
+    let end = pointer + length - 1;
+    for address in (start..=end).step_by(page_size as usize) {
+        crate::mm::address_space::translate_user_write(space, address)
+            .ok_or(ErrorCode::Invalid)?;
+    }
+    Ok(())
+}
+
+fn copy_to_space(
+    space: &crate::mm::address_space::AddressSpace,
+    pointer: u64,
+    bytes: &[u8],
+) -> Result<(), ErrorCode> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let _access = crate::mm::address_space::user_access();
+    writable_range(space, pointer, bytes.len() as u64)?;
     let page_size = crate::arch::ADDRESS_SPACE.page_size;
     let mut copied = 0usize;
 
@@ -606,7 +615,7 @@ fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
         let offset = address & (page_size - 1);
         let chunk = core::cmp::min(page_size - offset, (bytes.len() - copied) as u64) as usize;
         let Some(phys) =
-            crate::mm::address_space::translate_user(&space, address & !(page_size - 1))
+            crate::mm::address_space::translate_user_write(space, address & !(page_size - 1))
         else {
             return Err(ErrorCode::Invalid);
         };
@@ -627,56 +636,97 @@ fn copy_to_user(pointer: u64, bytes: &[u8]) -> Result<(), ErrorCode> {
     Ok(())
 }
 
+/// Resolve the physical address of a 32-bit user word for the futex calls.
+///
+/// The futex key is the *physical* address of the word, so waiters and
+/// wakers that share a memory object meet on the same key no matter which
+/// virtual address each mapped it at. A misaligned pointer is refused: a
+/// futex word is a `u32`, and an unaligned key would let one word be
+/// watched under two different addresses.
+fn futex_word_phys(pointer: u64) -> Result<u64, ErrorCode> {
+    if pointer % 4 != 0 {
+        return Err(ErrorCode::Invalid);
+    }
+    user_range(pointer, 4)?;
+    let Some(space) = crate::task::current_thread_space() else {
+        return Err(ErrorCode::BadHandle);
+    };
+    let page_size = crate::arch::ADDRESS_SPACE.page_size;
+    let Some(phys) = crate::mm::address_space::translate_user(&space, pointer & !(page_size - 1))
+    else {
+        return Err(ErrorCode::Invalid);
+    };
+    Ok(phys + (pointer & (page_size - 1)))
+}
+
+/// `FUTEX_WAIT`: park the calling thread until the word at `arg0` changes.
+///
+/// The full contract lives on [`nova_abi::nr::FUTEX_WAIT`]. The park is
+/// signalled by returning a `Block` effect, exactly as a parked IPC call
+/// is; the registration in the futex table is what the wake will find.
+///
+/// The expected-value load and queue registration are serialized against wake.
+fn futex_wait(args: [u64; 6]) -> Outcome {
+    let fail = |code: ErrorCode| Outcome {
+        result: nova_core::syscall::SyscallResult::Failed(code),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    };
+
+    if args[2] != 0 {
+        // `arg2` is reserved for a timeout that is not implemented yet; a
+        // caller passing one must be told rather than silently ignored.
+        return fail(ErrorCode::Unsupported);
+    }
+
+    let pointer = args[0];
+    let expected = args[1] as u32;
+    let _access = crate::mm::address_space::user_access();
+    let phys = match futex_word_phys(pointer) {
+        Ok(phys) => phys,
+        Err(code) => return fail(code),
+    };
+
+    let context = crate::task::current_syscall_context();
+    let cpu = crate::arch::current_cpu();
+    let word = crate::mm::direct_map::phys_to_virt(phys).cast::<core::sync::atomic::AtomicU32>();
+    let matches = || unsafe { &*word }.load(core::sync::atomic::Ordering::Acquire) == expected;
+    if let Err(code) = crate::services::sync::register_wait_if(phys, context.thread, cpu, matches) {
+        return fail(code);
+    }
+
+    Outcome {
+        result: nova_core::syscall::SyscallResult::Value(0),
+        effect: nova_core::syscall::ThreadEffect::Block,
+    }
+}
+
+/// `FUTEX_WAKE`: wake up to `arg1` threads parked on the word at `arg0`.
+fn futex_wake(args: [u64; 6]) -> Outcome {
+    let fail = |code: ErrorCode| Outcome {
+        result: nova_core::syscall::SyscallResult::Failed(code),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    };
+
+    let pointer = args[0];
+    if args[1] == 0 {
+        return fail(ErrorCode::Invalid);
+    }
+    let max = args[1].min(crate::services::sync::MAX_FUTEX_WAITERS as u64) as usize;
+
+    let _access = crate::mm::address_space::user_access();
+    let phys = match futex_word_phys(pointer) {
+        Ok(phys) => phys,
+        Err(code) => return fail(code),
+    };
+
+    let woken = crate::services::sync::futex_wake(phys, max);
+    Outcome {
+        result: nova_core::syscall::SyscallResult::Value(woken as i64),
+        effect: nova_core::syscall::ThreadEffect::Continue,
+    }
+}
+
 /// Copy an IPC payload from user memory before the service dispatcher runs.
-fn stage_outgoing_payload(number: u64, args: [u64; 6]) {
-    let ipc_number = number == nova_abi::nr::SEND.number() as u64
-        || number == nova_abi::nr::CALL.number() as u64
-        || number == nova_abi::nr::REPLY.number() as u64;
-    if !ipc_number || args[3] == 0 || args[3] > nova_abi::ipc::MAX_INLINE_PAYLOAD as u64 {
-        return;
-    }
-
-    let mut payload = [0u8; nova_abi::ipc::MAX_INLINE_PAYLOAD];
-    if copy_from_user(&mut payload, args[2], args[3]).is_err() {
-        return;
-    }
-    let opcode = if number == nova_abi::nr::REPLY.number() as u64 {
-        0
-    } else {
-        args[1]
-    };
-    let message = nova_ipc::Message::with_payload(opcode, &payload[..args[3] as usize]);
-    let Ok(message) = message else {
-        return;
-    };
-
-    // SAFETY: service state is installed before user processes can run.
-    let mut kernel = crate::services::state();
-    let thread = crate::task::current_syscall_context().thread as usize;
-    if thread < kernel.outgoing_message.len() {
-        kernel.outgoing_message[thread] = Some(message);
-    }
-}
-
-/// Copy the payload of a successfully received IPC message to user memory.
-fn copy_received_payload(thread: usize, args: [u64; 6]) {
-    if args[2] == 0 || args[3] == 0 {
-        return;
-    }
-
-    // SAFETY: service state is installed before user processes can run.
-    unsafe {
-        let mut kernel = crate::services::state();
-        let Some(message) = kernel.last_message.get(thread).and_then(Option::as_ref) else {
-            return;
-        };
-        let payload = message.payload();
-        if payload.len() <= args[3] as usize {
-            let _ = copy_to_user(args[2], payload);
-        }
-    }
-}
-
 /// Start an initramfs image as a child process.
 fn process_exec(args: [u64; 6]) -> Outcome {
     const MAX_NAME: usize = 32;

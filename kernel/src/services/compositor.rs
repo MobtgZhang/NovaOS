@@ -417,9 +417,6 @@ impl CompositorService {
         let width = existing.width;
         let height = existing.height;
 
-        // A buffer capability names one object; two surfaces sharing it would
-        // make closing one window free the other's pixels. Refuse the second
-        // attachment rather than hiding the double ownership.
         if self.surfaces.iter().flatten().any(|other| {
             other.id != id
                 && other
@@ -510,17 +507,8 @@ impl CompositorService {
         Ok(serial)
     }
 
-    /// Destroy a surface, releasing the buffer it attached.
-    ///
-    /// The buffer is freed only if its object still lives in the registry. A
-    /// client that destroyed the memory object first has already returned its
-    /// frames, so this must not free them a second time.
-    pub fn destroy(
-        &mut self,
-        id: u32,
-        owner: usize,
-        objects: &mut crate::services::object::ObjectRegistry,
-    ) -> Result<(), ErrorCode> {
+    /// Destroy a surface and drop its reference to the backing object.
+    pub fn destroy(&mut self, id: u32, owner: usize) -> Result<(), ErrorCode> {
         let Some(slot) = self
             .surfaces
             .iter()
@@ -532,14 +520,6 @@ impl CompositorService {
         if surface.owner != owner {
             return Err(ErrorCode::Denied);
         }
-        if let Some(buffer) = surface.buffer {
-            if let Some(kind) = objects.get(buffer.object_ref) {
-                if let ObjectKind::MemoryObject { .. } = *kind {
-                    crate::services::dispatch::free_memory_object(buffer.base, buffer.size);
-                    objects.destroy(buffer.object_ref);
-                }
-            }
-        }
         self.surfaces[slot] = None;
         if self.focused == Some(id) {
             // Focus moves to the topmost remaining surface, so a closed window
@@ -547,6 +527,22 @@ impl CompositorService {
             self.focused = self.topmost();
         }
         Ok(())
+    }
+
+    pub(super) fn has_buffer(&self, object: ObjectRef) -> bool {
+        self.surfaces.iter().flatten().any(|surface| {
+            surface.buffer.is_some_and(|buffer| buffer.object_ref == object)
+        })
+    }
+
+    pub(super) fn detach_buffer(&mut self, object: ObjectRef) {
+        for surface in self.surfaces.iter_mut().flatten() {
+            if surface.buffer.is_some_and(|buffer| buffer.object_ref == object) {
+                surface.buffer = None;
+                surface.full = true;
+                surface.dirty = true;
+            }
+        }
     }
 
     /// Move a surface.
@@ -1080,11 +1076,7 @@ impl CompositorService {
     ///
     /// Called when a task dies. A crashed GUI process must not leave its window,
     /// its focus, or its frames behind.
-    pub fn remove_owner(
-        &mut self,
-        owner: usize,
-        objects: &mut crate::services::object::ObjectRegistry,
-    ) -> usize {
+    pub fn remove_owner(&mut self, owner: usize) -> usize {
         let mut removed = 0usize;
         let mut focus_lost = false;
 
@@ -1094,14 +1086,6 @@ impl CompositorService {
             };
             if surface.owner != owner {
                 continue;
-            }
-            if let Some(buffer) = surface.buffer {
-                if let Some(kind) = objects.get(buffer.object_ref) {
-                    if let ObjectKind::MemoryObject { .. } = *kind {
-                        crate::services::dispatch::free_memory_object(buffer.base, buffer.size);
-                        objects.destroy(buffer.object_ref);
-                    }
-                }
             }
             if self.focused == Some(surface.id) {
                 focus_lost = true;
@@ -1137,7 +1121,7 @@ impl CompositorService {
             SURFACE_OP_ATTACH => self.handle_attach(payload, owner, table, objects),
             SURFACE_OP_DAMAGE => self.handle_damage(payload, owner),
             SURFACE_OP_COMMIT => self.handle_commit(payload, owner),
-            SURFACE_OP_DESTROY => self.handle_destroy(payload, owner, objects),
+            SURFACE_OP_DESTROY => self.handle_destroy(payload, owner),
             COMPOSITOR_OP_CONFIGURE => self.handle_configure(payload, owner),
             COMPOSITOR_OP_FRAME_DONE => self.handle_frame_done(payload, owner),
             COMPOSITOR_OP_MOVE => self.handle_move(payload, owner),
@@ -1328,12 +1312,7 @@ impl CompositorService {
         }
     }
 
-    fn handle_destroy(
-        &mut self,
-        payload: &[u8],
-        owner: usize,
-        objects: &mut crate::services::object::ObjectRegistry,
-    ) -> Message {
+    fn handle_destroy(&mut self, payload: &[u8], owner: usize) -> Message {
         if payload.len() != SURFACE_DESTROY_REQUEST_SIZE {
             return reply_error(ErrorCode::Invalid, SURFACE_REPLY_SIZE);
         }
@@ -1347,7 +1326,7 @@ impl CompositorService {
             return reply_error(ErrorCode::Invalid, SURFACE_REPLY_SIZE);
         };
 
-        match self.destroy(surface, owner, objects) {
+        match self.destroy(surface, owner) {
             Ok(()) => reply_status(0),
             Err(code) => reply_error(code, SURFACE_REPLY_SIZE),
         }

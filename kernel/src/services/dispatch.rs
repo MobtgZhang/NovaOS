@@ -187,7 +187,11 @@ pub unsafe fn dispatch_syscall(
     // SAFETY: delegated to this function's contract: the state is installed
     // and no other borrow of it is live.
     let mut kernel = state();
-    dispatch_syscall_in(&mut kernel, context, number, args)
+    let outcome = dispatch_syscall_in(&mut kernel, context, number, args);
+    if number == nr::THREAD_EXIT.raw() {
+        crate::syscall::ipc::collect_after_exit(&mut kernel, context.task_slot);
+    }
+    outcome
 }
 
 /// Dispatch one syscall against an explicit service state.
@@ -247,29 +251,37 @@ pub fn dispatch_typed(
         nr::OBJECT_DESTROY => object_destroy(kernel, context, args),
         nr::CAP_DEREGATE => cap_delegate(kernel, context, args),
         nr::CAP_REVOKE => cap_revoke(kernel, context, args),
-        nr::SEND => send(kernel, context, args, false),
+        nr::SEND | nr::CALL => {
+            let message = staged_message(kernel, context, args[1]);
+            send(kernel, context, args[0], message, number == nr::CALL)
+        }
         nr::RECV => recv(kernel, context, args),
-        nr::CALL => send(kernel, context, args, true),
-        nr::REPLY => reply(kernel, context, args),
+        nr::REPLY => {
+            let message = staged_message(kernel, context, 0);
+            reply(kernel, context, args[0], args[1], message)
+        }
         nr::MAP => map_memory(kernel, context, args),
         nr::YIELD => SyscallOutcome::Value(0),
         nr::THREAD_EXIT => {
-            crate::services::process::retire_task(context.task_slot);
+            // A wait never outlives its waiter: the exiting thread's futex
+            // registrations return to the table before its slot is retired.
+            crate::services::sync::abandon_thread(context.thread);
+            kernel.retire_task(context.task_slot);
             SyscallOutcome::Value(args[0] as i64)
         }
-        nr::ENDPOINT_CREATE => match process::create_endpoint_pair() {
+        nr::ENDPOINT_CREATE => match process::create_endpoint_pair(kernel, context.task_slot) {
             Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
             Err(code) => SyscallOutcome::Failed(code),
         },
-        nr::ENDPOINT_PEER_CREATE => match process::take_pending_endpoint() {
+        nr::ENDPOINT_PEER_CREATE => match process::take_pending_endpoint(kernel, context.task_slot) {
             Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
             Err(code) => SyscallOutcome::Failed(code),
         },
-        nr::ENDPOINT_SELF => match process::management_endpoint() {
+        nr::ENDPOINT_SELF => match process::management_endpoint(kernel, context.task_slot) {
             Ok(handle) => SyscallOutcome::Value(handle.raw() as i64),
             Err(code) => SyscallOutcome::Failed(code),
         },
-        nr::PROCESS_COUNT => SyscallOutcome::Value(process::live_task_count() as i64),
+        nr::PROCESS_COUNT => SyscallOutcome::Value(process::live_task_count(kernel) as i64),
         _ => SyscallOutcome::Failed(ErrorCode::Unsupported),
     }
 }
@@ -395,11 +407,15 @@ fn object_create(
     let rights = requested.intersect(Rights::ALL);
     let KernelStateParts { caps, objects, .. } = kernel.split();
     let Some(table) = caps.get_mut(context.task_slot) else {
+        release_unpublished_memory(kind);
         return SyscallOutcome::Failed(ErrorCode::BadHandle);
     };
     match cap::create(table, objects, kind, rights) {
         Ok((handle, _)) => SyscallOutcome::Value(handle.raw() as i64),
-        Err(code) => SyscallOutcome::Failed(code),
+        Err(code) => {
+            release_unpublished_memory(kind);
+            SyscallOutcome::Failed(code)
+        }
     }
 }
 
@@ -443,22 +459,17 @@ fn create_memory_object(size: u64) -> Result<ObjectKind, ErrorCode> {
         Err(_) => return Err(ErrorCode::NoMemory),
     };
 
-    let base = (first as u64).saturating_mul(PAGE_SIZE);
+    let base = first as u64 * PAGE_SIZE;
+    unsafe { crate::mm::direct_map::phys_to_virt(base).write_bytes(0, aligned as usize) };
     Ok(ObjectKind::MemoryObject {
         base,
         size: aligned,
     })
 }
 
-/// Return a memory object's frames to the allocator.
-pub(crate) fn free_memory_object(base: u64, size: u64) {
-    let start = (base / PAGE_SIZE) as usize;
-    let count = (size / PAGE_SIZE) as usize;
-    let allocator = unsafe { crate::mm::frame_allocator() };
-    for index in 0..count {
-        // SAFETY: the object was created from a contiguous run of frames that
-        // this kernel allocated, and it is being destroyed once.
-        unsafe { allocator.dealloc(start.saturating_add(index)) };
+fn release_unpublished_memory(kind: ObjectKind) {
+    if let ObjectKind::MemoryObject { base, size } = kind {
+        super::memory::release_frames(base, size);
     }
 }
 
@@ -469,15 +480,11 @@ pub(crate) fn free_memory_object(base: u64, size: u64) {
 /// read-only, `2` read-execute. The mapping is page by page because the ABI's
 /// address space is page granular; `length` and `virt` must already be page
 /// aligned, and the region must lie inside the object.
-fn map_memory(kernel: &KernelState, context: &SyscallContext, args: [u64; 6]) -> SyscallOutcome {
+fn map_memory(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> SyscallOutcome {
     let handle = CapHandle::from_raw(args[0]);
     let virt = args[1];
     let length = args[2];
     let protection_code = args[3];
-
-    if length == 0 || length % PAGE_SIZE != 0 || virt % PAGE_SIZE != 0 {
-        return SyscallOutcome::Failed(ErrorCode::Invalid);
-    }
 
     let Some(table) = kernel.caps_at(context.task_slot) else {
         return SyscallOutcome::Failed(ErrorCode::BadHandle);
@@ -487,14 +494,6 @@ fn map_memory(kernel: &KernelState, context: &SyscallContext, args: [u64; 6]) ->
         Ok(resolved) => resolved,
         Err(code) => return SyscallOutcome::Failed(code),
     };
-
-    let ObjectKind::MemoryObject { base, size } = resolved.kind else {
-        return SyscallOutcome::Failed(ErrorCode::Invalid);
-    };
-
-    if length > size {
-        return SyscallOutcome::Failed(ErrorCode::Invalid);
-    }
 
     let protection = match protection_code {
         0 => Protection::UserReadWrite,
@@ -507,18 +506,10 @@ fn map_memory(kernel: &KernelState, context: &SyscallContext, args: [u64; 6]) ->
         return SyscallOutcome::Failed(ErrorCode::BadHandle);
     };
 
-    let pages = length / PAGE_SIZE;
-    for index in 0..pages {
-        let offset = index.saturating_mul(PAGE_SIZE);
-        let page_virt = virt.saturating_add(offset);
-        let page_phys = base.saturating_add(offset);
-
-        if crate::mm::address_space::map(&space, page_virt, page_phys, protection).is_err() {
-            return SyscallOutcome::Failed(ErrorCode::Invalid);
-        }
+    match kernel.map_memory(context.task_slot, resolved.object_ref, space, virt, length, protection) {
+        Ok(result) => SyscallOutcome::Value(result as i64),
+        Err(code) => SyscallOutcome::Failed(code),
     }
-
-    SyscallOutcome::Value(pages as i64)
 }
 
 /// The handle of the kernel's root capability in a task's table.
@@ -558,11 +549,9 @@ fn object_destroy(
         Err(code) => return SyscallOutcome::Failed(code),
     };
 
-    // A memory object owns physical frames. Destroying it is the point at
-    // which those frames must return to the allocator; otherwise a program
-    // that creates and closes windows leaks every surface buffer it ever used.
-    if let ObjectKind::MemoryObject { base, size } = resolved.kind {
-        free_memory_object(base, size);
+    if matches!(resolved.kind, ObjectKind::MemoryObject { .. }) {
+        kernel.destroy_memory(resolved.object_ref);
+        return SyscallOutcome::Value(0);
     }
 
     let object_ref = resolved.object_ref;
@@ -618,7 +607,10 @@ fn cap_revoke(
     };
 
     match cap::revoke(table, handle, nova_cap::RevocationScope::Descendants) {
-        Ok(count) => SyscallOutcome::Value(count as i64),
+        Ok(count) => {
+            kernel.collect_unused_memory();
+            SyscallOutcome::Value(count as i64)
+        }
         Err(code) => SyscallOutcome::Failed(code),
     }
 }
@@ -637,13 +629,19 @@ fn cap_revoke(
 /// The message's capabilities are transferred from the caller's table to the
 /// *destination* task's table. The destination is the peer of this endpoint's
 /// channel — the task that holds the other side.
-fn send(
+fn staged_message(kernel: &KernelState, context: &SyscallContext, opcode: u64) -> Message {
+    kernel.outgoing_message.get(context.thread as usize).copied().flatten()
+        .unwrap_or_else(|| Message::new(opcode))
+}
+
+pub(crate) fn send(
     kernel: &mut KernelState,
     context: &SyscallContext,
-    args: [u64; 6],
+    handle: u64,
+    message: Message,
     is_call: bool,
 ) -> SyscallOutcome {
-    let handle = CapHandle::from_raw(args[0]);
+    let handle = CapHandle::from_raw(handle);
 
     if kernel.task_at_slot(context.task_slot).is_none() {
         return SyscallOutcome::Failed(ErrorCode::BadHandle);
@@ -669,15 +667,11 @@ fn send(
         // No peer task: the message goes nowhere, so the operation is
         // refused rather than silently dropped. A dropped message is a
         // message the sender believes was delivered.
-        return SyscallOutcome::Failed(ErrorCode::Closed);
-    };
-
-    // The message the entry path staged, or an empty one.
-    let thread = context.thread as usize;
-    let message = if thread < crate::services::MAX_THREADS {
-        kernel.outgoing_message[thread].unwrap_or_else(|| Message::new(args[1]))
-    } else {
-        Message::new(args[1])
+        let error = match kernel.ipc.channel(channel_id) {
+            Some(channel) if !channel.peer_alive(side) => ErrorCode::PeerDied,
+            _ => ErrorCode::Closed,
+        };
+        return SyscallOutcome::Failed(error);
     };
 
     // The borrows are of different fields, so they are split explicitly: the
@@ -750,42 +744,52 @@ fn send(
 /// slots, so the entry path can hand them to user space after the call
 /// returns.
 fn recv(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> SyscallOutcome {
-    let handle = CapHandle::from_raw(args[0]);
+    match receive(kernel, context, args[0]) {
+        Ok(received) => {
+            let thread = context.thread as usize;
+            if thread < crate::services::MAX_THREADS {
+                kernel.last_message[thread] = Some(received.message);
+                kernel.last_token[thread] = received.reply_token;
+                kernel.last_error[thread] = None;
+            }
+            SyscallOutcome::Value(received.message.opcode() as i64)
+        }
+        Err(outcome) => outcome,
+    }
+}
+
+pub(crate) fn receive(
+    kernel: &mut KernelState,
+    context: &SyscallContext,
+    handle: u64,
+) -> Result<nova_ipc::endpoint::Received, SyscallOutcome> {
+    let handle = CapHandle::from_raw(handle);
 
     if kernel.task_at_slot(context.task_slot).is_none() {
-        return SyscallOutcome::Failed(ErrorCode::BadHandle);
+        return Err(SyscallOutcome::Failed(ErrorCode::BadHandle));
     }
     let Some(table) = kernel.caps_at(context.task_slot) else {
-        return SyscallOutcome::Failed(ErrorCode::BadHandle);
+        return Err(SyscallOutcome::Failed(ErrorCode::BadHandle));
     };
 
     let resolved = match cap::resolve(table, &kernel.objects, handle, Rights::RECEIVE) {
         Ok(resolved) => resolved,
-        Err(code) => return SyscallOutcome::Failed(code),
+        Err(code) => return Err(SyscallOutcome::Failed(code)),
     };
 
     let ObjectKind::Endpoint { channel, side } = resolved.kind else {
-        return SyscallOutcome::Failed(ErrorCode::Invalid);
+        return Err(SyscallOutcome::Failed(ErrorCode::Invalid));
     };
 
     let channel_id = nova_ipc::ChannelId::new(channel);
     let Some(channel) = kernel.ipc.channel_mut(channel_id) else {
-        return SyscallOutcome::Failed(ErrorCode::BadHandle);
+        return Err(SyscallOutcome::Failed(ErrorCode::BadHandle));
     };
     let endpoint = channel.endpoint(side, resolved.rights);
-    let (outcome, token) = crate::services::ipc::recv(channel, &endpoint, context.thread);
-    match outcome {
-        IpcOutcome::Ready(message) => {
-            let thread = context.thread as usize;
-            if thread < crate::services::MAX_THREADS {
-                kernel.last_message[thread] = Some(message);
-                kernel.last_token[thread] = token;
-                kernel.last_error[thread] = None;
-            }
-            SyscallOutcome::Value(message.opcode() as i64)
-        }
-        IpcOutcome::Blocked => SyscallOutcome::Blocked,
-        IpcOutcome::Failed(code) => SyscallOutcome::Failed(code),
+    match channel.recv(&endpoint, context.thread) {
+        nova_ipc::OpResult::Ready(received) => Ok(received),
+        nova_ipc::OpResult::Blocked => Err(SyscallOutcome::Blocked),
+        nova_ipc::OpResult::Error(code) => Err(SyscallOutcome::Failed(code)),
     }
 }
 
@@ -796,9 +800,15 @@ fn recv(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> S
 /// The reply message is the one the entry path staged in
 /// [`KernelState::outgoing_message`]; a reply with no staged message is an
 /// empty one.
-fn reply(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> SyscallOutcome {
-    let handle = CapHandle::from_raw(args[0]);
-    let token = nova_ipc::ReplyToken::from_raw(args[1]);
+pub(crate) fn reply(
+    kernel: &mut KernelState,
+    context: &SyscallContext,
+    handle: u64,
+    token: u64,
+    message: Message,
+) -> SyscallOutcome {
+    let handle = CapHandle::from_raw(handle);
+    let token = nova_ipc::ReplyToken::from_raw(token);
 
     if kernel.task_at_slot(context.task_slot).is_none() {
         return SyscallOutcome::Failed(ErrorCode::BadHandle);
@@ -814,13 +824,6 @@ fn reply(kernel: &mut KernelState, context: &SyscallContext, args: [u64; 6]) -> 
 
     let ObjectKind::Endpoint { channel, side } = resolved.kind else {
         return SyscallOutcome::Failed(ErrorCode::Invalid);
-    };
-
-    let thread = context.thread as usize;
-    let message = if thread < crate::services::MAX_THREADS {
-        kernel.outgoing_message[thread].unwrap_or_else(|| Message::new(0))
-    } else {
-        Message::new(0)
     };
 
     let Some(channel) = kernel.ipc.channel_mut(nova_ipc::ChannelId::new(channel)) else {
@@ -897,8 +900,18 @@ pub fn service_request(
     // A surface change is not displayed until the compositor presents the
     // pending frame. An idle service request with no damage presents nothing,
     // which is the no-busy-spin path.
-    if matches!(service, SERVICE_COMPOSITOR | SERVICE_INPUT) {
-        match compositor.present() {
+    let presentation = if matches!(service, SERVICE_COMPOSITOR | SERVICE_INPUT) {
+        Some(compositor.present())
+    } else {
+        None
+    };
+    if service == SERVICE_COMPOSITOR
+        && matches!(opcode, nova_protocols::surface::SURFACE_OP_ATTACH | nova_protocols::surface::SURFACE_OP_DESTROY)
+    {
+        kernel.collect_unused_memory();
+    }
+    if let Some(presentation) = presentation {
+        match presentation {
             Ok(_) => {}
             Err(DisplayError::NoDisplay) => return Err(ErrorCode::Unsupported),
             Err(DisplayError::OutOfBounds | DisplayError::InvalidBuffer) => {

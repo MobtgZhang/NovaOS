@@ -28,7 +28,7 @@
 
 use nova_abi::cap::{CapHandle, Rights};
 use nova_abi::error::ErrorCode;
-use nova_abi::layout::{PAGE_SIZE, USER_HEAP_BASE};
+use nova_abi::layout::PAGE_SIZE;
 use nova_abi::{ObjectType, nr};
 use nova_protocols::display::{
     DISPLAY_OP_QUERY, DISPLAY_QUERY_REPLY_SIZE, DISPLAY_VERSION, DisplayQueryReply,
@@ -600,6 +600,7 @@ pub struct Window {
     pub width: u32,
     /// Height in pixels.
     pub height: u32,
+    object: CapHandle,
     /// The serial of the last committed frame.
     serial: u64,
 }
@@ -607,12 +608,13 @@ pub struct Window {
 impl Window {
     /// Open a `width` x `height` window and map the buffer to draw into.
     pub fn open(width: u32, height: u32) -> Result<Window, ErrorCode> {
-        let (surface, buffer) = open_window(width, height)?;
+        let (surface, buffer, object) = allocate_window(width, height, 0)?;
         Ok(Window {
             surface,
             buffer,
             width,
             height,
+            object,
             serial: 0,
         })
     }
@@ -623,14 +625,22 @@ impl Window {
     /// fullscreen, so an ordinary raise would cover every window on the
     /// desktop. A pinned window still takes focus and pointer events.
     pub fn open_bottom(width: u32, height: u32) -> Result<Window, ErrorCode> {
-        let (surface, buffer) = open_window_with_flags(width, height, SURFACE_CREATE_FLAG_BOTTOM)?;
+        let (surface, buffer, object) = allocate_window(width, height, SURFACE_CREATE_FLAG_BOTTOM)?;
         Ok(Window {
             surface,
             buffer,
             width,
             height,
+            object,
             serial: 0,
         })
+    }
+
+    /// Release the window and its mapped pixel buffer.
+    pub fn close(self) -> Result<(), ErrorCode> {
+        let surface = surface_destroy(self.surface);
+        let object = destroy_object(self.object);
+        surface.and(object)
     }
 
     /// Show the window's current contents under a fresh serial.
@@ -769,19 +779,15 @@ pub fn map_memory(buffer: CapHandle, size: u64) -> Result<*mut u8, ErrorCode> {
         return Err(ErrorCode::Invalid);
     }
 
-    let pages = syscall::call(
-        nr::MAP.raw(),
-        [buffer.raw(), USER_HEAP_BASE, aligned, 0, 0, 0],
-    )
-    .map_err(error_code)?;
-    if pages == 0 {
+    let address = syscall::call(nr::MAP.raw(), [buffer.raw(), 0, aligned, 0, 0, 0])
+        .map_err(error_code)?;
+    if address == 0 {
         return Err(ErrorCode::Invalid);
     }
-    Ok(USER_HEAP_BASE as *mut u8)
+    Ok(address as *mut u8)
 }
 
-/// Destroy a `MemoryObject`. A surface destroy already releases the buffer,
-/// so a program should call this only when it has not destroyed the surface.
+/// Destroy a `MemoryObject`, revoking all aliases to its frames.
 pub fn destroy_object(buffer: CapHandle) -> Result<(), ErrorCode> {
     syscall::call(nr::OBJECT_DESTROY.raw(), [buffer.raw(), 0, 0, 0, 0, 0]).map_err(error_code)?;
     Ok(())
@@ -803,6 +809,14 @@ pub fn open_window_with_flags(
     height: u32,
     flags: u32,
 ) -> Result<(u32, *mut u8), ErrorCode> {
+    allocate_window(width, height, flags).map(|(surface, pointer, _)| (surface, pointer))
+}
+
+fn allocate_window(
+    width: u32,
+    height: u32,
+    flags: u32,
+) -> Result<(u32, *mut u8, CapHandle), ErrorCode> {
     let bytes = (width as u64)
         .checked_mul(height as u64)
         .and_then(|pixels| pixels.checked_mul(4))
@@ -833,5 +847,5 @@ pub fn open_window_with_flags(
         let _ = surface_destroy(surface);
         return Err(error);
     }
-    Ok((surface, pointer))
+    Ok((surface, pointer, buffer))
 }

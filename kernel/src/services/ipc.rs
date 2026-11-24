@@ -241,22 +241,17 @@ impl IpcRegistry {
     /// output array is full is counted, not dropped silently: a lost wakeup is
     /// a hung thread, which is far worse than a reported overflow.
     pub fn drain_completions(&mut self, out: &mut [Completion]) -> usize {
-        let mut count = 0usize;
-        for entry in self.channels.iter_mut().flatten() {
-            let sink = entry.completions();
-            for index in 0..sink.len() {
-                if count >= out.len() {
-                    return count;
-                }
-                let Some(completion) = sink.get(index) else {
-                    continue;
-                };
-                out[count] = completion;
-                count += 1;
-            }
-            entry.take_completions();
+        for (index, slot) in out.iter_mut().enumerate() {
+            let Some(completion) = self.pop_completion() else {
+                return index;
+            };
+            *slot = completion;
         }
-        count
+        out.len()
+    }
+
+    pub(crate) fn pop_completion(&mut self) -> Option<Completion> {
+        self.channels.iter_mut().flatten().find_map(Channel::pop_completion)
     }
 }
 

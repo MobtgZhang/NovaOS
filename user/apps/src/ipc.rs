@@ -1,6 +1,6 @@
 use nova_abi::cap::CapHandle;
 use nova_abi::nr;
-use nova_ipc::message::MAX_INLINE_PAYLOAD;
+use nova_ipc::{ReplyToken, message::MAX_INLINE_PAYLOAD};
 
 use crate::syscall;
 
@@ -46,10 +46,11 @@ pub fn call(
     endpoint: CapHandle,
     opcode: u64,
     payload: &[u8],
-) -> Result<usize, syscall::SyscallError> {
+) -> Result<[u8; MAX_PAYLOAD], syscall::SyscallError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(syscall::SyscallError::ShortWrite);
     }
+    let mut reply = [0; MAX_PAYLOAD];
     syscall::call(
         nr::CALL.raw(),
         [
@@ -57,15 +58,16 @@ pub fn call(
             opcode,
             payload.as_ptr() as u64,
             payload.len() as u64,
-            0,
-            0,
+            reply.as_mut_ptr() as u64,
+            reply.len() as u64,
         ],
     )
-    .map(|_| MAX_PAYLOAD)
+    .map(|_| reply)
 }
 
-pub fn recv(endpoint: CapHandle) -> Option<(u64, [u8; MAX_PAYLOAD], CapHandle)> {
+pub fn recv(endpoint: CapHandle) -> Option<(u64, [u8; MAX_PAYLOAD], Option<ReplyToken>)> {
     let mut payload = [0u8; MAX_PAYLOAD];
+    let mut token = 0u64;
     let raw = syscall::call(
         nr::RECV.raw(),
         [
@@ -73,16 +75,21 @@ pub fn recv(endpoint: CapHandle) -> Option<(u64, [u8; MAX_PAYLOAD], CapHandle)> 
             0,
             payload.as_mut_ptr() as u64,
             payload.len() as u64,
-            0,
+            &mut token as *mut u64 as u64,
             0,
         ],
     )
     .ok()?;
     let opcode = raw as u64;
-    Some((opcode, payload, CapHandle::INVALID))
+    let token = (token != 0).then(|| ReplyToken::from_raw(token));
+    Some((opcode, payload, token))
 }
 
-pub fn reply(endpoint: CapHandle, token: u64, payload: &[u8]) -> Result<(), syscall::SyscallError> {
+pub fn reply(
+    endpoint: CapHandle,
+    token: ReplyToken,
+    payload: &[u8],
+) -> Result<(), syscall::SyscallError> {
     if payload.len() > MAX_PAYLOAD {
         return Err(syscall::SyscallError::ShortWrite);
     }
@@ -90,7 +97,7 @@ pub fn reply(endpoint: CapHandle, token: u64, payload: &[u8]) -> Result<(), sysc
         nr::REPLY.raw(),
         [
             endpoint.raw(),
-            token,
+            token.to_raw(),
             payload.as_ptr() as u64,
             payload.len() as u64,
             0,

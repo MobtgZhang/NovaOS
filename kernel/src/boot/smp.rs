@@ -16,9 +16,8 @@
 //! # What the AP owns
 //!
 //! Each AP gets its own kernel stack, GDT/TSS pair, local APIC timer, scheduler,
-//! thread pool, and one kernel-only idle thread. It does not enter ring 3 and it
-//! does not use the bootstrap processor's user-service state. That keeps the SMP
-//! foundation real without pretending that the service layer is concurrency-safe.
+//! thread pool, and one kernel idle thread. Application processors can schedule
+//! user threads and deliver remote wakeups; device ownership remains separate.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -40,6 +39,15 @@ static AP_SCHEDULER_THREADS: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new
 static AP_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static AP_SCHED_TICKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static AP_TSS_RSP0: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static WORK_IPIS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+pub(crate) fn record_work_ipi(cpu: usize) {
+    WORK_IPIS[cpu].fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn work_ipi_count(cpu: usize) -> u64 {
+    WORK_IPIS[cpu].load(Ordering::Relaxed)
+}
 /// Publish that the bootstrap-side state is ready for APs.
 pub fn mark_ready() {
     SMP_READY.store(true, Ordering::Release);

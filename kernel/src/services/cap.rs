@@ -117,8 +117,13 @@ pub fn create(
     rights: Rights,
 ) -> Result<(CapHandle, ObjectRef), ErrorCode> {
     let object_ref = objects.create(kind).ok_or(ErrorCode::NoMemory)?;
-    let handle = table.create(object_ref, rights)?;
-    Ok((handle, object_ref))
+    match table.create(object_ref, rights) {
+        Ok(handle) => Ok((handle, object_ref)),
+        Err(code) => {
+            objects.destroy(object_ref);
+            Err(code)
+        }
+    }
 }
 
 /// Mint a path-scoped grant for a task.

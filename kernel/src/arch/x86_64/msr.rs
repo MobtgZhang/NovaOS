@@ -37,6 +37,7 @@ pub const MSR_SFMASK: u32 = 0xC000_0084;
 
 /// `EFER.SCE` — the System Call Extension bit.
 pub const EFER_SCE: u64 = 1 << 0;
+pub const EFER_NXE: u64 = 1 << 11;
 
 /// Read an MSR.
 ///

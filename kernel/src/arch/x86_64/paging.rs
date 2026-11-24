@@ -182,7 +182,7 @@ pub const fn is_addressable_physical(address: u64) -> bool {
 #[inline]
 pub fn current_page_directory() -> u64 {
     // SAFETY: reading CR3 is unprivileged and always safe.
-    unsafe { read_cr3() & 0xFFFF_FFFF_FFF0 }
+    unsafe { read_cr3() & 0x000f_ffff_ffff_f000 }
 }
 
 /// Read the linear address of the last page fault.
@@ -351,7 +351,7 @@ pub unsafe fn read_entry(table: *const u64, index: usize) -> u64 {
 pub unsafe fn invlpg(virtual_address: u64) {
     // SAFETY: delegated to this function's contract.
     unsafe {
-        asm!("invlpg [{0}]", in(reg) virtual_address, options(readonly, nostack, preserves_flags));
+        asm!("invlpg [{0}]", in(reg) virtual_address, options(nostack, preserves_flags));
     }
 }
 

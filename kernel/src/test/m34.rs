@@ -1981,7 +1981,7 @@ fn without_spawn_cannot_exec_service() -> Result<(), &'static str> {
     let mut state = fresh_state();
     let task = state.create_bare_task().ok_or("task pool is empty")?;
     let slot = slot_of(&state, task).ok_or("the new task has no slot")?;
-    let baseline = crate::services::process::live_task_count();
+    let baseline = crate::services::process::live_task_count(&crate::services::state());
     let boot_info = unsafe { crate::boot::read_boot_info() };
     match crate::services::process::exec_image_in_state(&mut state, b"echo-server", slot, boot_info)
     {
@@ -1990,7 +1990,7 @@ fn without_spawn_cannot_exec_service() -> Result<(), &'static str> {
         Err(_) => return Err("the unauthorised exec was refused for the wrong reason"),
     }
 
-    if crate::services::process::live_task_count() != baseline {
+    if crate::services::process::live_task_count(&crate::services::state()) != baseline {
         return Err("the denied exec still changed the task pool");
     }
     if state.service_is_alive(b"echo-server") {

@@ -6,6 +6,7 @@ pub mod allocator;
 pub mod console;
 pub mod fsclient;
 pub mod graphics;
+pub mod futex;
 pub mod ipc;
 pub mod process;
 pub mod syscall;

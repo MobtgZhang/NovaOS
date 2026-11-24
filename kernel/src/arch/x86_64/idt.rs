@@ -704,7 +704,7 @@ pub unsafe extern "C" fn nova_kernel_idt_dispatch(vector: u64, frame: &Exception
     if info.from_user {
         // SAFETY: we are in the exception path with interrupts masked.
         unsafe {
-            sched::fault_current_user_and_switch(info.address.unwrap_or(0));
+            sched::fault_current_user_and_switch(info.address.unwrap_or(0), info.error_code);
         }
     }
 
@@ -1422,6 +1422,43 @@ pub unsafe extern "C" fn nova_kernel_virtio_irq_handler(registers: *const UserRe
     unsafe { crate::task::resume_from_block(registers as u64) }
 }
 
+macro_rules! ipi_stub {
+    ($name:ident, $handler:ident) => {
+        #[unsafe(naked)]
+        unsafe extern "C" fn $name() -> ! {
+            core::arch::naked_asm!(
+                "push rax", "push rbx", "push rcx", "push rdx", "push rsi", "push rdi",
+                "push rbp", "push r8", "push r9", "push r10", "push r11", "push r12",
+                "push r13", "push r14", "push r15",
+                "lea rdi, [rsp]",
+                "and rsp, -16",
+                "cld",
+                "call {handler}",
+                "ud2",
+                handler = sym $handler,
+            )
+        }
+    };
+}
+
+ipi_stub!(work_ipi_stub, work_ipi_handler);
+ipi_stub!(tlb_ipi_stub, tlb_ipi_handler);
+
+unsafe extern "C" fn tlb_ipi_handler(registers: *const UserRegisters) -> ! {
+    super::tlb::poll(crate::arch::current_cpu());
+    unsafe { super::apic::eoi() };
+    unsafe { crate::task::resume_from_block(registers as u64) }
+}
+
+unsafe extern "C" fn work_ipi_handler(registers: *const UserRegisters) -> ! {
+    let cpu = crate::task::current_cpu();
+    unsafe { super::apic::eoi() };
+    crate::boot::smp::record_work_ipi(cpu);
+    crate::task::admit_incoming(cpu);
+    crate::sched::drain_pending_wakes_for_cpu(cpu);
+    unsafe { crate::task::resume_from_block(registers as u64) }
+}
+
 /// The timer interrupt handler.
 ///
 /// # What it does
@@ -1598,6 +1635,8 @@ pub unsafe fn init() {
         // guess; with the timer alone on 0x30, its APIC-only EOI is correct
         // by construction (§4.1).
         set!(super::apic::TIMER_VECTOR as usize, timer_stub);
+        set!(super::apic::WORK_VECTOR as usize, work_ipi_stub);
+        set!(super::apic::TLB_VECTOR as usize, tlb_ipi_stub);
 
         // The PIC's remapped range carries only spurious interrupts — every
         // line is masked, and a masked 8259 can still raise one. The handler

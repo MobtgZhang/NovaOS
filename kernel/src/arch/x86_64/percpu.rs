@@ -93,6 +93,8 @@ pub unsafe fn init_for_cpu(cpu: usize) {
     // for this CPU's lifetime.
     let base = unsafe { &raw mut PER_CPU_AREAS[cpu] } as *mut u64;
     // Record the index once, so `cpu_index()` is a load rather than a `CPUID`.
+    // SAFETY: `cpu < MAX_CPUS` was asserted above; `base` points at this
+    // CPU's own `PerCpuData`, which no other CPU aliases.
     unsafe {
         base.add(OFFSET_CPU_INDEX / 8).write(cpu as u64);
         msr::write(MSR_GS_BASE, base as u64);
