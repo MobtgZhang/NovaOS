@@ -2,7 +2,7 @@
 #
 # # The shape of this file
 #
-# Three jobs, in dependency order, each one a gate the plan requires:
+# The jobs cover independent validation paths:
 #
 # 1. `host` — the host unit tests, `cargo fmt --check`, and `cargo clippy -D
 #    warnings`. Cheap, and it fails in seconds.
@@ -14,9 +14,7 @@
 # 3. `qemu` — the kernel, booted under QEMU with OVMF, with the serial log
 #    archived.
 #
-# The three are separate jobs rather than three steps in one job for two
-# reasons: the host gate should report in seconds rather than after the
-# emulation, and the QEMU job needs the artifacts the kernel job produced.
+# 4. `qemu-ports` — the other bare-metal targets booted on QEMU virt.
 #
 # # Why the kernel is excluded from the host gates
 #
@@ -215,7 +213,7 @@ jobs:
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain
-          rustup target add x86_64-unknown-none
+          rustup target add x86_64-unknown-none x86_64-unknown-uefi
 
       # QEMU and the OVMF firmware. The kernel image is built by `xtask`
       # itself — the ISO writer is self-contained and shells out to nothing —
@@ -224,12 +222,12 @@ jobs:
       #
       # The firmware is used read-only as the code drive; the variable store is
       # copied per run, so a run's NVRAM writes cannot corrupt the next one.
-      - name: Install QEMU and OVMF
+      - name: Install QEMU, OVMF and FAT image tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 \
-            ovmf
+            ovmf dosfstools mtools
           # The runner must agree with `xtask` about where the firmware is.
           # `xtask` searches these paths in order; the package installs into
           # the first one.
@@ -245,15 +243,6 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-
-      # Download and verify the pinned Limine release. The SHA-256 is checked
-      # against the value recorded in `tools/xtask/src/limine.rs`, so a
-      # bootloader that is not the one this kernel was written against cannot
-      # be booted.
-      #
-      # The download is cached, so this is a no-op on a warm runner.
-      - name: Fetch the pinned Limine release
-        run: cargo xtask fetch-limine
 
       # The boot itself.
       #
@@ -282,5 +271,56 @@ jobs:
           path: |
             target/novaos/run/serial.log
             target/novaos/run/archive/
+          if-no-files-found: warn
+          retention-days: 14
+
+  qemu-ports:
+    name: qemu (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            target: aarch64-unknown-none
+            qemu: qemu-system-arm
+          - arch: riscv64
+            target: riscv64gc-unknown-none-elf
+            qemu: qemu-system-misc
+          - arch: loongarch64
+            target: loongarch64-unknown-none
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain target and QEMU
+        run: |
+          rustup target add '${{ matrix.target }}'
+          sudo apt-get update
+          if [ '${{ matrix.arch }}' = loongarch64 ]; then
+            sudo apt-get install -y --no-install-recommends libfdt-dev libglib2.0-dev ninja-build python3-venv
+          else
+            sudo apt-get install -y --no-install-recommends '${{ matrix.qemu }}'
+          fi
+      - name: Build QEMU with the LoongArch NX exception fix
+        if: matrix.arch == 'loongarch64'
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --location --retry 3 --output qemu-10.2.2.tar.xz https://download.qemu.org/qemu-10.2.2.tar.xz
+          echo '784b296ff29c1417aa72323abcb2d2ea9ab9771724f577dcd785c3b04f21e176  qemu-10.2.2.tar.xz' | sha256sum -c
+          tar -xf qemu-10.2.2.tar.xz
+          mkdir qemu-loongarch-build
+          cd qemu-loongarch-build
+          ../qemu-10.2.2/configure --target-list=loongarch64-softmmu --without-default-features \
+            --enable-tcg --enable-fdt=system --disable-docs --disable-download --disable-werror
+          ninja qemu-system-loongarch64
+          echo "$PWD" >> "$GITHUB_PATH"
+      - name: Build and verify the user trap path
+        run: cargo xtask test-ports --arch '${{ matrix.arch }}' --timeout 60
+      - name: Archive QEMU and serial logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: novaos-port-${{ matrix.arch }}
+          path: target/novaos/ports/${{ matrix.arch }}/
           if-no-files-found: warn
           retention-days: 14

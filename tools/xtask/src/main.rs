@@ -33,6 +33,7 @@
 mod boot;
 mod build;
 mod disk;
+mod ports;
 mod qemu;
 mod run;
 mod test;
@@ -41,9 +42,7 @@ use std::process::ExitCode;
 
 /// Everything `xtask` can do.
 ///
-/// Kept as a flat list rather than nested subcommands-with-subcommands because
-/// there are only six of them; a command that needs a subcommand is a sign the
-/// command is doing two jobs.
+/// Commands are kept in a flat list.
 const USAGE: &str = "\
 NovaOS build automation
 
@@ -55,6 +54,8 @@ COMMANDS:
     image           Package the kernel into a bootable ESP FAT image
     run             Build, then boot the image in QEMU with a serial console
     test            Run xtask's tests, the host unit tests, then the QEMU boot suite
+    test-ports      Boot the AArch64, RISC-V 64 and LoongArch 64 kernels and check user traps
+    run-ports       Boot resident init and its echo service on a selected QEMU virt port
     clean           Remove build artifacts
 
 OPTIONS:
@@ -63,6 +64,7 @@ OPTIONS:
     --timeout <s>   QEMU run timeout in seconds (default: 30)
     --headless      Do not open a graphical window (default)
     --keep-image    Do not delete the image after `run`
+    --arch <arch>   Select a QEMU virt port for `run-ports` or `test-ports`
     -h, --help      Show this message
 ";
 
@@ -78,6 +80,7 @@ struct Args {
     timeout: u64,
     /// Whether to keep the ISO after a run.
     keep_image: bool,
+    arch: Option<ports::Port>,
     /// Whether help was requested.
     help: bool,
 }
@@ -95,6 +98,7 @@ impl Args {
             profile: None,
             timeout: 30,
             keep_image: false,
+            arch: None,
             help: false,
         };
 
@@ -122,6 +126,10 @@ impl Args {
                             .clone(),
                     );
                 }
+                "--arch" => {
+                    let value = iter.next().ok_or("--arch needs a target architecture")?;
+                    args.arch = Some(ports::Port::parse(value)?);
+                }
                 other if other.starts_with('-') => {
                     return Err(format!("unknown option {other:?}"));
                 }
@@ -134,6 +142,9 @@ impl Args {
             }
         }
 
+        if args.arch.is_some() && !matches!(args.command.as_deref(), Some("test-ports" | "run-ports")) {
+            return Err("--arch is only supported by test-ports and run-ports".into());
+        }
         Ok(args)
     }
 
@@ -177,6 +188,8 @@ fn main() -> ExitCode {
         Some("image") => image(args.cargo_profile()).map(|_| ()),
         Some("run") => run::run(&args),
         Some("test") => test_all(&args),
+        Some("test-ports") => ports::test(&args),
+        Some("run-ports") => ports::run(&args),
         Some("clean") => clean(),
         // Unreachable in practice: `args.command.is_none()` returned above. Kept
         // as a catch-all rather than `unreachable!()` so that adding a command
@@ -327,7 +340,7 @@ mod tests {
 
     #[test]
     fn each_subcommand_parses() {
-        for command in ["build", "image", "run", "test", "clean"] {
+        for command in ["build", "image", "run", "test", "test-ports", "run-ports", "clean"] {
             let args = parse(&[command]).expect("a known command parses");
             assert_eq!(args.command.as_deref(), Some(command));
         }
