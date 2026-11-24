@@ -317,24 +317,17 @@ whole machine testable on the host.
 | `ReplyReady` | a parked caller was handed its reply |
 | `Failed` | a parked operation failed, with an error code |
 
-`ReceiveReady` deliberately does **not** carry the payload: the receiver
-collects it by calling `recv` again, so the payload always arrives inline with
-the receive and never in a wakeup notification. That keeps one rule for where
-a message comes from, whichever path delivered it.
+`ReceiveReady` identifies the waiter. The kernel dequeues the message on
+that waiter's behalf and completes the original `RECV`. `ReplyReady`
+carries the reply to the waiting `CALL`, and `Failed` completes the wait
+with an error such as `E_PEER_DIED`.
 
-The kernel drains the completions after every syscall
-(`kernel/src/services/mod.rs::KernelState::drain_completions`, which delegates
-to `kernel/src/services/ipc.rs::IpcRegistry::drain_completions`) and wakes the
-threads they name. A completion that cannot be delivered because the output
-array is full is *counted*, not dropped silently: a lost wakeup is a hung
-thread, which is far worse than a reported overflow.
-
-A `ReplyReady` completion carries the reply message with it, so the kernel
-writes it into the waiting thread's message slot and clears its token slot; a
-`Failed` completion carries the error code instead, and that goes into the
-thread's error slot. That is the point at which the *kernel* owns the
-message, and it is the same slot a `recv` fills — so a thread that is woken
-by a reply finds its answer where it would have found a received message.
+The x86-64 syscall path collects completions after IPC operations and task
+teardown. It records results against the waiting thread, queues its wakeup
+on the owning CPU, and copies output into that thread's address space before
+returning to user mode. The early `virt` ports complete the same rendezvous
+operations in their probe scheduler. See the [x86-64 syscall argument
+convention](syscalls-x86_64.md#per-call-arguments) for the user buffers.
 
 ## The capability model this rests on
 

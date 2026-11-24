@@ -280,11 +280,11 @@ find the contract without reading the crate.
 | `CAP_DEREGATE` | parent handle, requested rights | a new, narrower handle |
 | `CAP_REVOKE` | handle | the number of capabilities withdrawn |
 | `SEND` | endpoint, opcode, payload pointer, payload length | `0` |
-| `RECV` | endpoint | the opcode of the received message |
-| `CALL` | endpoint, opcode, payload pointer, payload length | `0`, then the reply |
-| `REPLY` | endpoint, reply token | `0` |
-| `MAP` | address space, virtual address, length | — |
-| `UNMAP` | address space, virtual address, length | — |
+| `RECV` | endpoint, reserved (`0`), payload output pointer, output capacity, reply token output pointer | received opcode |
+| `CALL` | endpoint, opcode, payload pointer, payload length, reply output pointer, output capacity | `0` after the reply arrives |
+| `REPLY` | endpoint, reply token, payload pointer, payload length | `0` |
+| `MAP` | memory object handle, virtual address (`0` for automatic placement), byte length, protection | selected virtual address or number of pages mapped |
+| `UNMAP` | address space, virtual address, length | not implemented |
 | `THREAD_SPAWN` | address space, entry, stack pointer | a thread identifier |
 | `YIELD` | none | `0` |
 | `THREAD_EXIT` | status | the status |
@@ -296,25 +296,37 @@ find the contract without reading the crate.
 | `ENDPOINT_SELF` | none | the endpoint side received at spawn |
 | `PROCESS_COUNT` | none | the number of live tasks |
 | `PROCESS_STATUS` | name pointer, name length | `1` if a task of that service name is live, otherwise `0` |
+| `FUTEX_WAIT` | aligned 32-bit word pointer, expected value, reserved (`0`) | `0` when woken, or `E_WOULD_BLOCK` if the value already changed |
+| `FUTEX_WAKE` | aligned 32-bit word pointer, maximum wake count | number of waiters woken |
+
+### Shared memory
+
+`MAP` acts on the current process and requires `MAP` rights on a `MemoryObject`.
+The length must be nonzero, page aligned, and no larger than the object.
+Protection codes are `0` (read/write), `1` (read-only), and `2` (read/execute).
+For a nonzero, page-aligned address the return value is the page count; `0`
+as the address requests a free range in the user heap window and returns the
+selected address. A range overlapping an existing mapping fails with `E_BUSY`.
+
+`OBJECT_DESTROY` with `CONTROL` rights destroys a memory object system-wide:
+it removes all aliases, waits for TLB invalidation, wakes waiters keyed to the
+backing frames, and revokes associated handles before releasing the frames.
+Ordinary process exit removes that process's aliases without destroying an
+object still referenced by another process. A futex wake is not proof that
+the original mapping remains valid.
 
 A number this kernel does not implement returns `E_UNSUPPORTED`. It never
 falls through to another operation: a number reserved for a later milestone
 ending up meaning something else is how a caller's request becomes a different
 request without anybody deciding that it should.
 
-> **Spot to re-check.** The argument lists above are the ABI's shape, as
-> documented by `nova_abi::nr`. The kernel's dispatcher currently reads
-> `arg0` as the endpoint handle and `arg1` as the opcode, and takes the
-> message *body* from a message the entry path has already staged into a
-> per-thread buffer (`kernel/src/services/dispatch.rs::send` and `::reply`
-> read `KernelState::outgoing_message`; `::recv` writes the received message
-> and its reply token into `KernelState::last_message` and
-> `KernelState::last_token`). The ABI crate's `nr` documentation owns the
-> argument list; if the entry path's staging is the real contract, the two
-> need to be brought into agreement — in the crate and the dispatcher, not in
-> this document. The same applies to the `RECV` result: the dispatcher
-> returns the received message's opcode, and the message itself is left in the
-> kernel-owned buffer rather than written back to a user pointer.
+IPC input payloads can be up to 64 bytes. For `RECV` and `CALL`, capacity
+must be 64 bytes or zero. Zero discards the payload. The kernel copies only
+the bytes present in the message and leaves the unused buffer suffix intact.
+`RECV` writes a little-endian `u64` to a non-null token pointer. The token is
+zero for `SEND` and one-shot for `CALL`. A server handling calls needs the
+token to reply. Buffers remain valid until the syscall returns, including
+across a blocking wait. See [IPC semantics](ipc.md) for completion behavior.
 
 ### The `WRITE` argument convention
 

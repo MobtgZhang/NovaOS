@@ -2,7 +2,7 @@
 
 **An experimental Rust-based desktop operating system featuring a lightweight microkernel, capability-based security, and modular user-space services.**
 
-> ✅ **Status: bootable in QEMU (M0–M8).** The kernel boots under UEFI/OVMF, runs its in-kernel suites, and reaches the implemented desktop, network, and SMP paths. The desktop is a port of [EDE, the Equinox Desktop Environment](https://github.com/edeproject/ede), to Rust — it renders through a GPU-driven scanout at 1024x768 (and adapts to the mode the virtio-gpu reports), with the real EDE look and feel: the start menu, panel, window chrome, and interaction model. It is still an experimental system, not a production desktop: IPv6, package management, audio, user accounts, and real-hardware support are not implemented. TCP, ICMP, DHCP, and a bounded socket API are implemented for the emulated QEMU network. SMP has a verified per-CPU foundation, but user processes, services, and drivers remain owned by the bootstrap processor, so concurrent service scheduling is not claimed. The roadmap below marks what is actually built.
+> **Status: experimental, bootable in QEMU.** The x86-64 system boots under UEFI/OVMF with its desktop, VirtIO and networking stack, and schedules isolated user processes on multiple CPUs. AArch64, RISC-V 64 and LoongArch 64 boot early runtimes with four-level user paging, SMP and cross-CPU init/echo RPC on QEMU `virt`. They do not yet have the full x86-64 system stack. No port has been qualified on physical hardware.
 
 NovaOS draws inspiration from Symbian OS's resource efficiency, client-server system services, and event-driven programming. It reimagines those ideas for modern 64-bit desktop computers, with an **independent Rust kernel** rather than a Linux-based distribution.
 
@@ -82,9 +82,9 @@ sequenceDiagram
 | Area | Initial choice |
 | --- | --- |
 | Main language | **Rust** (`no_std` in the kernel, plus minimal assembly where needed) |
-| CPU architecture | **x86-64**; RISC-V 64 and LoongArch 64 are bring-up ports (see the RISC-V/LoongArch section) |
-| Development platform | **QEMU** with UEFI/OVMF |
-| Boot protocol | **NovaBoot** UEFI boot menu (`make run`, current); the kernel parses the NovaBoot hand-off |
+| CPU architecture | **x86-64** system; **AArch64**, **RISC-V 64** and **LoongArch 64** early runtimes |
+| Development platform | **QEMU** with UEFI/OVMF on x86-64; `virt` on the other three targets |
+| Boot protocol | **NovaBoot** UEFI hand-off on x86-64; device-tree-based early entry on `virt` |
 | Executable format | **ELF64** and a NovaOS-specific ABI |
 | Initial device targets | Serial, timers, framebuffer, and VirtIO |
 | Tooling | Cargo, `make`, QEMU, GDB, and the `xtask` workflow |
@@ -101,8 +101,8 @@ All listed milestones are engineering gates. M0–M8 are implemented in the repo
 - [x] **M5 — Storage:** PCI, VirtIO block devices, and VFS.
 - [x] **M6 — Desktop:** Input system, window compositor, terminal, editor, and file manager — now including the EDE port: GPU-driven scanout, the EDE panel/menus/look and interaction, real edeneu icons, and an About EDE dialog.
 - [x] **M7 — Networking (phase 1):** VirtIO-net over QEMU user networking, ARP, IPv4, UDP, DNS, TCP, ICMP, DHCP, and a versioned bounded socket API. IPv6 and real-hardware networking are not implemented.
-- [x] **M8 — SMP foundation:** per-CPU schedulers, thread pools and stacks, GDT/TSS pairs, local APIC timers, AP startup, and kernel-only AP idle threads. CPU identity is taken from CPUID leaf 1 `EBX[31:24]`. The bootstrap processor still owns user processes, services, and drivers; concurrent service/driver SMP scheduling is not claimed.
-- [ ] **M9+ — Expansion:** concurrent multi-CPU service scheduling, package management, audio, user accounts, security hardening, and selected real hardware.
+- [x] **M8 — SMP:** per-CPU schedulers, AP startup, cross-CPU user dispatch, futex and IPC wakeups, and acknowledged x86-64 TLB invalidation.
+- [ ] **M9+ — Expansion:** process migration, service and driver parity across ports, package management, audio, user accounts, security hardening, and selected real hardware.
 
 **First major architecture milestone:** two isolated Rust processes communicate through a capability-protected IPC endpoint.
 
@@ -185,7 +185,7 @@ The M7 network path is a bounded phase-one stack, not a general TCP/IP implement
 - DHCP acquisition returns a bounded lease and acknowledgement from the emulated server;
 - the network service protocol is versioned and bounds names, datagrams, socket payloads, ICMP payloads, and reply sizes; socket handles are owned by the caller's task slot.
 
-Deliberately not implemented or not asserted: IPv6, a blocking socket API, concurrent service/driver SMP scheduling, arbitrary external-host TCP reachability, and real-hardware networking. Those limits are documented rather than hidden behind a passing suite.
+Deliberately not implemented or not asserted: IPv6, a blocking socket API, unrestricted parallel driver execution, arbitrary external-host TCP reachability, and real-hardware networking.
 
 ### M8 SMP foundation
 
@@ -193,7 +193,8 @@ The SMP phase is a tested foundation, not a claim that the whole system is concu
 
 - The NovaBoot hand-off carries a CPU table captured by the boot manager at boot; each AP waits on `SMP_READY` before entering its startup path.
 - Each AP gets its own kernel stack, fault stack, GDT/TSS pair, local APIC timer, scheduler, thread pool, and one kernel-only idle thread.
-- The bootstrap processor remains the only owner of user processes, services, and drivers. APs never enter ring 3 and never touch the network, file, or display service state.
+- New x86-64 user processes are dispatched across online CPUs and remain pinned to the receiving scheduler. The ring-3 suite exercises cross-CPU IPC, futex wakeups, and permission revocation. The kernel still serializes shared service state.
+- On process exit or a fatal user fault, the kernel revokes shared mappings, switches away from the private CR3, and reclaims the ELF, user stack and private page tables without freeing the shared kernel half.
 - CPU identity is read from CPUID leaf 1 `EBX[31:24]`, not from the xAPIC ID register. On QEMU the ID register reads as zero for every processor, while CPUID reports the captured IDs.
 - The APIC timer uses periodic mode; its handler acknowledges the interrupt on the delivering CPU and accounts that CPU's own scheduler tick.
 - The timer's no-current-thread path restores the saved `r15..rax` register file before returning, rather than resuming through the frame alone.
@@ -205,7 +206,7 @@ The NovaBoot boot-menu layer on top of the [`nova-boot`] protocol crate **is** t
 
 - `crates/nova-boot` defines the architecture-neutral [`BootProtocol`] snapshot (magic, version, target architecture, kernel entry/load address, CPU table, memory map, framebuffer) and a bounded [`BootMenu`] model, all validated on the host.
 - `crates/nova-boot-menu` is a UEFI application (`x86_64-unknown-uefi`) that renders a **graphical** boot menu through the UEFI GOP (Graphics Output Protocol) framebuffer — no text console involved: a centered panel, a highlighted selection bar, and a hint row drawn with an embedded 5x7 bitmap font at 1024x768 (other modes fall back). Entries ship compiled in: `1. Desktop (default)` and `2. Safe Terminal`. The keyboard is read through *every* `SimpleTextIn` handle the firmware exposes (OVMF surfaces several; the real keyboard may be any of them), so selection works on real firmware as well as under QEMU.
-- The menu covers four target families (`x86_64`, aarch64, riscv64, loongarch64) in the protocol model; x86-64 has a full kernel backend, RISC-V 64 and LoongArch 64 have bring-up backends (see the RISC-V 64 / LoongArch 64 section), and aarch64 is planned.
+- The protocol identifies `x86_64`, `aarch64`, `riscv64` and `loongarch64`. The boot menu currently loads the x86-64 kernel. The other architectures use QEMU's `virt` direct boot path.
 - The kernel validates the `BootProtocol` snapshot it is handed and transfers control at the recorded entry point.
 
 [`nova-boot`]: crates/nova-boot
@@ -224,13 +225,17 @@ NovaOS Desktop is a port of [EDE, the Equinox Desktop Environment](https://githu
 
 The About dialog (`ede-about`) ships in the desktop and reports the port honestly: NovaOS Desktop 0.1.0, a Rust-written desktop, port of EDE (Equinox Desktop Environment), licensed under GPL-2.0; edelib is LGPL-2.0.
 
-### RISC-V 64 and LoongArch 64 (bring-up)
+### AArch64, RISC-V 64 and LoongArch 64
 
-NovaOS is ported to two additional bare-metal targets. Both are **bring-up only** — far from the x86-64 completion level:
+The AArch64, RISC-V 64 and LoongArch 64 ports boot on QEMU `virt` and run native initramfs ELFs in isolated, four-level user address spaces. The test matrix covers multi-page segments, read-only and non-executable mappings, stack guard faults, frame reclamation, timer preemption, context preservation, and blocking futex waits with cross-CPU wakeups. It also runs 128 init/echo RPC round trips with multi-page IPC buffers, both on one CPU and with the two processes assigned to separate CPUs in a four-CPU guest. The LoongArch test requires QEMU 10.2.2 or newer (or an equivalent NX fix).
 
-- `riscv64gc-unknown-none-elf` and `loongarch64-unknown-none` build; on QEMU's `virt` machines both boot the kernel and print the banner over the memory-mapped 16550 console, install an exception vector, and park the CPU.
-- Not implemented (honestly): paging, memory management, SMP, timer interrupts, initramfs, user space, services, and the desktop. The full kernel's x86-64-specific modules are gated out of these builds rather than stubbed with lies.
-- See `reports/issues-001.md` §14 for the verified boot logs and the porting order.
+```bash
+rustup target add aarch64-unknown-none riscv64gc-unknown-none-elf loongarch64-unknown-none
+cargo xtask test-ports
+cargo xtask test-ports --arch aarch64 --timeout 30
+```
+
+Install `qemu-system-aarch64`, `qemu-system-riscv64` with OpenSBI firmware, and `qemu-system-loongarch64`. Per-target logs go to `target/novaos/ports/<arch>/`. See [the architecture port notes](docs/architecture-ports.md) for validation scope and the remaining platform work.
 
 ## Quality gates
 
