@@ -382,6 +382,15 @@ impl CompletionSink {
         self.items.get(index).copied().flatten()
     }
 
+    /// Remove the oldest completion.
+    pub fn pop_front(&mut self) -> Option<Completion> {
+        let completion = self.items[0].take()?;
+        self.items.copy_within(1..self.len, 0);
+        self.len -= 1;
+        self.items[self.len] = None;
+        Some(completion)
+    }
+
     /// Empty the sink, returning how many completions it held.
     pub fn clear(&mut self) -> usize {
         let count = self.len;

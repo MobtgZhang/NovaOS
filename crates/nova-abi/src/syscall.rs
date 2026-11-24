@@ -83,23 +83,38 @@ pub mod nr {
 
     /// Send a message on an endpoint.
     ///
-    /// Arguments: `endpoint`, `header`, `payload_ptr`, `payload_len`.
+    /// Arguments: `endpoint`, `opcode`, `payload_ptr`, `payload_len`.
     pub const SEND: Syscall = Syscall(5);
 
     /// Receive from an endpoint, blocking until a message arrives.
+    ///
+    /// Arguments: `endpoint`, `0`, `payload_out`, `capacity`, `token_out`, `0`.
+    /// Returns the opcode. A non-null `token_out` receives a little-endian
+    /// `u64`, zero for a one-way message.
     pub const RECV: Syscall = Syscall(6);
 
     /// Send and wait for a reply on a one-shot reply token.
+    ///
+    /// Arguments: `endpoint`, `opcode`, `payload_ptr`, `payload_len`,
+    /// `reply_out`, `capacity`. Returns zero on success.
+    /// For `CALL` and `RECV`, pass zero capacity to discard the payload or
+    /// `MAX_INLINE_PAYLOAD` for a writable output buffer.
     pub const CALL: Syscall = Syscall(7);
 
     /// Reply once to a received request.
+    ///
+    /// Arguments: `endpoint`, `token`, `payload_ptr`, `payload_len`.
     ///
     /// The token is consumed by this call. A second reply with the same token
     /// fails rather than duplicating the answer — the invariant the report calls
     /// "a ReplyToken can succeed exactly once".
     pub const REPLY: Syscall = Syscall(8);
 
-    /// Map a region of an address space.
+    /// Map a memory object into the current address space.
+    ///
+    /// Arguments: `memory_handle`, `address_or_zero`, `length`, `protection`.
+    /// A fixed address returns the number of pages; zero selects a free user
+    /// heap range and returns its address.
     pub const MAP: Syscall = Syscall(9);
 
     /// Unmap a previously mapped region.
@@ -223,6 +238,31 @@ pub mod nr {
     /// a hot loop.
     pub const TIME: Syscall = Syscall(26);
 
+    /// Block on an aligned atomic 32-bit word until a `FUTEX_WAKE`.
+    ///
+    /// Arguments: `word_ptr`, `expected_value`, `reserved`. The kernel reads
+    /// the word out of the caller's address space and only parks the thread
+    /// when it still holds `expected_value`; a word that has already changed
+    /// fails with `E_WOULD_BLOCK` instead of blocking. Store the new value
+    /// before calling `FUTEX_WAKE`; waiters must recheck the condition after
+    /// waking. `reserved` must be zero: timeouts are not supported yet,
+    /// and a nonzero value is refused rather than ignored.
+    ///
+    /// The wait is keyed by the *physical* address of the word, so two
+    /// processes that map the same memory object wait on the same key and
+    /// wake each other. A thread that exits with a futex wait registered
+    /// has the registration dropped; a wait never outlives its waiter.
+    pub const FUTEX_WAIT: Syscall = Syscall(27);
+
+    /// Wake threads waiting on the 32-bit word at a user address.
+    ///
+    /// Arguments: `word_ptr`, `max_count`. Wakes up to `max_count` threads
+    /// parked on the word's physical address and
+    /// returns how many were woken. Waking zero waiters is success, not an
+    /// error: the caller re-checks its condition anyway, so a lost race
+    /// needs no report.
+    pub const FUTEX_WAKE: Syscall = Syscall(28);
+
     /// Read bytes from standard input (the serial console).
     ///
     /// Arguments: `fd`, `buffer`, `length`. `fd` must be `0` (stdin). The
@@ -260,6 +300,8 @@ pub mod nr {
         GET_BOOT_MODE,
         CONSOLE_CLEAR,
         TIME,
+        FUTEX_WAIT,
+        FUTEX_WAKE,
     ];
 
     /// A name for each number, for logs and backtraces.
@@ -292,6 +334,8 @@ pub mod nr {
             READ => "read",
             CONSOLE_CLEAR => "console_clear",
             TIME => "time",
+            FUTEX_WAIT => "futex_wait",
+            FUTEX_WAKE => "futex_wake",
             // Numbers deliberately not implemented yet are named so a binary
             // that calls one produces a readable log rather than "unknown
             // syscall 15". The list is empty in v0.1.0 but the arm exists so

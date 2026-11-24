@@ -455,6 +455,25 @@ impl CapabilityTable {
         revoked
     }
 
+    /// Whether this table still grants authority to the object.
+    pub fn has_live_object(&self, object_ref: ObjectRef) -> bool {
+        self.slots.iter().any(|slot| {
+            matches!(slot, Slot::Occupied(entry) if entry.object_ref == object_ref && entry.is_live())
+        })
+    }
+
+    /// Discard all handles to a destroyed object and advance their generations.
+    pub fn remove_object(&mut self, object_ref: ObjectRef) {
+        for slot in RESERVED_SLOTS..MAX_CAPS {
+            if let Slot::Occupied(entry) = self.slots[slot] {
+                if entry.object_ref == object_ref {
+                    let handle = CapHandle::new(slot as u32, entry.generation);
+                    let _ = self.destroy(handle);
+                }
+            }
+        }
+    }
+
     /// Give up a capability.
     ///
     /// The slot is released and its generation advances, so every handle that

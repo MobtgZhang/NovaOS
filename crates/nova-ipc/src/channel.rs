@@ -289,6 +289,11 @@ impl Channel {
         &self.completions
     }
 
+    /// Take one completion in delivery order.
+    pub fn pop_completion(&mut self) -> Option<Completion> {
+        self.completions.pop_front()
+    }
+
     /// Take the recorded completions, leaving the sink empty.
     pub fn take_completions(&mut self) -> usize {
         self.completions.clear()
